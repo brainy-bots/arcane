@@ -1,0 +1,9 @@
+[package]
+name = "arcane-spatial"
+version = "0.1.0"
+edition = "2021"
+description = "Arcane Engine — SpatialIndex (IN-03), 2D coarse grid for neighbor discovery"
+
+[dependencies]
+arcane-core = { path = "../arcane-core" }
+uuid = { version = "1.0", features = ["v4"] }

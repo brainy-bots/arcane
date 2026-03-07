@@ -1,0 +1,9 @@
+[package]
+name = "arcane-rules"
+version = "0.1.0"
+edition = "2021"
+description = "Arcane Engine — RulesEngine (IN-04), static IClusteringModel implementation"
+
+[dependencies]
+arcane-core = { path = "../arcane-core" }
+uuid = { version = "1.0", features = ["v4"] }

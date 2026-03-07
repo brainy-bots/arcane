@@ -1,0 +1,9 @@
+[package]
+name = "arcane-pool"
+version = "0.1.0"
+edition = "2021"
+description = "Arcane Engine — LocalPool / ClusterServerPool (IN-07), IServerPool implementation"
+
+[dependencies]
+arcane-core = { path = "../arcane-core" }
+uuid = { version = "1.0", features = ["v4"] }
