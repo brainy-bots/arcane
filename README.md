@@ -24,7 +24,7 @@ cargo test
 - **Manager** (HTTP join): `cargo run -p arcane-infra --bin arcane-manager --features manager`
 - **Cluster** (WebSocket + Redis): `cargo run -p arcane-infra --bin arcane-cluster --features cluster-ws`
 
-See [arcane-demos](https://github.com/your-org/arcane-demos) for a full demo (backend + Unreal client and scripts).
+See [arcane-demos](https://github.com/brainy-bots/arcane-demos) for a full demo (backend + Unreal client and scripts).
 
 ## Unreal client
 

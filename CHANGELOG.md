@@ -15,5 +15,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **arcane-pool**: LocalPool / ClusterServerPool (IN-07) — IServerPool implementation.
 - **arcane-infra**: ClusterManager, ClusterServer, ReplicationChannelManager, RPCHandler; binaries `arcane-cluster` and `arcane-manager` (reference server).
 
-[Unreleased]: https://github.com/your-org/arcane/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/your-org/arcane/releases/tag/v0.1.0
+[Unreleased]: https://github.com/brainy-bots/arcane/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/brainy-bots/arcane/releases/tag/v0.1.0
