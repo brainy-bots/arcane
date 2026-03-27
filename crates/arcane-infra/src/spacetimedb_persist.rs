@@ -44,6 +44,10 @@ fn encode_spacetimedb_entities_body(
     serde_json::to_string(&vec![entities])
 }
 
+fn should_persist_tick(tick: u64, interval_ticks: u64, entries_len: usize) -> bool {
+    tick.is_multiple_of(interval_ticks) && entries_len > 0
+}
+
 pub struct SpacetimeDbPersist {
     client: reqwest::blocking::Client,
     url: String,
@@ -100,7 +104,7 @@ impl SpacetimeDbPersist {
     }
 
     pub fn maybe_persist(&self, tick: u64, entries: &[EntityStateEntry]) {
-        if !tick.is_multiple_of(self.interval_ticks) || entries.is_empty() {
+        if !should_persist_tick(tick, self.interval_ticks, entries.len()) {
             return;
         }
         let chunk_size = if self.max_batch_size > 0 {
@@ -195,5 +199,14 @@ mod tests {
         let body = encode_spacetimedb_entities_body(&[e1, e2]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v[0].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn should_persist_tick_obeys_cadence_and_non_empty_entries() {
+        assert!(should_persist_tick(0, 20, 1));
+        assert!(should_persist_tick(20, 20, 5));
+        assert!(!should_persist_tick(1, 20, 5));
+        assert!(!should_persist_tick(19, 20, 5));
+        assert!(!should_persist_tick(20, 20, 0));
     }
 }

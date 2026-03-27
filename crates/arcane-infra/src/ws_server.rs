@@ -43,6 +43,12 @@ fn parse_player_state(text: &str) -> Option<EntityStateEntry> {
     })
 }
 
+fn should_keep_ws_loop_running_on_broadcast_error(
+    error: &tokio::sync::broadcast::error::RecvError,
+) -> bool {
+    matches!(error, tokio::sync::broadcast::error::RecvError::Lagged(_))
+}
+
 pub fn run_ws_server(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -107,7 +113,13 @@ async fn ws_loop(
                                     break;
                                 }
                             }
-                            Err(_) => break,
+                            Err(error) => {
+                                // Backpressure/loss policy: tolerate dropped broadcast frames (`Lagged`)
+                                // and continue with freshest state; terminate only when channel is closed.
+                                if !should_keep_ws_loop_running_on_broadcast_error(&error) {
+                                    break;
+                                }
+                            },
                         }
                     }
                     msg = ws_stream.next() => {
@@ -124,5 +136,45 @@ async fn ws_loop(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_player_state, should_keep_ws_loop_running_on_broadcast_error};
+    use tokio::sync::broadcast::error::RecvError;
+    use uuid::Uuid;
+
+    #[test]
+    fn parse_player_state_accepts_valid_payload() {
+        let id = Uuid::from_u128(1);
+        let payload = format!(
+            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":1.0,"y":2.0,"z":3.0}},"velocity":{{"x":0.1,"y":0.2,"z":0.3}}}}"#,
+            id
+        );
+        let parsed = parse_player_state(&payload).expect("valid payload should parse");
+        assert_eq!(parsed.entity_id, id);
+        assert_eq!(parsed.position.x, 1.0);
+        assert_eq!(parsed.velocity.z, 0.3);
+    }
+
+    #[test]
+    fn parse_player_state_rejects_non_player_state_messages() {
+        let payload = r#"{"type":"PING","entity_id":"00000000-0000-0000-0000-000000000000","position":{"x":0.0,"y":0.0,"z":0.0},"velocity":{"x":0.0,"y":0.0,"z":0.0}}"#;
+        assert!(parse_player_state(payload).is_none());
+    }
+
+    #[test]
+    fn backpressure_policy_keeps_loop_on_lagged_messages() {
+        assert!(should_keep_ws_loop_running_on_broadcast_error(
+            &RecvError::Lagged(5)
+        ));
+    }
+
+    #[test]
+    fn backpressure_policy_stops_loop_when_channel_closed() {
+        assert!(!should_keep_ws_loop_running_on_broadcast_error(
+            &RecvError::Closed
+        ));
     }
 }

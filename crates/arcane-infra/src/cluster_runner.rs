@@ -27,6 +27,26 @@ const LOG_EVERY_TICKS: u64 = 100;
 /// Log parseable server stats every N ticks (for benchmark: entities, clusters, tick_ms).
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 
+fn merge_with_neighbor_latest(
+    our_delta: EntityStateDelta,
+    neighbor_latest: &HashMap<Uuid, Vec<EntityStateEntry>>,
+) -> EntityStateDelta {
+    let merged_updated: Vec<EntityStateEntry> = our_delta
+        .updated
+        .iter()
+        .cloned()
+        .chain(neighbor_latest.values().flat_map(|v| v.iter().cloned()))
+        .collect();
+    EntityStateDelta {
+        source_cluster_id: our_delta.source_cluster_id,
+        seq: our_delta.seq,
+        tick: our_delta.tick,
+        timestamp: our_delta.timestamp,
+        updated: merged_updated,
+        removed: our_delta.removed,
+    }
+}
+
 /// Runs the cluster server loop with WebSocket and Redis replication.
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
 /// Never returns on success (infinite loop); returns Err only if setup fails.
@@ -86,20 +106,7 @@ where
         let tick_start = Instant::now();
         let our_delta = server.tick();
         let tick_elapsed_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
-        let merged_updated: Vec<EntityStateEntry> = our_delta
-            .updated
-            .iter()
-            .cloned()
-            .chain(neighbor_latest.values().flat_map(|v| v.iter().cloned()))
-            .collect();
-        let merged_delta = EntityStateDelta {
-            source_cluster_id: our_delta.source_cluster_id,
-            seq: our_delta.seq,
-            tick: our_delta.tick,
-            timestamp: our_delta.timestamp,
-            updated: merged_updated,
-            removed: our_delta.removed,
-        };
+        let merged_delta = merge_with_neighbor_latest(our_delta, &neighbor_latest);
         #[cfg(feature = "spacetimedb-persist")]
         if let Some(ref persist) = persist {
             persist.maybe_persist(tick_count, &merged_delta.updated);
@@ -126,4 +133,81 @@ where
         thread::sleep(interval);
     }
     // unreachable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_with_neighbor_latest;
+    use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+    use arcane_core::Vec3;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn mk_entry(entity_id: Uuid, cluster_id: Uuid, x: f64) -> EntityStateEntry {
+        EntityStateEntry {
+            entity_id,
+            cluster_id,
+            position: Vec3::new(x, 0.0, 0.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn merge_includes_local_and_latest_neighbor_entries() {
+        let local_cluster = Uuid::from_u128(1);
+        let n1 = Uuid::from_u128(2);
+        let n2 = Uuid::from_u128(3);
+        let local_entity = mk_entry(Uuid::from_u128(11), local_cluster, 10.0);
+        let n1_entity = mk_entry(Uuid::from_u128(12), n1, 20.0);
+        let n2_entity = mk_entry(Uuid::from_u128(13), n2, 30.0);
+
+        let our_delta = EntityStateDelta {
+            source_cluster_id: local_cluster,
+            seq: 7,
+            tick: 42,
+            timestamp: 123.0,
+            updated: vec![local_entity.clone()],
+            removed: vec![Uuid::from_u128(99)],
+        };
+        let mut neighbors = HashMap::new();
+        neighbors.insert(n1, vec![n1_entity.clone()]);
+        neighbors.insert(n2, vec![n2_entity.clone()]);
+
+        let merged = merge_with_neighbor_latest(our_delta, &neighbors);
+        assert_eq!(merged.source_cluster_id, local_cluster);
+        assert_eq!(merged.seq, 7);
+        assert_eq!(merged.tick, 42);
+        assert_eq!(merged.removed, vec![Uuid::from_u128(99)]);
+        assert_eq!(merged.updated.len(), 3);
+        assert!(merged.updated.iter().any(|e| e.entity_id == local_entity.entity_id));
+        assert!(merged.updated.iter().any(|e| e.entity_id == n1_entity.entity_id));
+        assert!(merged.updated.iter().any(|e| e.entity_id == n2_entity.entity_id));
+    }
+
+    #[test]
+    fn merge_uses_latest_neighbor_snapshot_for_each_cluster() {
+        let local_cluster = Uuid::from_u128(1);
+        let n1 = Uuid::from_u128(2);
+        let old_n1_entity = mk_entry(Uuid::from_u128(21), n1, 1.0);
+        let new_n1_entity = mk_entry(Uuid::from_u128(22), n1, 2.0);
+
+        let mut neighbors = HashMap::new();
+        neighbors.insert(n1, vec![old_n1_entity]);
+        // Simulate loop behavior that replaces the last-seen snapshot for a neighbor.
+        neighbors.insert(n1, vec![new_n1_entity.clone()]);
+
+        let merged = merge_with_neighbor_latest(
+            EntityStateDelta {
+                source_cluster_id: local_cluster,
+                seq: 1,
+                tick: 1,
+                timestamp: 0.0,
+                updated: vec![],
+                removed: vec![],
+            },
+            &neighbors,
+        );
+        assert_eq!(merged.updated.len(), 1);
+        assert_eq!(merged.updated[0].entity_id, new_n1_entity.entity_id);
+    }
 }
