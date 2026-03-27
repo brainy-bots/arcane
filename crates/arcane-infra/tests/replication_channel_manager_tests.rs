@@ -1,6 +1,6 @@
 //! Tests for ReplicationChannelManager (IN-06). Define expected behavior.
 
-use arcane_core::replication_channel::{EntityStateEntry, EntityStateDelta};
+use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use arcane_core::Vec3;
 use arcane_infra::ReplicationChannelManager;
 use uuid::Uuid;

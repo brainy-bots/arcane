@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
+#[cfg(feature = "cluster-ws")]
+use crate::neighbor_subscriber::spawn_neighbor_subscriber;
+#[cfg(feature = "spacetimedb-persist")]
+use crate::spacetimedb_persist::SpacetimeDbPersist;
 use crate::{ClusterServer, ReplicationChannelManager};
 
 const TICK_RATE_HZ: u64 = 20;
@@ -32,7 +36,9 @@ where
     F: FnMut(u64) -> Vec<EntityStateEntry>,
 {
     let replication = ReplicationChannelManager::new(cluster_id);
-    replication.start(&redis_url).map_err(|e| format!("Redis start failed: {}", e))?;
+    replication
+        .start(&redis_url)
+        .map_err(|e| format!("Redis start failed: {}", e))?;
     replication.set_neighbors(neighbor_ids.clone());
 
     let server = ClusterServer::new(cluster_id);
@@ -43,51 +49,7 @@ where
     crate::ws_server::run_ws_server(ws_port, state_rx, client_updates_tx);
 
     let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel::<EntityStateDelta>();
-    if !neighbor_ids.is_empty() {
-        let redis_url_sub = redis_url.clone();
-        let neighbor_ids_sub = neighbor_ids.clone();
-        thread::spawn(move || {
-            let client = match redis::Client::open(redis_url_sub.as_str()) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("neighbor subscriber: Redis open failed: {}", e);
-                    return;
-                }
-            };
-            let mut conn = match client.get_connection() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("neighbor subscriber: Redis connection failed: {}", e);
-                    return;
-                }
-            };
-            let mut pubsub = conn.as_pubsub();
-            for nid in &neighbor_ids_sub {
-                let topic = format!("arcane:replication:{}", nid);
-                if pubsub.subscribe(&topic).is_err() {
-                    eprintln!("neighbor subscriber: subscribe {} failed", topic);
-                }
-            }
-            eprintln!("subscribed to {} neighbor topic(s)", neighbor_ids_sub.len());
-            loop {
-                match pubsub.get_message() {
-                    Ok(msg) => {
-                        let payload: String = match msg.get_payload() {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        if let Ok(delta) = serde_json::from_str::<EntityStateDelta>(&payload) {
-                            let _ = neighbor_tx.send(delta);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("neighbor subscriber: get_message error: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    spawn_neighbor_subscriber(redis_url.clone(), neighbor_ids.clone(), neighbor_tx);
     let mut neighbor_latest: HashMap<Uuid, Vec<EntityStateEntry>> = HashMap::new();
 
     eprintln!(
@@ -96,6 +58,9 @@ where
         neighbor_ids.len(),
         TICK_RATE_HZ
     );
+
+    #[cfg(feature = "spacetimedb-persist")]
+    let persist = SpacetimeDbPersist::from_env();
 
     let interval = Duration::from_millis(1000 / TICK_RATE_HZ);
     let mut tick_count: u64 = 0;
@@ -129,13 +94,22 @@ where
             updated: merged_updated,
             removed: our_delta.removed,
         };
+        #[cfg(feature = "spacetimedb-persist")]
+        if let Some(ref persist) = persist {
+            persist.maybe_persist(tick_count, &merged_delta.updated);
+        }
+
         let _ = state_tx.send(merged_delta);
 
         tick_count += 1;
-        if tick_count % LOG_EVERY_TICKS == 0 {
-            eprintln!("tick {} seq {}", server.current_tick(), server.current_seq());
+        if tick_count.is_multiple_of(LOG_EVERY_TICKS) {
+            eprintln!(
+                "tick {} seq {}",
+                server.current_tick(),
+                server.current_seq()
+            );
         }
-        if tick_count % LOG_STATS_EVERY_TICKS == 0 {
+        if tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
             let entities = server.entity_count();
             let clusters = 1u32; // This process is one cluster; multi-cluster = multiple processes
             eprintln!(

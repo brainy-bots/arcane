@@ -1,7 +1,7 @@
 //! IClusteringModel (IF-01) — merge/split decision interface.
 
-use uuid::Uuid;
 use crate::types::Vec2;
+use uuid::Uuid;
 
 /// View of world state passed to the clustering model. ClusterManager maintains this from SpacetimeDB subscriptions.
 #[derive(Clone, Debug)]

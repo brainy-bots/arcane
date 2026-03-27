@@ -19,6 +19,10 @@ cargo build
 cargo test
 ```
 
+## Architecture
+
+See [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md) for Mermaid diagrams of the full system: component responsibilities and how data moves between clients, ClusterManager, ClusterServers, Redis, and SpacetimeDB.
+
 ## Reference server
 
 - **Manager** (HTTP join): `cargo run -p arcane-infra --bin arcane-manager --features manager`

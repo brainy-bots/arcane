@@ -16,13 +16,15 @@ impl RpcHandler {
 
     /// Start listening. Returns when server is bound.
     pub fn start(&self) -> Result<(), String> {
-        self.running.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
     /// Stop listening and close connections.
     pub fn stop(&self) {
-        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the handler is currently running (for tests).

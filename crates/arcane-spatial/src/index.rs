@@ -3,9 +3,9 @@
 //! API from IN-03: update_entity, remove_entity, set_observation_radius,
 //! get_cluster_geometry, get_neighbors, get_clusters_in_region, snapshot_for_view.
 
+use arcane_core::types::{ClusterGeometry, Vec3};
 use std::collections::HashMap;
 use uuid::Uuid;
-use arcane_core::types::{ClusterGeometry, Vec3};
 
 /// 2D coarse spatial index over cluster entities. Caller (e.g. ClusterManager) feeds
 /// entity positions via update_entity / remove_entity; index answers geometry and neighbor queries.

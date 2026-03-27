@@ -32,6 +32,12 @@ fn get_neighbors_for_cluster_returns_neighbors_from_spatial_index() {
     manager.update_entity(uuid(21), uuid(2), Vec3::new(300.0, 0.0, 0.0));
     let neighbors_a = manager.get_neighbors_for_cluster(uuid(1));
     let neighbors_b = manager.get_neighbors_for_cluster(uuid(2));
-    assert!(neighbors_a.contains(&uuid(2)), "A's neighbors should include B");
-    assert!(neighbors_b.contains(&uuid(1)), "B's neighbors should include A");
+    assert!(
+        neighbors_a.contains(&uuid(2)),
+        "A's neighbors should include B"
+    );
+    assert!(
+        neighbors_b.contains(&uuid(1)),
+        "B's neighbors should include A"
+    );
 }

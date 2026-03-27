@@ -1,7 +1,7 @@
 //! IReplicationChannel (IF-03) — cluster-to-cluster state broadcast (pub/sub).
 
-use uuid::Uuid;
 use crate::types::Vec3;
+use uuid::Uuid;
 
 /// Configuration for a replication channel (one neighbor).
 #[derive(Clone, Debug)]
@@ -47,4 +47,36 @@ pub trait IReplicationChannel: Send + Sync {
 
     /// Close the channel and flush pending sends.
     fn close(&self, reason: CloseReason);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_state_delta_serde_roundtrip() {
+        let cid = Uuid::nil();
+        let eid = Uuid::max();
+        let delta = EntityStateDelta {
+            source_cluster_id: cid,
+            seq: 7,
+            tick: 100,
+            timestamp: 1.5,
+            updated: vec![EntityStateEntry {
+                entity_id: eid,
+                cluster_id: cid,
+                position: Vec3::new(1.0, 2.0, 3.0),
+                velocity: Vec3::new(0.1, 0.0, -0.2),
+            }],
+            removed: vec![Uuid::from_u128(1)],
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        let back: EntityStateDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(delta.source_cluster_id, back.source_cluster_id);
+        assert_eq!(delta.seq, back.seq);
+        assert_eq!(delta.updated.len(), back.updated.len());
+        assert_eq!(delta.updated[0].entity_id, back.updated[0].entity_id);
+        assert_eq!(delta.updated[0].position, back.updated[0].position);
+        assert_eq!(delta.removed, back.removed);
+    }
 }

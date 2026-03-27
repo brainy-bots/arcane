@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry, IReplicationChannel};
 use arcane_core::Vec3;
-use arcane_infra::{ClusterManager, ClusterServer, RedisReplicationChannel, ReplicationChannelManager};
+use arcane_infra::{
+    ClusterManager, ClusterServer, RedisReplicationChannel, ReplicationChannelManager,
+};
 use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
@@ -21,7 +23,9 @@ fn manager_cycle_allocates_one_cluster_when_entities_present() {
     assert_eq!(manager.active_cluster_count(), 0);
 
     manager.update_entity(uuid(10), uuid(1), Vec3::new(100.0, 0.0, 200.0));
-    manager.run_evaluation_cycle().expect("cycle should succeed");
+    manager
+        .run_evaluation_cycle()
+        .expect("cycle should succeed");
 
     assert_eq!(
         manager.active_cluster_count(),
@@ -33,7 +37,9 @@ fn manager_cycle_allocates_one_cluster_when_entities_present() {
 #[test]
 fn manager_empty_spatial_does_not_allocate() {
     let mut manager = ClusterManager::with_defaults();
-    manager.run_evaluation_cycle().expect("cycle should succeed");
+    manager
+        .run_evaluation_cycle()
+        .expect("cycle should succeed");
     assert_eq!(manager.active_cluster_count(), 0);
 }
 
@@ -43,7 +49,9 @@ fn manager_multiple_entities_same_cluster_still_one_allocated_server() {
     let cluster_a = uuid(1);
     manager.update_entity(uuid(10), cluster_a, Vec3::new(0.0, 0.0, 0.0));
     manager.update_entity(uuid(11), cluster_a, Vec3::new(10.0, 0.0, 0.0));
-    manager.run_evaluation_cycle().expect("cycle should succeed");
+    manager
+        .run_evaluation_cycle()
+        .expect("cycle should succeed");
     assert_eq!(manager.active_cluster_count(), 1);
 }
 
@@ -59,7 +67,9 @@ fn redis_reachable_when_up() {
         Ok(c) => c,
         Err(_) => return, // Redis not up — skip test
     };
-    let pong: String = redis::cmd("PING").query(&mut conn).expect("PING should succeed when Redis is up");
+    let pong: String = redis::cmd("PING")
+        .query(&mut conn)
+        .expect("PING should succeed when Redis is up");
     assert_eq!(pong, "PONG", "Redis PING must return PONG");
 }
 
@@ -148,11 +158,19 @@ fn redis_channel_publish_received_by_subscriber() {
         removed: vec![],
     };
     let channel = RedisReplicationChannel::new(source_id, conn_pub);
-    assert_eq!(channel.topic(), topic.as_str(), "topic must match subscriber");
+    assert_eq!(
+        channel.topic(),
+        topic.as_str(),
+        "topic must match subscriber"
+    );
     channel.send(delta.clone());
     let payload = serde_json::to_string(&delta).expect("serialize");
     let mut conn2 = client.get_connection().expect("second conn");
-    let _: i32 = redis::cmd("PUBLISH").arg(&topic).arg(&payload).query(&mut conn2).expect("publish");
+    let _: i32 = redis::cmd("PUBLISH")
+        .arg(&topic)
+        .arg(&payload)
+        .query(&mut conn2)
+        .expect("publish");
 
     let received = rx.recv_timeout(Duration::from_secs(8)).ok();
     let _ = subscriber.join();
@@ -188,7 +206,10 @@ fn manager_replication_cluster_server_integration() {
     manager.update_entity(uuid(21), cluster_b, Vec3::new(300.0, 0.0, 0.0));
     manager.run_evaluation_cycle().expect("cycle");
     let neighbors = manager.get_neighbors_for_cluster(cluster_a);
-    assert!(!neighbors.is_empty(), "cluster A should have at least one neighbor (B)");
+    assert!(
+        !neighbors.is_empty(),
+        "cluster A should have at least one neighbor (B)"
+    );
 
     let replication_mgr = ReplicationChannelManager::new(cluster_a);
     if replication_mgr.start(&url).is_err() {
@@ -213,7 +234,10 @@ fn manager_replication_cluster_server_integration() {
             }
         };
         let mut pubsub = conn.as_pubsub();
-        if pubsub.set_read_timeout(Some(Duration::from_secs(5))).is_err() {
+        if pubsub
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .is_err()
+        {
             return;
         }
         if pubsub.subscribe(&topic_clone).is_err() {
@@ -261,7 +285,11 @@ fn manager_replication_cluster_server_integration() {
     })
     .expect("serialize");
     let mut conn2 = client.get_connection().expect("conn2");
-    let _: i32 = redis::cmd("PUBLISH").arg(&topic).arg(&payload).query(&mut conn2).expect("publish");
+    let _: i32 = redis::cmd("PUBLISH")
+        .arg(&topic)
+        .arg(&payload)
+        .query(&mut conn2)
+        .expect("publish");
 
     let received = rx.recv_timeout(Duration::from_secs(5)).ok();
     let _ = subscriber.join();

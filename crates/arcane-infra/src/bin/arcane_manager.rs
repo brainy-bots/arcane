@@ -16,11 +16,7 @@ use std::env;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use axum::{
-    extract::State,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 
 #[derive(Clone, Serialize)]
@@ -61,9 +57,15 @@ async fn main() -> Result<(), String> {
     let state = if let Ok(clusters_var) = env::var("MANAGER_CLUSTERS") {
         let clusters = parse_clusters(&clusters_var);
         if clusters.is_empty() {
-            return Err("MANAGER_CLUSTERS is set but parsed to empty (use id:host:port,id2:host2:port2)".to_string());
+            return Err(
+                "MANAGER_CLUSTERS is set but parsed to empty (use id:host:port,id2:host2:port2)"
+                    .to_string(),
+            );
         }
-        eprintln!("arcane-manager: {} cluster(s), round-robin assign", clusters.len());
+        eprintln!(
+            "arcane-manager: {} cluster(s), round-robin assign",
+            clusters.len()
+        );
         ManagerState {
             clusters: clusters.clone(),
             counter: std::sync::Arc::new(AtomicUsize::new(0)),
@@ -71,7 +73,8 @@ async fn main() -> Result<(), String> {
     } else {
         let cluster_id = env::var("MANAGER_CLUSTER_ID")
             .map_err(|_| "MANAGER_CLUSTER_ID or MANAGER_CLUSTERS env var required".to_string())?;
-        let server_host = env::var("MANAGER_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let server_host =
+            env::var("MANAGER_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let server_port: u16 = env::var("MANAGER_SERVER_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -91,7 +94,9 @@ async fn main() -> Result<(), String> {
         .with_state(state);
 
     axum::serve(
-        tokio::net::TcpListener::bind(addr).await.map_err(|e| e.to_string())?,
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| e.to_string())?,
         app,
     )
     .await

@@ -62,10 +62,13 @@ async fn ws_loop(
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
 ) {
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(16);
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.expect("bind ws port");
-    eprintln!("cluster WebSocket listening on ws://{} (send PLAYER_STATE to push player entity)", addr);
+    eprintln!(
+        "cluster WebSocket listening on ws://{} (send PLAYER_STATE to push player entity)",
+        addr
+    );
 
     let broadcast_tx = std::sync::Arc::new(broadcast_tx);
     let tx_clone = broadcast_tx.clone();
@@ -100,7 +103,7 @@ async fn ws_loop(
                     result = recv.recv() => {
                         match result {
                             Ok(json) => {
-                                if ws_stream.send(Message::Text(json.into())).await.is_err() {
+                                if ws_stream.send(Message::Text(json)).await.is_err() {
                                     break;
                                 }
                             }

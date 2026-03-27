@@ -44,8 +44,14 @@ impl ClusterManager {
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
-    pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: arcane_core::Vec3) {
-        self.spatial_index.update_entity(entity_id, cluster_id, position);
+    pub fn update_entity(
+        &mut self,
+        entity_id: Uuid,
+        cluster_id: Uuid,
+        position: arcane_core::Vec3,
+    ) {
+        self.spatial_index
+            .update_entity(entity_id, cluster_id, position);
     }
 
     /// Set observation radius used for neighbor discovery (delegates to SpatialIndex). Call before get_neighbors_for_cluster.
@@ -94,7 +100,10 @@ impl ClusterManager {
                 self.allocated_servers.push(handle);
                 Ok(())
             }
-            Err(e) => Err(format!("pool allocate failed: {} - {}", e.code as u32, e.detail)),
+            Err(e) => Err(format!(
+                "pool allocate failed: {} - {}",
+                e.code as u32, e.detail
+            )),
         }
     }
 

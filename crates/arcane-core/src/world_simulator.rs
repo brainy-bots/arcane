@@ -1,7 +1,7 @@
 //! IWorldSimulator (IF-04) — unobserved entity state (Static / FastForward / MLPredictive).
 
-use uuid::Uuid;
 use crate::types::Vec3;
+use uuid::Uuid;
 
 /// Last known state of an entity when it was last observed.
 #[derive(Clone, Debug)]

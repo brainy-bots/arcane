@@ -1,8 +1,8 @@
 //! RulesEngine — static rules implementation of IClusteringModel (IF-01).
 
 use arcane_core::clustering_model::{
-    IClusteringModel, WorldStateView, ClusterDecision, DecisionReason, DecisionType, ModelInfo,
-    ValidationResult,
+    ClusterDecision, DecisionReason, DecisionType, IClusteringModel, ModelInfo, ValidationResult,
+    WorldStateView,
 };
 
 /// MVP static rules implementation of IClusteringModel. Stateless; no I/O.

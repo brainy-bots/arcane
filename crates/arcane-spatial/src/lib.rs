@@ -5,5 +5,5 @@
 
 mod index;
 
-pub use index::SpatialIndex;
 pub use arcane_core::ClusterGeometry;
+pub use index::SpatialIndex;

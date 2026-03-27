@@ -1,12 +1,11 @@
 //! LocalPool — pre-provisioned cluster servers for development (IN-07).
 
+use arcane_core::server_pool::{
+    FailureType, IServerPool, PoolError, PoolErrorCode, PoolStatus, ReplacementHandle, ServerHandle,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
-use arcane_core::server_pool::{
-    FailureType, PoolError, PoolErrorCode, PoolStatus, ReplacementHandle, ServerHandle,
-    IServerPool,
-};
 
 /// Pre-provisioned pool of cluster server processes (dev). Implements IServerPool.
 pub struct LocalPool {

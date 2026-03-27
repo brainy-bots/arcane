@@ -1,7 +1,7 @@
 //! Tests for LocalPool (IN-07). Define expected behavior; implementation must satisfy these.
 
-use arcane_pool::LocalPool;
 use arcane_core::IServerPool;
+use arcane_pool::LocalPool;
 
 #[test]
 fn new_pool_has_capacity() {
@@ -14,7 +14,10 @@ fn new_pool_has_capacity() {
 fn allocate_returns_handle_when_available() {
     let pool = LocalPool::new(2);
     let result = pool.allocate();
-    assert!(result.is_ok(), "allocate should succeed when pool has capacity");
+    assert!(
+        result.is_ok(),
+        "allocate should succeed when pool has capacity"
+    );
     let handle = result.unwrap();
     assert!(!handle.host.is_empty());
     assert!(handle.ws_port > 0);

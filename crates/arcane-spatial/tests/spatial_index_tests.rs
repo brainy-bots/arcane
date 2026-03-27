@@ -1,7 +1,7 @@
 //! Tests for SpatialIndex (IN-03). Define expected behavior; implementation must satisfy these.
 
-use arcane_spatial::SpatialIndex;
 use arcane_core::types::Vec3;
+use arcane_spatial::SpatialIndex;
 use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
@@ -24,7 +24,9 @@ fn update_entity_single_entity_returns_geometry() {
 
     index.update_entity(entity_1, cluster_a, pos);
 
-    let geom = index.get_cluster_geometry(cluster_a).expect("cluster should exist");
+    let geom = index
+        .get_cluster_geometry(cluster_a)
+        .expect("cluster should exist");
     assert_eq!(geom.cluster_id, cluster_a);
     assert_eq!(geom.entity_count, 1);
     assert_eq!(geom.centroid.x, 100.0);
@@ -42,11 +44,16 @@ fn update_entity_two_entities_same_cluster_centroid_and_spread() {
     index.update_entity(uuid(10), cluster_a, pos1);
     index.update_entity(uuid(11), cluster_a, pos2);
 
-    let geom = index.get_cluster_geometry(cluster_a).expect("cluster should exist");
+    let geom = index
+        .get_cluster_geometry(cluster_a)
+        .expect("cluster should exist");
     assert_eq!(geom.entity_count, 2);
     assert_eq!(geom.centroid.x, 5.0, "centroid x is midpoint");
     assert_eq!(geom.centroid.z, 0.0);
-    assert!(geom.spread_radius > 0.0, "two entities have positive spread");
+    assert!(
+        geom.spread_radius > 0.0,
+        "two entities have positive spread"
+    );
 }
 
 #[test]
@@ -58,7 +65,10 @@ fn remove_entity_empty_cluster_returns_none() {
 
     index.remove_entity(entity_1, cluster_a);
 
-    assert!(index.get_cluster_geometry(cluster_a).is_none(), "empty cluster should be absent");
+    assert!(
+        index.get_cluster_geometry(cluster_a).is_none(),
+        "empty cluster should be absent"
+    );
 }
 
 #[test]
@@ -70,7 +80,9 @@ fn remove_entity_one_of_two_updates_geometry() {
 
     index.remove_entity(uuid(11), cluster_a);
 
-    let geom = index.get_cluster_geometry(cluster_a).expect("cluster should still exist");
+    let geom = index
+        .get_cluster_geometry(cluster_a)
+        .expect("cluster should still exist");
     assert_eq!(geom.entity_count, 1);
     assert_eq!(geom.centroid.x, 0.0);
     assert_eq!(geom.spread_radius, 0.0);
@@ -89,8 +101,14 @@ fn get_neighbors_two_nearby_clusters_see_each_other() {
     let neighbors_a = index.get_neighbors(cluster_a);
     let neighbors_b = index.get_neighbors(cluster_b);
 
-    assert!(neighbors_a.contains(&cluster_b), "A's neighbors should include B");
-    assert!(neighbors_b.contains(&cluster_a), "B's neighbors should include A");
+    assert!(
+        neighbors_a.contains(&cluster_b),
+        "A's neighbors should include B"
+    );
+    assert!(
+        neighbors_b.contains(&cluster_a),
+        "B's neighbors should include A"
+    );
 }
 
 #[test]
@@ -104,7 +122,10 @@ fn get_neighbors_far_clusters_not_neighbors() {
 
     let neighbors_a = index.get_neighbors(cluster_a);
 
-    assert!(!neighbors_a.contains(&cluster_b), "distant B should not be neighbor of A");
+    assert!(
+        !neighbors_a.contains(&cluster_b),
+        "distant B should not be neighbor of A"
+    );
 }
 
 #[test]
@@ -134,8 +155,12 @@ fn entity_move_between_clusters_updates_both() {
 
     index.update_entity(entity_1, cluster_b, Vec3::new(100.0, 0.0, 100.0)); // move entity_1 to B
 
-    let geom_a = index.get_cluster_geometry(cluster_a).expect("A should exist");
-    let geom_b = index.get_cluster_geometry(cluster_b).expect("B should exist");
+    let geom_a = index
+        .get_cluster_geometry(cluster_a)
+        .expect("A should exist");
+    let geom_b = index
+        .get_cluster_geometry(cluster_b)
+        .expect("B should exist");
     assert_eq!(geom_a.entity_count, 1, "A should have one entity left");
     assert_eq!(geom_b.entity_count, 1, "B should have the moved entity");
     assert_eq!(geom_a.centroid.x, 2.0);
