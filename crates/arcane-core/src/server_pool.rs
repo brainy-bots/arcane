@@ -1,4 +1,7 @@
 //! IServerPool (IF-02) — cluster server allocation and release.
+//!
+//! Consumed by manager orchestration (`arcane-infra::ClusterManager`) to provision and reclaim
+//! cluster hosts. Implementations live in crates like `arcane-pool`.
 
 use uuid::Uuid;
 

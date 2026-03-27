@@ -1,4 +1,7 @@
 //! Shared types used across Arcane components.
+//!
+//! These are intentionally minimal and serialization-friendly so both rule/infra code and tests
+//! can share a single geometry vocabulary.
 
 use uuid::Uuid;
 

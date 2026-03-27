@@ -22,6 +22,7 @@ cargo test
 ## Architecture
 
 See [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md) for Mermaid diagrams of the full system: component responsibilities and how data moves between clients, ClusterManager, ClusterServers, Redis, and SpacetimeDB.
+See [docs/MODULE_INTERACTIONS.md](docs/MODULE_INTERACTIONS.md) for crate/module-level responsibilities and interaction boundaries inside the Rust workspace.
 
 ## Reference server
 

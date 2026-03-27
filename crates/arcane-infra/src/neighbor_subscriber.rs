@@ -1,3 +1,12 @@
+//! Redis-backed inbound replication subscriber for neighbor cluster deltas.
+//!
+//! Responsibilities:
+//! - subscribe to each neighbor topic (`arcane:replication:<cluster_id>`)
+//! - parse incoming JSON payload into `EntityStateDelta`
+//! - forward valid deltas to the cluster run loop via `std::sync::mpsc::Sender`
+//!
+//! This module is intentionally narrow: no topology decisions and no state merging.
+
 use std::sync::mpsc::Sender;
 use std::thread;
 

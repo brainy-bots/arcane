@@ -1,6 +1,18 @@
 //! Arcane Engine — core traits and shared types.
 //!
-//! Defines the infrastructure interfaces (IF-01–04) and types used across crates.
+//! Defines the stable, I/O-free contracts used by the rest of the workspace.
+//!
+//! ## Module responsibilities
+//! - `types`: shared math and geometry primitives (`Vec2`, `Vec3`, `ClusterGeometry`).
+//! - `clustering_model`: merge/split decision interface consumed by manager logic.
+//! - `server_pool`: allocation/release contract for cluster server capacity.
+//! - `replication_channel`: neighbor-delta contract and message schema.
+//! - `world_simulator`: contract for unobserved entity state progression.
+//!
+//! ## Interaction model
+//! Implementations in sibling crates (`arcane-rules`, `arcane-pool`, `arcane-infra`) depend on
+//! these contracts. `arcane-core` itself has no runtime side effects and should remain a dependency
+//! root for cross-crate compatibility.
 
 pub mod clustering_model;
 pub mod replication_channel;

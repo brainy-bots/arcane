@@ -1,3 +1,12 @@
+//! SpacetimeDB persistence adapter for throttled state snapshots.
+//!
+//! Responsibilities:
+//! - derive persist cadence and endpoint config from environment
+//! - encode `EntityStateEntry` batches into SpacetimeDB reducer payload shape
+//! - send chunked HTTP requests and log success/failure totals
+//!
+//! This module does not own simulation timing; `cluster_runner` decides when to call it.
+
 use std::time::{Duration, Instant};
 
 use arcane_core::replication_channel::EntityStateEntry;

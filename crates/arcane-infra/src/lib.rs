@@ -1,6 +1,15 @@
 //! Arcane Engine — infrastructure components.
 //!
-//! IN-01 ClusterManager, IN-02 ClusterServer, IN-06 ReplicationChannelManager, IN-05 RPCHandler.
+//! Runtime orchestration and transport implementations on top of `arcane-core` contracts.
+//!
+//! ## Module responsibilities
+//! - `cluster_manager`: assignment/topology orchestration and control-plane decisions.
+//! - `cluster_server`: per-cluster simulation and state-delta production.
+//! - `replication_channel_manager` + `redis_channel`: neighbor transport plumbing.
+//! - `neighbor_subscriber`: inbound Redis subscriber loop for neighbor deltas.
+//! - `ws_server`: client-facing WebSocket transport.
+//! - `spacetimedb_persist`: throttled persistence adapter for state snapshots.
+//! - `cluster_runner`: loop composition that wires server, replication, ws, and persistence.
 
 pub mod cluster_manager;
 pub mod cluster_server;

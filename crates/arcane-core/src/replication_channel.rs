@@ -1,4 +1,8 @@
 //! IReplicationChannel (IF-03) — cluster-to-cluster state broadcast (pub/sub).
+//!
+//! Defines the delta payload shape shared between cluster runtime and transport adapters.
+//! Infra components (`ReplicationChannelManager`, Redis adapter, neighbor subscribers) exchange
+//! `EntityStateDelta` values defined here.
 
 use crate::types::Vec3;
 use uuid::Uuid;

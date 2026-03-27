@@ -1,6 +1,12 @@
 //! Cluster server run loop — library entry point for running a cluster with optional per-tick entity injection.
 //! Used by the arcane-cluster binary (no demo) and by arcane-demo's cluster-demo binary (with demo agents).
 //! Keeps infrastructure (this crate) free of game/demo logic.
+//!
+//! Interactions:
+//! - pulls local simulation deltas from `ClusterServer`
+//! - consumes neighbor deltas from `neighbor_subscriber`
+//! - publishes merged state to `ws_server`
+//! - optionally persists snapshots through `spacetimedb_persist`
 
 use std::collections::HashMap;
 use std::sync::Arc;

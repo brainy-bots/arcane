@@ -1,4 +1,7 @@
 //! IWorldSimulator (IF-04) — unobserved entity state (Static / FastForward / MLPredictive).
+//!
+//! Used by cluster simulation paths when entities are not currently observed by players.
+//! The contract isolates policy (how to simulate) from runtime loop mechanics.
 
 use crate::types::Vec3;
 use uuid::Uuid;
