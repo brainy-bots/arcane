@@ -179,9 +179,18 @@ mod tests {
         assert_eq!(merged.tick, 42);
         assert_eq!(merged.removed, vec![Uuid::from_u128(99)]);
         assert_eq!(merged.updated.len(), 3);
-        assert!(merged.updated.iter().any(|e| e.entity_id == local_entity.entity_id));
-        assert!(merged.updated.iter().any(|e| e.entity_id == n1_entity.entity_id));
-        assert!(merged.updated.iter().any(|e| e.entity_id == n2_entity.entity_id));
+        assert!(merged
+            .updated
+            .iter()
+            .any(|e| e.entity_id == local_entity.entity_id));
+        assert!(merged
+            .updated
+            .iter()
+            .any(|e| e.entity_id == n1_entity.entity_id));
+        assert!(merged
+            .updated
+            .iter()
+            .any(|e| e.entity_id == n2_entity.entity_id));
     }
 
     #[test]
