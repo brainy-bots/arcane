@@ -2,6 +2,12 @@
 
 This folder contains interface and module responsibility specs for the `arcane` repository.
 
+## Entity state model and physics
+
+- **[four-bucket-state-model.md](four-bucket-state-model.md)** — Where entity data lives (spine, replicated JSON, cluster-local, SpacetimeDB) and how it maps to `EntityStateEntry` and SpacetimeDB.
+- **[physics-backends-and-unreal.md](physics-backends-and-unreal.md)** — Integrating authoritative physics (Unreal Chaos first, optional Rust backends): `ClusterSimulation`, tick order, recommended server layout, checklists.
+- **`adr/`** — Architecture decision records (e.g. chosen Unreal integration shape, UE version). See [adr/README.md](adr/README.md).
+
 ## Interfaces
 
 - `interface-iclusteringmodel.md`

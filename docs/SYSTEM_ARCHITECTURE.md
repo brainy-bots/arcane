@@ -175,4 +175,6 @@ sequenceDiagram
 | Entity state (persistent) | ClusterServer (throttled) | ClusterServers (gap recovery, load) | SpacetimeDB |
 | Discrete game outcomes | ClusterServer → reducer | Client (RPC_RESULT), SpacetimeDB tables | SpacetimeDB reducers |
 
+For how **entity fields** map to replication vs SpacetimeDB vs process-local state, see [architecture/four-bucket-state-model.md](architecture/four-bucket-state-model.md). For **authoritative physics** (e.g. Unreal Chaos) and the cluster tick hook, see [architecture/physics-backends-and-unreal.md](architecture/physics-backends-and-unreal.md).
+
 This document is the single place in the **arcane** library repo that describes the full system with Mermaid diagrams. For recovery (crash detection and handoff to a new instance), see GitHub issue [#3](https://github.com/brainy-bots/arcane/issues/3).

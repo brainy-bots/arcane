@@ -2,6 +2,8 @@
 
 This document complements `SYSTEM_ARCHITECTURE.md` by focusing on crate/module boundaries inside the Rust workspace.
 
+**Entity state and physics:** Where fields live on the wire vs in SpacetimeDB is specified in [architecture/four-bucket-state-model.md](architecture/four-bucket-state-model.md). How authoritative physics integrates with the cluster tick (including Unreal Chaos) is in [architecture/physics-backends-and-unreal.md](architecture/physics-backends-and-unreal.md).
+
 ## Workspace-level module graph
 
 ```mermaid
