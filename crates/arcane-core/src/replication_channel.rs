@@ -125,12 +125,8 @@ mod tests {
     fn entity_state_entry_user_data_roundtrip() {
         let cid = Uuid::nil();
         let eid = Uuid::from_u128(42);
-        let mut e = EntityStateEntry::new(
-            eid,
-            cid,
-            Vec3::new(1.0, 0.0, 2.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        );
+        let mut e =
+            EntityStateEntry::new(eid, cid, Vec3::new(1.0, 0.0, 2.0), Vec3::new(0.0, 0.0, 0.0));
         e.user_data = serde_json::json!({"kind": "projectile", "owner": "a"});
         let json = serde_json::to_string(&e).unwrap();
         let back: EntityStateEntry = serde_json::from_str(&json).unwrap();
@@ -141,12 +137,8 @@ mod tests {
     fn entity_state_entry_local_data_not_on_replication_wire() {
         let cid = Uuid::nil();
         let eid = Uuid::from_u128(7);
-        let mut e = EntityStateEntry::new(
-            eid,
-            cid,
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        );
+        let mut e =
+            EntityStateEntry::new(eid, cid, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
         e.user_data = serde_json::json!({"visible": true});
         e.local_data = serde_json::json!({"cooldown_s": 2.5});
 
@@ -166,7 +158,10 @@ mod tests {
         );
 
         let back: EntityStateDelta = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.updated[0].user_data, serde_json::json!({"visible": true}));
+        assert_eq!(
+            back.updated[0].user_data,
+            serde_json::json!({"visible": true})
+        );
         assert!(
             back.updated[0].local_data.is_null(),
             "after wire roundtrip local_data is absent (default null)"
