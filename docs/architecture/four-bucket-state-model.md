@@ -32,7 +32,7 @@ Source of truth: [`crates/arcane-core/src/replication_channel.rs`](../../crates/
 | `entity_id`, `cluster_id` | **1 — Spine** | Identity and ownership for routing and display. |
 | `position`, `velocity` | **1 — Spine** | Pose for simulation and replication. |
 | `user_data` | **2 — Replicated simulation** | Omitted from JSON when `null`. On the wire to neighbors and (current reference server) clients. |
-| `local_data` | **3 — Cluster-local** | **`#[serde(skip_serializing)]`** — never part of `EntityStateDelta` JSON. Not trusted from clients; set server-side. Incoming neighbor rows arrive with `local_data` defaulted / empty for that entity. |
+| `local_data` | **3 — Cluster-local** | **`skip_serializing` + `skip_deserializing`:** not on the wire; JSON must not hydrate bucket 3 from neighbors/Redis. Set only in-process. |
 
 ### 3.2 Per-tick simulation (optional)
 
@@ -53,7 +53,7 @@ Authoritative simulation may update **buckets 1–3** in memory each tick (pose,
 | Bucket | Who may write (production target) |
 |--------|-----------------------------------|
 | 1–2 | **Server / cluster authoritative simulation** after validating client **inputs**. Today’s reference WebSocket accepts `PLAYER_STATE` with pose and `user_data`; a production game should converge on **inputs → server sim** and treat client pose as cheat-prone unless locked down. |
-| 3 | **Only** cluster process (simulation, game code). Never accept `local_data` from a client message. |
+| 3 | **Only** cluster process (simulation, game code). Never accept `local_data` from a client message; replication JSON cannot populate it (`skip_deserializing` on the type). |
 | 4 | **SpacetimeDB reducers** and controlled server calls; clients subscribe, not mutate tables directly without module rules. |
 
 Document your game’s exact validation policy in your own design doc; this table is the Arcane platform contract.

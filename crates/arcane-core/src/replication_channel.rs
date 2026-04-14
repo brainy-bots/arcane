@@ -55,8 +55,11 @@ pub struct EntityStateEntry {
     /// **Bucket 2** — replicated game JSON (neighbors, clients). Default `null`; omitted when null.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub user_data: serde_json::Value,
-    /// **Bucket 3** — cluster process only; never sent on [`EntityStateDelta`]. Do not trust from clients.
-    #[serde(default, skip_serializing)]
+    /// **Bucket 3** — cluster process only; never sent on [`EntityStateDelta`].
+    ///
+    /// **`skip_deserializing`:** replication JSON must never hydrate this field from the wire (neighbors,
+    /// Redis, or crafted payloads). Only this process may set `local_data` in memory after deserialize.
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub local_data: serde_json::Value,
 }
 
@@ -165,6 +168,30 @@ mod tests {
         assert!(
             back.updated[0].local_data.is_null(),
             "after wire roundtrip local_data is absent (default null)"
+        );
+    }
+
+    #[test]
+    fn entity_state_entry_local_data_not_accepted_from_replication_json() {
+        // Malicious or buggy neighbor must not inject bucket-3 state via the wire.
+        let json = r#"{
+            "source_cluster_id":"00000000-0000-0000-0000-000000000001",
+            "seq":1,"tick":1,"timestamp":0.0,
+            "updated":[{
+                "entity_id":"00000000-0000-0000-0000-000000000002",
+                "cluster_id":"00000000-0000-0000-0000-000000000001",
+                "position":{"x":1.0,"y":0.0,"z":0.0},
+                "velocity":{"x":0.0,"y":0.0,"z":0.0},
+                "user_data":{"ok":true},
+                "local_data":{"injected":true}
+            }],
+            "removed":[]
+        }"#;
+        let delta: EntityStateDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.updated[0].user_data, serde_json::json!({"ok": true}));
+        assert!(
+            delta.updated[0].local_data.is_null(),
+            "local_data from JSON must be ignored (skip_deserializing)"
         );
     }
 }
