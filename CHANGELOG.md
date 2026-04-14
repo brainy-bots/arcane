@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **arcane-core**: `EntityStateEntry` now carries **`user_data`** and **`local_data`** (JSON) aligned with the [four-bucket state model](docs/architecture/four-bucket-state-model.md): replicated simulation payload vs cluster-local fields; `local_data` is never serialized on `EntityStateDelta`. Added `EntityStateEntry::new`.
+- **arcane-infra**: WebSocket `PLAYER_STATE` accepts optional **`user_data`**; **`local_data`** is never read from clients.
+
 ## [0.1.0] - (initial split)
 
 - **arcane-core**: Traits and shared types (IClusteringModel, IServerPool, IReplicationChannel, IWorldSimulator; Vec2, Vec3, ClusterGeometry, WorldStateView, etc.).

@@ -5,6 +5,9 @@
 //! - encode `EntityStateEntry` batches into SpacetimeDB reducer payload shape
 //! - send chunked HTTP requests and log success/failure totals
 //!
+//! **Four buckets:** this path mirrors **bucket 1** (pose) into **bucket 4** (durable tables) at a
+//! throttled cadence — not a substitute for hot Redis replication between clusters.
+//!
 //! This module does not own simulation timing; `cluster_runner` decides when to call it.
 
 use std::time::{Duration, Instant};
@@ -164,12 +167,12 @@ mod tests {
     use uuid::Uuid;
 
     fn mk_entry(id: Uuid, x: f64, y: f64, z: f64) -> EntityStateEntry {
-        EntityStateEntry {
-            entity_id: id,
-            cluster_id: Uuid::nil(),
-            position: Vec3::new(x, y, z),
-            velocity: Vec3::new(9.0, 9.0, 9.0),
-        }
+        EntityStateEntry::new(
+            id,
+            Uuid::nil(),
+            Vec3::new(x, y, z),
+            Vec3::new(9.0, 9.0, 9.0),
+        )
     }
 
     #[test]

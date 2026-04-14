@@ -1,5 +1,10 @@
 //! WebSocket server for cluster state broadcast. Built only with feature "cluster-ws".
 //! Accepts incoming PLAYER_STATE messages from clients and forwards them to the tick loop.
+//!
+//! **Buckets:** inbound JSON may set **spine** (`position`, `velocity`) and **bucket 2**
+//! ([`EntityStateEntry::user_data`](arcane_core::replication_channel::EntityStateEntry::user_data)).
+//! **Bucket 3** ([`local_data`](arcane_core::replication_channel::EntityStateEntry::local_data)) is
+//! never taken from the client; it stays default until the cluster sets it server-side.
 
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender};
@@ -11,7 +16,9 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-/// Incoming message from a client. Expects JSON: {"type":"PLAYER_STATE","entity_id":"uuid","position":{"x",y,z},"velocity":{"x",y,z}}
+/// Incoming message from a client. Expects JSON:
+/// `{"type":"PLAYER_STATE","entity_id":"uuid","position":{...},"velocity":{...},"user_data":?}`.
+/// Optional **`user_data`** is **bucket 2** (replicated simulation JSON). Unknown keys are ignored.
 #[derive(serde::Deserialize)]
 struct PlayerStateMessage {
     #[serde(rename = "type")]
@@ -19,6 +26,8 @@ struct PlayerStateMessage {
     entity_id: String,
     position: Vec3Message,
     velocity: Vec3Message,
+    #[serde(default)]
+    user_data: serde_json::Value,
 }
 
 #[derive(serde::Deserialize)]
@@ -35,12 +44,14 @@ fn parse_player_state(text: &str) -> Option<EntityStateEntry> {
     }
     let entity_id = Uuid::parse_str(&msg.entity_id).ok()?;
     // cluster_id set by cluster binary when applying (this connection is to that cluster)
-    Some(EntityStateEntry {
+    let mut entry = EntityStateEntry::new(
         entity_id,
-        cluster_id: Uuid::nil(),
-        position: Vec3::new(msg.position.x, msg.position.y, msg.position.z),
-        velocity: Vec3::new(msg.velocity.x, msg.velocity.y, msg.velocity.z),
-    })
+        Uuid::nil(),
+        Vec3::new(msg.position.x, msg.position.y, msg.position.z),
+        Vec3::new(msg.velocity.x, msg.velocity.y, msg.velocity.z),
+    );
+    entry.user_data = msg.user_data;
+    Some(entry)
 }
 
 fn should_keep_ws_loop_running_on_broadcast_error(
@@ -162,6 +173,18 @@ mod tests {
     fn parse_player_state_rejects_non_player_state_messages() {
         let payload = r#"{"type":"PING","entity_id":"00000000-0000-0000-0000-000000000000","position":{"x":0.0,"y":0.0,"z":0.0},"velocity":{"x":0.0,"y":0.0,"z":0.0}}"#;
         assert!(parse_player_state(payload).is_none());
+    }
+
+    #[test]
+    fn parse_player_state_accepts_optional_user_data() {
+        let id = Uuid::from_u128(2);
+        let payload = format!(
+            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":0.0,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}},"user_data":{{"stamina":99}}}}"#,
+            id
+        );
+        let parsed = parse_player_state(&payload).expect("parse");
+        assert_eq!(parsed.user_data, serde_json::json!({"stamina": 99}));
+        assert!(parsed.local_data.is_null());
     }
 
     #[test]

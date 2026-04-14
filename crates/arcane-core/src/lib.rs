@@ -6,7 +6,7 @@
 //! - `types`: shared math and geometry primitives (`Vec2`, `Vec3`, `ClusterGeometry`).
 //! - `clustering_model`: merge/split decision interface consumed by manager logic.
 //! - `server_pool`: allocation/release contract for cluster server capacity.
-//! - `replication_channel`: neighbor-delta contract and message schema.
+//! - `replication_channel`: neighbor-delta contract, [`EntityStateEntry`](replication_channel::EntityStateEntry) (four-bucket spine + JSON fields), [`IReplicationChannel`](replication_channel::IReplicationChannel).
 //! - `world_simulator`: contract for unobserved entity state progression.
 //!
 //! ## Interaction model

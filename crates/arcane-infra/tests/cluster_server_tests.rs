@@ -66,12 +66,12 @@ fn tick_returns_delta_with_entities() {
     let cluster_id = Uuid::new_v4();
     let server = ClusterServer::new(cluster_id);
     let entity_id = Uuid::new_v4();
-    server.add_entity(EntityStateEntry {
+    server.add_entity(EntityStateEntry::new(
         entity_id,
         cluster_id,
-        position: Vec3::new(1.0, 2.0, 3.0),
-        velocity: Vec3::new(0.0, 0.0, 0.0),
-    });
+        Vec3::new(1.0, 2.0, 3.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
     let delta = server.tick();
     assert_eq!(delta.source_cluster_id, cluster_id);
     assert_eq!(delta.tick, 1);
@@ -91,12 +91,12 @@ fn remove_entity_appears_in_next_delta_removed() {
     let cluster_id = Uuid::new_v4();
     let server = ClusterServer::new(cluster_id);
     let entity_id = Uuid::new_v4();
-    server.add_entity(EntityStateEntry {
+    server.add_entity(EntityStateEntry::new(
         entity_id,
         cluster_id,
-        position: Vec3::new(0.0, 0.0, 0.0),
-        velocity: Vec3::new(0.0, 0.0, 0.0),
-    });
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
     let _ = server.tick();
     server.remove_entity(entity_id);
     let delta = server.tick();

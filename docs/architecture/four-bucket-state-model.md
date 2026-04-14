@@ -16,7 +16,7 @@ Multiplayer backends mix **hot replication** (cluster mesh, clients), **process-
 |---|------|------------|----------------------|------------------|
 | **1** | **Spine (routing + pose)** | Fixed fields the platform understands for routing, replication, and interest management. | Hot path; in-memory; replicated every tick as part of the entity row. | `entity_id`, `cluster_id`, `position`, `velocity` |
 | **2** | **Replicated simulation payload** | Game-defined data that **must** cross the cluster mesh and usually reach clients, updated with simulation. | Hot path; serialized on Redis and (today) WebSocket payloads when present. | `EntityStateEntry::user_data` (JSON) |
-| **3** | **Cluster-local / ephemeral** | State that **must not** leave this cluster process on the replication wire. | Memory only; **lost** on process crash or if an entry is replaced from a neighbor delta without rehydrating. | `EntityStateEntry::local_data` (JSON); any fields on your [`ClusterSimulation`](../../crates/arcane-core/src/cluster_simulation.rs) implementation |
+| **3** | **Cluster-local / ephemeral** | State that **must not** leave this cluster process on the replication wire. | Memory only; **lost** on process crash or if an entry is replaced from a neighbor delta without rehydrating. | `EntityStateEntry::local_data` (JSON); plus any extra process-only state your simulation holds (see [physics-backends-and-unreal.md](physics-backends-and-unreal.md) for optional per-tick hooks) |
 | **4** | **Durable authoritative** | Transactional, persistent outcomes and tables clients may subscribe to via SpacetimeDB. | Not on the Redis tick hot path; written via reducers / module APIs on a throttled or event-driven cadence. | SpacetimeDB tables, reducers, subscriptions |
 
 ---
@@ -34,13 +34,12 @@ Source of truth: [`crates/arcane-core/src/replication_channel.rs`](../../crates/
 | `user_data` | **2 — Replicated simulation** | Omitted from JSON when `null`. On the wire to neighbors and (current reference server) clients. |
 | `local_data` | **3 — Cluster-local** | **`#[serde(skip_serializing)]`** — never part of `EntityStateDelta` JSON. Not trusted from clients; set server-side. Incoming neighbor rows arrive with `local_data` defaulted / empty for that entity. |
 
-### 3.2 Cluster simulation hook
+### 3.2 Per-tick simulation (optional)
 
-[`ClusterSimulation::on_tick`](../../crates/arcane-core/src/cluster_simulation.rs) receives `ClusterTickContext` with mutable `entities: &mut HashMap<Uuid, EntityStateEntry>`.
+Authoritative simulation may update **buckets 1–3** in memory each tick (pose, `user_data`, `local_data`). A future or game-specific **per-tick hook** in the cluster runtime is described in [physics-backends-and-unreal.md](physics-backends-and-unreal.md) (not required for using the four-bucket **data** model on the wire).
 
-- May read/write **bucket 1** and **2** (pose and `user_data`) for authoritative simulation.
-- May read/write **bucket 3** (`local_data` and internal structs on the simulation type).
-- **Bucket 4** is **not** updated inside this hook alone: call SpacetimeDB from your integration layer (reducers, SDK) when discrete events or persist windows require it.
+- Typical rules: read/write **bucket 1** and **2** for integrated motion and replicated game fields; use **bucket 3** for scratch that must not leave the process on Redis.
+- **Bucket 4** is **not** satisfied by mutating `EntityStateEntry` alone: use SpacetimeDB reducers / module APIs when discrete events or durable tables require it.
 
 ### 3.3 SpacetimeDB
 
@@ -81,20 +80,26 @@ Engine-style per-property replication (Unreal-style conditions, dormancy, per-fi
 
 Use this when updating types or wires so they stay consistent with this model.
 
-- [ ] Read this doc and [`EntityStateEntry`](../../crates/arcane-core/src/replication_channel.rs) doc comments; confirm no contradiction (fix code comments or this doc in PR if drift).
-- [ ] [`docs/architecture/README.md`](README.md) indexes this file.
-- [ ] Optional: add a short subsection under [`docs/MODULE_INTERACTIONS.md`](../MODULE_INTERACTIONS.md) pointing here (one paragraph).
-- [ ] If benchmarks or demos embed state, add a one-line comment in their README or module pointing to this doc for “where does this field live?”
+- [x] Read this doc and [`EntityStateEntry`](../../crates/arcane-core/src/replication_channel.rs) doc comments; confirm no contradiction (fix code comments or this doc in PR if drift).
+- [x] [`docs/architecture/README.md`](README.md) indexes this file.
+- [x] Pointer from [`docs/MODULE_INTERACTIONS.md`](../MODULE_INTERACTIONS.md).
+- [ ] If external benchmarks or demos embed state, pin **crate + module versions** and record manifests next to results (see §8).
 
 **Non-goals for this checklist:** unrelated features (per-client visibility, async persist refactor, crash recovery) — track those separately in your own planning.
 
 ---
 
-## 8. Quick reference card
+## 8. Workload and version pinning (benchmarks)
+
+Ceilings and comparisons are only meaningful when **Arcane’s crate version**, any **SpacetimeDB module version**, and **run manifests** (rates, visibility, authority path) are recorded next to published numbers. External harness repositories should store that metadata beside CSVs or dashboards so “what lived in which bucket” can be reconstructed.
+
+---
+
+## 9. Quick reference card
 
 ```
 Spine        → entity_id, cluster_id, position, velocity
 Replicated   → user_data (JSON, on Redis + WS in reference server)
-Local        → local_data + ClusterSimulation-owned memory
+Local        → local_data + other process-only simulation memory
 Durable      → SpacetimeDB tables / reducers / subscriptions
 ```

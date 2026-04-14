@@ -39,12 +39,12 @@ fn send_to_neighbors_no_panic_before_start() {
         seq: 0,
         tick: 0,
         timestamp: 0.0,
-        updated: vec![EntityStateEntry {
-            entity_id: Uuid::new_v4(),
-            cluster_id: mgr.cluster_id(),
-            position: Vec3::new(0.0, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
-        }],
+        updated: vec![EntityStateEntry::new(
+            Uuid::new_v4(),
+            mgr.cluster_id(),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        )],
         removed: vec![],
     };
     mgr.send_to_neighbors(delta);
