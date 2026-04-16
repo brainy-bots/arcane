@@ -11,7 +11,9 @@
 //!   CLUSTER_ID=550e8400-e29b-41d4-a716-446655440000 cargo run -p arcane-infra --bin arcane-cluster --features cluster-ws
 
 use std::env;
+use std::sync::Arc;
 
+use arcane_core::ClusterSimulation;
 use arcane_infra::cluster_runner;
 use uuid::Uuid;
 
@@ -47,6 +49,7 @@ fn main() -> Result<(), String> {
             neighbor_ids,
             ws_port,
             |_| vec![], // no demo entities; use arcane_cluster_demo from arcane-demo for that
+            Option::<Arc<dyn ClusterSimulation>>::None,
         )
     }
 

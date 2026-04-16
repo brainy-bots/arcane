@@ -167,6 +167,7 @@ mod tests {
         assert_eq!(parsed.entity_id, id);
         assert_eq!(parsed.position.x, 1.0);
         assert_eq!(parsed.velocity.z, 0.3);
+        assert!(parsed.user_data.is_null());
     }
 
     #[test]

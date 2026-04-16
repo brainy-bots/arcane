@@ -2,8 +2,18 @@
 
 use std::sync::Arc;
 
-use arcane_infra::{ClusterServer, ReplicationChannelManager};
+use arcane_infra::{ClusterServer, ClusterSimulation, ReplicationChannelManager};
 use uuid::Uuid;
+
+struct NudgePositiveX;
+
+impl ClusterSimulation for NudgePositiveX {
+    fn on_tick(&self, ctx: &mut arcane_infra::ClusterTickContext<'_>) {
+        for e in ctx.entities.values_mut() {
+            e.position.x += 10.0 * ctx.dt_seconds;
+        }
+    }
+}
 
 #[test]
 fn new_holds_cluster_id() {
@@ -81,6 +91,86 @@ fn tick_returns_delta_with_entities() {
     assert_eq!(delta.updated[0].position.y, 2.0);
     assert_eq!(delta.updated[0].position.z, 3.0);
     assert!(delta.removed.is_empty());
+}
+
+#[test]
+fn simulate_before_tick_runs_before_delta_and_sees_upcoming_tick() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    struct RecordTick;
+    impl ClusterSimulation for RecordTick {
+        fn on_tick(&self, ctx: &mut arcane_infra::ClusterTickContext<'_>) {
+            assert_eq!(ctx.tick, 1, "first frame should use upcoming tick 1");
+            assert!((ctx.dt_seconds - 0.05).abs() < 1e-9);
+            let _ = ctx
+                .entities
+                .get_mut(&Uuid::nil())
+                .expect("entity present")
+                .position
+                .x;
+        }
+    }
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::new(cluster_id);
+    server.add_entity(EntityStateEntry::new(
+        Uuid::nil(),
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+    server.simulate_before_tick(0.05, 1, Some(&RecordTick));
+    let delta = server.tick();
+    assert_eq!(delta.tick, 1);
+}
+
+#[test]
+fn simulate_before_tick_can_mutate_positions() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::new(cluster_id);
+    let entity_id = Uuid::new_v4();
+    server.add_entity(EntityStateEntry::new(
+        entity_id,
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+    ));
+    server.simulate_before_tick(1.0, 1, Some(&NudgePositiveX));
+    let delta = server.tick();
+    assert_eq!(delta.updated[0].position.x, 10.0);
+}
+
+#[test]
+fn simulate_before_tick_pending_removals_end_up_in_delta_removed() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    struct RemoveAll;
+    impl ClusterSimulation for RemoveAll {
+        fn on_tick(&self, ctx: &mut arcane_infra::ClusterTickContext<'_>) {
+            for id in ctx.entities.keys().copied().collect::<Vec<_>>() {
+                ctx.pending_removals.push(id);
+            }
+        }
+    }
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::new(cluster_id);
+    let entity_id = Uuid::new_v4();
+    server.add_entity(EntityStateEntry::new(
+        entity_id,
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+    server.simulate_before_tick(0.05, 1, Some(&RemoveAll));
+    let delta = server.tick();
+    assert!(delta.updated.is_empty());
+    assert_eq!(delta.removed, vec![entity_id]);
 }
 
 #[test]
