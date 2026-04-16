@@ -144,12 +144,12 @@ mod tests {
     use uuid::Uuid;
 
     fn mk_entry(entity_id: Uuid, cluster_id: Uuid, x: f64) -> EntityStateEntry {
-        EntityStateEntry {
+        EntityStateEntry::new(
             entity_id,
             cluster_id,
-            position: Vec3::new(x, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
-        }
+            Vec3::new(x, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        )
     }
 
     #[test]

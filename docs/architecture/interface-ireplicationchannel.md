@@ -97,17 +97,16 @@ EntityStateDelta {
 }
 
 EntityStateEntry {
-  entity_id:       UUID
-  entity_type:     PLAYER | NPC | PROJECTILE | AOE_FIELD
-  position:        Vector3
-  velocity:        Vector3
-  facing:          Quaternion
-  animation_state: AnimState
-  health:          int
-  visual_tags:     string[]
-  dirty_fields:    bitmask      // which fields changed — skip unchanged
+  entity_id:    UUID
+  cluster_id:   UUID
+  position:     Vector3      // bucket 1 — spine
+  velocity:     Vector3      // bucket 1 — spine
+  user_data:    JSON | null  // bucket 2 — on wire when present (game-defined schema)
+  // local_data: JSON — bucket 3; not serialized on EntityStateDelta (cluster process only)
 }
 ```
+
+See `docs/architecture/four-bucket-state-model.md` for the full model. Game-specific fields (health, anim, etc.) typically live in **`user_data`** (replicated) or SpacetimeDB (**bucket 4**) until finer-grained wire types exist.
 
 ---
 

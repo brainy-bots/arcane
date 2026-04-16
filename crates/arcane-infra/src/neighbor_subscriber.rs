@@ -81,12 +81,12 @@ mod tests {
             seq: 5,
             tick: 42,
             timestamp: 1.23,
-            updated: vec![EntityStateEntry {
-                entity_id: Uuid::from_u128(2),
-                cluster_id: Uuid::from_u128(3),
-                position: Vec3::new(1.0, 2.0, 3.0),
-                velocity: Vec3::new(0.1, 0.2, 0.3),
-            }],
+            updated: vec![EntityStateEntry::new(
+                Uuid::from_u128(2),
+                Uuid::from_u128(3),
+                Vec3::new(1.0, 2.0, 3.0),
+                Vec3::new(0.1, 0.2, 0.3),
+            )],
             removed: vec![Uuid::from_u128(4)],
         };
         let payload = serde_json::to_string(&delta).unwrap();

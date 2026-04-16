@@ -149,12 +149,12 @@ fn redis_channel_publish_received_by_subscriber() {
         seq: 1,
         tick: 10,
         timestamp: 100.0,
-        updated: vec![EntityStateEntry {
-            entity_id: Uuid::from_bytes([5u8; 16]),
-            cluster_id: source_id,
-            position: Vec3::new(1.0, 2.0, 3.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
-        }],
+        updated: vec![EntityStateEntry::new(
+            Uuid::from_bytes([5u8; 16]),
+            source_id,
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        )],
         removed: vec![],
     };
     let channel = RedisReplicationChannel::new(source_id, conn_pub);
