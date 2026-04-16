@@ -194,3 +194,96 @@ fn remove_entity_appears_in_next_delta_removed() {
     assert_eq!(delta.removed.len(), 1);
     assert_eq!(delta.removed[0], entity_id);
 }
+
+#[test]
+fn add_entity_respects_max_entity_cap() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::with_max_entities(cluster_id, 3);
+
+    for i in 0..5u128 {
+        server.add_entity(EntityStateEntry::new(
+            Uuid::from_u128(i),
+            cluster_id,
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+    }
+    assert_eq!(server.entity_count(), 3, "should cap at max_entities");
+}
+
+#[test]
+fn add_entity_allows_update_to_existing_at_cap() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::with_max_entities(cluster_id, 2);
+    let existing_id = Uuid::from_u128(1);
+
+    server.add_entity(EntityStateEntry::new(
+        existing_id,
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+    server.add_entity(EntityStateEntry::new(
+        Uuid::from_u128(2),
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+    assert_eq!(server.entity_count(), 2);
+
+    // Update existing entity at cap — should succeed
+    server.add_entity(EntityStateEntry::new(
+        existing_id,
+        cluster_id,
+        Vec3::new(99.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+    assert_eq!(server.entity_count(), 2);
+    let delta = server.tick();
+    let updated = delta
+        .updated
+        .iter()
+        .find(|e| e.entity_id == existing_id)
+        .unwrap();
+    assert_eq!(updated.position.x, 99.0, "existing entity position updated");
+}
+
+#[test]
+fn simulate_before_tick_panicking_simulation_poisons_but_does_not_cascade() {
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    struct PanicSim;
+    impl ClusterSimulation for PanicSim {
+        fn on_tick(&self, _ctx: &mut arcane_infra::ClusterTickContext<'_>) {
+            panic!("simulation bug");
+        }
+    }
+
+    let cluster_id = Uuid::new_v4();
+    let server = ClusterServer::new(cluster_id);
+    server.add_entity(EntityStateEntry::new(
+        Uuid::nil(),
+        cluster_id,
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, 0.0),
+    ));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server.simulate_before_tick(0.05, 1, Some(&PanicSim));
+    }));
+    assert!(result.is_err(), "panicking simulation should propagate");
+    // After a panic, the entities lock is poisoned — tick() will also panic.
+    // This is the expected Rust behavior: a bug in user simulation code is a bug.
+    let tick_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.tick()));
+    assert!(
+        tick_result.is_err(),
+        "poisoned lock makes subsequent operations fail"
+    );
+}
