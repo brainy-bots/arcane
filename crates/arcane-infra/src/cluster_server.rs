@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -58,6 +59,35 @@ impl ClusterServer {
     /// Run the server loop (tick, SpacetimeDB, replication, WebSocket). Blocks.
     pub fn run(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Runs custom simulation with exclusive access to the local entity map, then applies any
+    /// [`ClusterTickContext::pending_removals`]. Call immediately before [`ClusterServer::tick`].
+    /// `upcoming_tick` must match the tick index the next `tick()` will assign (`current_tick() + 1`
+    /// before the first `tick()` call).
+    pub fn simulate_before_tick(
+        &self,
+        dt_seconds: f64,
+        upcoming_tick: u64,
+        simulation: Option<&dyn ClusterSimulation>,
+    ) {
+        let Some(sim) = simulation else {
+            return;
+        };
+        let mut pending_removals = Vec::new();
+        {
+            let mut entities = self.entities.lock().expect("entities lock");
+            sim.on_tick(&mut ClusterTickContext {
+                cluster_id: self.cluster_id,
+                tick: upcoming_tick,
+                dt_seconds,
+                entities: &mut entities,
+                pending_removals: &mut pending_removals,
+            });
+        }
+        for id in pending_removals {
+            self.remove_entity(id);
+        }
     }
 
     /// Advance simulation by one tick, build delta from current entities, broadcast to neighbors if set, and return the delta.

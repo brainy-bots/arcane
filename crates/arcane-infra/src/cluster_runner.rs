@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arcane_core::cluster_simulation::ClusterSimulation;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -49,6 +50,9 @@ fn merge_with_neighbor_latest(
 
 /// Runs the cluster server loop with WebSocket and Redis replication.
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
+///
+/// When `simulation` is `Some`, [`ClusterSimulation::on_tick`] runs after those steps and before
+/// [`ClusterServer::tick`], using `1 / TICK_RATE_HZ` as `dt_seconds`.
 /// Never returns on success (infinite loop); returns Err only if setup fails.
 #[cfg(feature = "cluster-ws")]
 pub fn run_cluster_loop<F>(
@@ -57,6 +61,7 @@ pub fn run_cluster_loop<F>(
     neighbor_ids: Vec<Uuid>,
     ws_port: u16,
     mut extra_entities_for_tick: F,
+    simulation: Option<Arc<dyn ClusterSimulation>>,
 ) -> Result<(), String>
 where
     F: FnMut(u64) -> Vec<EntityStateEntry>,
@@ -89,6 +94,7 @@ where
     let persist = SpacetimeDbPersist::from_env();
 
     let interval = Duration::from_millis(1000 / TICK_RATE_HZ);
+    let dt_seconds = interval.as_secs_f64();
     let mut tick_count: u64 = 0;
 
     loop {
@@ -104,6 +110,12 @@ where
             neighbor_latest.insert(delta.source_cluster_id, delta.updated);
         }
         let tick_start = Instant::now();
+        let upcoming_tick = server.current_tick() + 1;
+        server.simulate_before_tick(
+            dt_seconds,
+            upcoming_tick,
+            simulation.as_ref().map(|s| s.as_ref()),
+        );
         let our_delta = server.tick();
         let tick_elapsed_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
         let merged_delta = merge_with_neighbor_latest(our_delta, &neighbor_latest);

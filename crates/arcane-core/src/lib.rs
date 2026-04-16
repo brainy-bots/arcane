@@ -14,12 +14,14 @@
 //! these contracts. `arcane-core` itself has no runtime side effects and should remain a dependency
 //! root for cross-crate compatibility.
 
+pub mod cluster_simulation;
 pub mod clustering_model;
 pub mod replication_channel;
 pub mod server_pool;
 pub mod types;
 pub mod world_simulator;
 
+pub use cluster_simulation::{ClusterSimulation, ClusterTickContext};
 pub use clustering_model::{
     ClusterDecision, ClusterInfo, DecisionReason, DecisionType, IClusteringModel, ModelInfo,
     PlayerInfo, ValidationResult, WorldStateView,

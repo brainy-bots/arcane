@@ -26,6 +26,9 @@ pub mod cluster_runner;
 #[cfg(feature = "cluster-ws")]
 pub mod ws_server;
 
+#[cfg(feature = "cluster-ws")]
+pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
+
 pub use cluster_manager::ClusterManager;
 pub use cluster_server::ClusterServer;
 pub use redis_channel::RedisReplicationChannel;
