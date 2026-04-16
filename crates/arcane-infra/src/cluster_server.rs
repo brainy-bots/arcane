@@ -81,7 +81,7 @@ impl ClusterServer {
                 cluster_id: self.cluster_id,
                 tick: upcoming_tick,
                 dt_seconds,
-                entities: &mut *entities,
+                entities: &mut entities,
                 pending_removals: &mut pending_removals,
             });
         }
