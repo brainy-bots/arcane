@@ -36,6 +36,12 @@ See [arcane-demos](https://github.com/brainy-bots/arcane-demos) for a full demo 
 
 The Unreal Engine client plugin lives in a separate repo: **arcane-client-unreal**. Add it to your project's `Plugins/` folder.
 
+## License
+
+Arcane is **source-available**. You may view, evaluate, and build the code for non-commercial purposes. Production use, commercial distribution, and managed service offerings require a commercial license from Brainy Bots Inc. See [LICENSE](LICENSE) for details.
+
+For licensing inquiries: martin.mba@gmail.com
+
 ## Versioning
 
 Releases are tagged (e.g. `v0.1.0`). See [CHANGELOG.md](CHANGELOG.md).

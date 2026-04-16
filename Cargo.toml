@@ -7,3 +7,6 @@ members = [
     "crates/arcane-pool",
     "crates/arcane-infra",
 ]
+
+[workspace.package]
+license-file = "LICENSE"
