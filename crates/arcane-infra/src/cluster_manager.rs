@@ -107,11 +107,6 @@ impl ClusterManager {
         }
     }
 
-    /// Run the manager loop (WebSocket, SpacetimeDB subscriptions, evaluation tick). Blocks.
-    pub fn run(&self) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Current number of active clusters (for tests / metrics).
     pub fn active_cluster_count(&self) -> u32 {
         self.allocated_servers.len() as u32

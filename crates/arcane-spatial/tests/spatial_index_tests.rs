@@ -166,3 +166,28 @@ fn entity_move_between_clusters_updates_both() {
     assert_eq!(geom_a.centroid.x, 2.0);
     assert_eq!(geom_b.centroid.x, 100.0);
 }
+
+#[test]
+fn get_clusters_in_region_returns_matching_clusters() {
+    let mut index = SpatialIndex::new();
+    let cluster_a = uuid(1);
+    let cluster_b = uuid(2);
+    let cluster_c = uuid(3);
+    // A near origin, B far away, C at (50,0,50)
+    index.update_entity(uuid(10), cluster_a, Vec3::new(0.0, 0.0, 0.0));
+    index.update_entity(uuid(20), cluster_b, Vec3::new(1000.0, 0.0, 1000.0));
+    index.update_entity(uuid(30), cluster_c, Vec3::new(50.0, 0.0, 50.0));
+
+    let in_region = index.get_clusters_in_region((0.0, 0.0), 100.0);
+
+    assert!(in_region.contains(&cluster_a), "A is within radius");
+    assert!(in_region.contains(&cluster_c), "C is within radius");
+    assert!(!in_region.contains(&cluster_b), "B is far away");
+}
+
+#[test]
+fn get_clusters_in_region_empty_index_returns_empty() {
+    let index = SpatialIndex::new();
+    let result = index.get_clusters_in_region((0.0, 0.0), 100.0);
+    assert!(result.is_empty());
+}

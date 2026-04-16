@@ -10,6 +10,11 @@ use uuid::Uuid;
 
 use crate::ReplicationChannelManager;
 
+/// Default maximum number of entities a single cluster will hold. Prevents unbounded memory
+/// growth from misbehaving clients sending unique entity IDs. The cap applies to `add_entity`;
+/// entities injected by `simulate_before_tick` are not capped (they are server-authoritative).
+pub const DEFAULT_MAX_ENTITIES: usize = 100_000;
+
 /// One process per cluster. Runs simulation, replication, client connections.
 pub struct ClusterServer {
     cluster_id: Uuid,
@@ -18,10 +23,15 @@ pub struct ClusterServer {
     replication: Mutex<Option<Arc<ReplicationChannelManager>>>,
     entities: Mutex<HashMap<Uuid, EntityStateEntry>>,
     pending_removed: Mutex<Vec<Uuid>>,
+    max_entities: usize,
 }
 
 impl ClusterServer {
     pub fn new(cluster_id: Uuid) -> Self {
+        Self::with_max_entities(cluster_id, DEFAULT_MAX_ENTITIES)
+    }
+
+    pub fn with_max_entities(cluster_id: Uuid, max_entities: usize) -> Self {
         Self {
             cluster_id,
             tick: AtomicU64::new(0),
@@ -29,6 +39,7 @@ impl ClusterServer {
             replication: Mutex::new(None),
             entities: Mutex::new(HashMap::new()),
             pending_removed: Mutex::new(Vec::new()),
+            max_entities,
         }
     }
 
@@ -39,11 +50,14 @@ impl ClusterServer {
     }
 
     /// Add or update an entity in this cluster's local state. Included in next tick's delta.
+    /// Silently drops the entry if the entity map is at capacity and the entity_id is new
+    /// (updates to existing entities are always accepted).
     pub fn add_entity(&self, entry: EntityStateEntry) {
-        self.entities
-            .lock()
-            .expect("entities lock")
-            .insert(entry.entity_id, entry);
+        let mut entities = self.entities.lock().expect("entities lock");
+        if entities.len() >= self.max_entities && !entities.contains_key(&entry.entity_id) {
+            return;
+        }
+        entities.insert(entry.entity_id, entry);
     }
 
     /// Mark an entity for removal. It will appear in the next tick's delta as removed, then be dropped from local state.
@@ -54,11 +68,6 @@ impl ClusterServer {
             .lock()
             .expect("pending_removed lock")
             .push(entity_id);
-    }
-
-    /// Run the server loop (tick, SpacetimeDB, replication, WebSocket). Blocks.
-    pub fn run(&self) -> Result<(), String> {
-        Ok(())
     }
 
     /// Runs custom simulation with exclusive access to the local entity map, then applies any
