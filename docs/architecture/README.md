@@ -2,6 +2,10 @@
 
 This folder contains interface and module responsibility specs for the `arcane` repository.
 
+## System data flow
+
+- **[connection-types.md](connection-types.md)** — The five connection types in an Arcane deployment: Client→Cluster (WebSocket), Client→SpacetimeDB (actions), SpacetimeDB→Cluster (subscriptions), Cluster→Cluster (Redis), Cluster→SpacetimeDB (persistence). What flows through each and why.
+
 ## Entity state model and physics
 
 - **[four-bucket-state-model.md](four-bucket-state-model.md)** — Where entity data lives (spine, replicated JSON, cluster-local, SpacetimeDB) and how it maps to `EntityStateEntry` and SpacetimeDB.
