@@ -38,9 +38,11 @@ The Unreal Engine client plugin lives in a separate repo: **arcane-client-unreal
 
 ## License
 
-Arcane is **source-available**. You may view, evaluate, and build the code for non-commercial purposes. Production use, commercial distribution, and managed service offerings require a commercial license from Brainy Bots Inc. See [LICENSE](LICENSE) for details.
+Arcane is licensed under the [Business Source License 1.1](LICENSE) (BSL 1.1). You may copy, modify, and use the code for non-production purposes. Production use requires a commercial license from Brainy Bots Inc.
 
-For licensing inquiries: martin.mba@gmail.com
+On April 17, 2036, this version converts to Apache 2.0.
+
+For commercial licensing: martin.mba@gmail.com
 
 ## Versioning
 
