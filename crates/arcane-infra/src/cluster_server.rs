@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
+use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -74,11 +74,15 @@ impl ClusterServer {
     /// [`ClusterTickContext::pending_removals`]. Call immediately before [`ClusterServer::tick`].
     /// `upcoming_tick` must match the tick index the next `tick()` will assign (`current_tick() + 1`
     /// before the first `tick()` call).
+    ///
+    /// `game_actions` contains client actions received since the last tick. The simulation
+    /// decides how to handle them (e.g., validate through SpacetimeDB, apply buffs).
     pub fn simulate_before_tick(
         &self,
         dt_seconds: f64,
         upcoming_tick: u64,
         simulation: Option<&dyn ClusterSimulation>,
+        game_actions: &[GameAction],
     ) {
         let Some(sim) = simulation else {
             return;
@@ -92,6 +96,7 @@ impl ClusterServer {
                 dt_seconds,
                 entities: &mut entities,
                 pending_removals: &mut pending_removals,
+                game_actions,
             });
         }
         for id in pending_removals {

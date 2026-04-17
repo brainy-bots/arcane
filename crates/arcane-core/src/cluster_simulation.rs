@@ -8,12 +8,36 @@
 //! `arcane_infra::cluster_runner::run_cluster_loop` (Cargo feature `cluster-ws` on `arcane-infra`).
 //! The hook runs
 //! after client updates and injected entities are applied, and before the replication delta is built.
+//!
+//! ## Game actions
+//!
+//! Clients may send simulation-affecting game actions (e.g., "use item", "cast spell") via
+//! WebSocket. These arrive as [`GameAction`] values in [`ClusterTickContext::game_actions`].
+//! The simulation decides what to do: validate through SpacetimeDB, apply buffs, etc.
+//! Non-simulation actions (cosmetics, chat, quests) go direct from client to SpacetimeDB
+//! and never reach the cluster.
 
 use std::collections::HashMap;
 
 use uuid::Uuid;
 
 use crate::replication_channel::EntityStateEntry;
+
+/// A game action sent by a client through the cluster WebSocket. The cluster's
+/// [`ClusterSimulation`] processes these — typically by validating through SpacetimeDB
+/// and applying simulation effects (buffs, roots, damage).
+///
+/// The `action_type` and `payload` are game-defined. The library does not interpret them.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GameAction {
+    /// Which entity (player) is performing the action.
+    pub entity_id: Uuid,
+    /// Game-defined action type (e.g., "use_item", "cast_spell", "interact").
+    pub action_type: String,
+    /// Game-defined payload (e.g., `{"item_type": 5}` or `{"target_id": "uuid"}`).
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
 
 /// Mutable view of one tick's simulation inputs. Custom logic may update positions and velocities.
 ///
@@ -28,6 +52,9 @@ pub struct ClusterTickContext<'a> {
     pub entities: &'a mut HashMap<Uuid, EntityStateEntry>,
     /// Processed after `on_tick` returns so the next delta lists these ids under `removed`.
     pub pending_removals: &'a mut Vec<Uuid>,
+    /// Game actions received from clients this tick. The simulation processes these — the library
+    /// does not interpret them. Drained each tick (actions not consumed are discarded).
+    pub game_actions: &'a [GameAction],
 }
 
 /// Custom simulation step for entities owned by this cluster.
