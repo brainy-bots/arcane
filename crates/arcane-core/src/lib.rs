@@ -21,7 +21,7 @@ pub mod server_pool;
 pub mod types;
 pub mod world_simulator;
 
-pub use cluster_simulation::{ClusterSimulation, ClusterTickContext};
+pub use cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 pub use clustering_model::{
     ClusterDecision, ClusterInfo, DecisionReason, DecisionType, IClusteringModel, ModelInfo,
     PlayerInfo, ValidationResult, WorldStateView,

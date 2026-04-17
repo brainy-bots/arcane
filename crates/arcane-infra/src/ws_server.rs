@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender};
 
+use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use arcane_core::Vec3;
 use futures_util::{sink::SinkExt, stream::StreamExt};
@@ -67,6 +68,41 @@ fn parse_player_state(text: &str) -> Option<EntityStateEntry> {
     Some(entry)
 }
 
+/// Generic incoming WebSocket message — we peek at "type" to decide how to route it.
+#[derive(serde::Deserialize)]
+struct TypePeek {
+    #[serde(rename = "type")]
+    msg_type: String,
+}
+
+/// Parse a game action message. Expects JSON:
+/// `{"type":"GAME_ACTION","entity_id":"uuid","action_type":"use_item","payload":{...}}`.
+fn parse_game_action(text: &str) -> Option<GameAction> {
+    if text.len() > MAX_MESSAGE_BYTES {
+        return None;
+    }
+    serde_json::from_str::<GameAction>(text).ok()
+}
+
+/// Result of parsing an incoming WebSocket text message.
+enum ClientMessage {
+    PlayerState(EntityStateEntry),
+    Action(GameAction),
+}
+
+/// Route an incoming WebSocket text message to the appropriate type.
+fn parse_client_message(text: &str) -> Option<ClientMessage> {
+    if text.len() > MAX_MESSAGE_BYTES {
+        return None;
+    }
+    let peek: TypePeek = serde_json::from_str(text).ok()?;
+    match peek.msg_type.as_str() {
+        "PLAYER_STATE" => parse_player_state(text).map(ClientMessage::PlayerState),
+        "GAME_ACTION" => parse_game_action(text).map(ClientMessage::Action),
+        _ => None,
+    }
+}
+
 fn should_keep_ws_loop_running_on_broadcast_error(
     error: &tokio::sync::broadcast::error::RecvError,
 ) -> bool {
@@ -77,13 +113,14 @@ pub fn run_ws_server(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
+    game_actions_tx: Sender<GameAction>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        rt.block_on(ws_loop(port, state_rx, client_updates_tx));
+        rt.block_on(ws_loop(port, state_rx, client_updates_tx, game_actions_tx));
     });
 }
 
@@ -91,6 +128,7 @@ async fn ws_loop(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
+    game_actions_tx: Sender<GameAction>,
 ) {
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -127,6 +165,7 @@ async fn ws_loop(
         };
         let mut recv = broadcast_tx.subscribe();
         let updates_tx = client_updates_tx.clone();
+        let actions_tx = game_actions_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -149,8 +188,14 @@ async fn ws_loop(
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
-                                if let Some(entry) = parse_player_state(&text) {
-                                    let _ = updates_tx.send(entry);
+                                match parse_client_message(&text) {
+                                    Some(ClientMessage::PlayerState(entry)) => {
+                                        let _ = updates_tx.send(entry);
+                                    }
+                                    Some(ClientMessage::Action(action)) => {
+                                        let _ = actions_tx.send(action);
+                                    }
+                                    None => {}
                                 }
                             }
                             Some(Err(_)) | None => break,
@@ -165,7 +210,10 @@ async fn ws_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_player_state, should_keep_ws_loop_running_on_broadcast_error};
+    use super::{
+        parse_client_message, parse_game_action, parse_player_state,
+        should_keep_ws_loop_running_on_broadcast_error, ClientMessage,
+    };
     use tokio::sync::broadcast::error::RecvError;
     use uuid::Uuid;
 
@@ -253,6 +301,54 @@ mod tests {
             id, big_data
         );
         assert!(parse_player_state(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_game_action_accepts_valid_payload() {
+        let id = Uuid::from_u128(10);
+        let payload = format!(
+            r#"{{"type":"GAME_ACTION","entity_id":"{}","action_type":"use_item","payload":{{"item_type":5}}}}"#,
+            id
+        );
+        let action = parse_game_action(&payload).expect("valid game action");
+        assert_eq!(action.entity_id, id);
+        assert_eq!(action.action_type, "use_item");
+        assert_eq!(action.payload, serde_json::json!({"item_type": 5}));
+    }
+
+    #[test]
+    fn parse_client_message_routes_player_state() {
+        let id = Uuid::from_u128(1);
+        let payload = format!(
+            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":1.0,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}}}}"#,
+            id
+        );
+        match parse_client_message(&payload) {
+            Some(ClientMessage::PlayerState(e)) => assert_eq!(e.entity_id, id),
+            _ => panic!("expected PlayerState"),
+        }
+    }
+
+    #[test]
+    fn parse_client_message_routes_game_action() {
+        let id = Uuid::from_u128(20);
+        let payload = format!(
+            r#"{{"type":"GAME_ACTION","entity_id":"{}","action_type":"cast_spell","payload":{{}}}}"#,
+            id
+        );
+        match parse_client_message(&payload) {
+            Some(ClientMessage::Action(a)) => {
+                assert_eq!(a.entity_id, id);
+                assert_eq!(a.action_type, "cast_spell");
+            }
+            _ => panic!("expected Action"),
+        }
+    }
+
+    #[test]
+    fn parse_client_message_rejects_unknown_type() {
+        let payload = r#"{"type":"UNKNOWN","data":"foo"}"#;
+        assert!(parse_client_message(payload).is_none());
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub mod cluster_runner;
 pub mod ws_server;
 
 #[cfg(feature = "cluster-ws")]
-pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
+pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 
 pub use cluster_manager::ClusterManager;
 pub use cluster_server::ClusterServer;

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use arcane_core::cluster_simulation::ClusterSimulation;
+use arcane_core::cluster_simulation::{ClusterSimulation, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -77,7 +77,8 @@ where
 
     let (state_tx, state_rx) = std::sync::mpsc::channel();
     let (client_updates_tx, client_updates_rx) = std::sync::mpsc::channel();
-    crate::ws_server::run_ws_server(ws_port, state_rx, client_updates_tx);
+    let (game_actions_tx, game_actions_rx) = std::sync::mpsc::channel::<GameAction>();
+    crate::ws_server::run_ws_server(ws_port, state_rx, client_updates_tx, game_actions_tx);
 
     let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel::<EntityStateDelta>();
     spawn_neighbor_subscriber(redis_url.clone(), neighbor_ids.clone(), neighbor_tx);
@@ -109,12 +110,17 @@ where
         while let Ok(delta) = neighbor_rx.try_recv() {
             neighbor_latest.insert(delta.source_cluster_id, delta.updated);
         }
+        let mut tick_actions: Vec<GameAction> = Vec::new();
+        while let Ok(action) = game_actions_rx.try_recv() {
+            tick_actions.push(action);
+        }
         let tick_start = Instant::now();
         let upcoming_tick = server.current_tick() + 1;
         server.simulate_before_tick(
             dt_seconds,
             upcoming_tick,
             simulation.as_ref().map(|s| s.as_ref()),
+            &tick_actions,
         );
         let our_delta = server.tick();
         let tick_elapsed_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
