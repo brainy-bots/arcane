@@ -2,6 +2,10 @@
 
 This folder contains interface and module responsibility specs for the `arcane` repository.
 
+## Design pillars
+
+- **[progressive-api.md](progressive-api.md)** — Every platform capability is a ladder: level-0 free default, level-1 data-level, level-2 simple knob, level-3 typed opt-in, level-4 escape hatch. Complexity paid ≈ optimization gained. Contributors adding new APIs follow this shape; reviewers push back when a PR forces advanced APIs on users who don't need them yet.
+
 ## System data flow
 
 - **[connection-types.md](connection-types.md)** — The five connection types in an Arcane deployment: Client→Cluster (WebSocket), Client→SpacetimeDB (actions), SpacetimeDB→Cluster (subscriptions), Cluster→Cluster (Redis), Cluster→SpacetimeDB (persistence). What flows through each and why.
