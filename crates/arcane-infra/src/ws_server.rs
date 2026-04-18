@@ -209,10 +209,12 @@ async fn ws_loop(
                                 match parse_client_message(&text) {
                                     Some(ClientMessage::PlayerState(entry)) => {
                                         stats.msgs_player_state.fetch_add(1, Ordering::Relaxed);
+                                        stats.note_entity_id(entry.entity_id);
                                         let _ = updates_tx.send(entry);
                                     }
                                     Some(ClientMessage::Action(action)) => {
                                         stats.msgs_game_action.fetch_add(1, Ordering::Relaxed);
+                                        stats.note_entity_id(action.entity_id);
                                         let _ = actions_tx.send(action);
                                     }
                                     None => {

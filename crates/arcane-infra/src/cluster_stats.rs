@@ -8,8 +8,11 @@
 //! driver can cross-check "the swarm claims to have sent N messages" against
 //! "each cluster actually accepted K of them".
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 pub struct ClusterStats {
@@ -33,11 +36,32 @@ pub struct ClusterStats {
     pub seq: AtomicU64,
     /// Most recent tick elapsed time, in microseconds, for quick health signaling.
     pub last_tick_us: AtomicU64,
+    /// Set of entity UUIDs ever observed in a parsed PLAYER_STATE message. The
+    /// set is write-only at accept time and only its `len()` is exposed via /stats.
+    /// This lets the harness distinguish "many messages share a few ids" from
+    /// "many unique ids get dropped after insert" — two very different bugs.
+    unique_entity_ids: Mutex<HashSet<Uuid>>,
 }
 
 impl ClusterStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Record that we observed an entity_id in an accepted PLAYER_STATE message.
+    /// Uses a mutex rather than a lock-free set to keep cluster-ws with no new
+    /// deps; contention is only at /stats-read time (counting .len()).
+    pub fn note_entity_id(&self, id: Uuid) {
+        if let Ok(mut set) = self.unique_entity_ids.lock() {
+            set.insert(id);
+        }
+    }
+
+    pub fn unique_entity_ids_count(&self) -> u64 {
+        self.unique_entity_ids
+            .lock()
+            .map(|s| s.len() as u64)
+            .unwrap_or(0)
     }
 
     pub fn set_entities(&self, n: u64) {
@@ -60,7 +84,7 @@ impl ClusterStats {
     /// so the harness's SSM/poll path is cheap.
     pub fn to_json(&self, cluster_id: &str) -> String {
         format!(
-            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"entities_current":{},"entities_peak":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
+            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
             cluster_id,
             self.ws_accepts.load(Ordering::Relaxed),
             self.msgs_player_state.load(Ordering::Relaxed),
@@ -69,6 +93,7 @@ impl ClusterStats {
             self.bytes_in.load(Ordering::Relaxed),
             self.entities_current.load(Ordering::Relaxed),
             self.entities_peak.load(Ordering::Relaxed),
+            self.unique_entity_ids_count(),
             self.tick.load(Ordering::Relaxed),
             self.seq.load(Ordering::Relaxed),
             self.last_tick_us.load(Ordering::Relaxed),
@@ -167,6 +192,9 @@ mod tests {
         s.tick.store(500, Ordering::Relaxed);
         s.seq.store(501, Ordering::Relaxed);
         s.last_tick_us.store(780, Ordering::Relaxed);
+        s.note_entity_id(Uuid::from_u128(1));
+        s.note_entity_id(Uuid::from_u128(2));
+        s.note_entity_id(Uuid::from_u128(1)); // duplicate — still counted as 1
         let json = s.to_json("abc-123");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         assert_eq!(parsed["cluster_id"], "abc-123");
@@ -177,6 +205,7 @@ mod tests {
         assert_eq!(parsed["bytes_in"], 12345);
         assert_eq!(parsed["entities_current"], 42);
         assert_eq!(parsed["entities_peak"], 42);
+        assert_eq!(parsed["unique_entity_ids_seen"], 2);
         assert_eq!(parsed["tick"], 500);
         assert_eq!(parsed["seq"], 501);
         assert_eq!(parsed["last_tick_us"], 780);
