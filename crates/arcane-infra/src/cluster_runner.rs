@@ -171,8 +171,8 @@ where
         if tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
             let entities = server.entity_count();
             let clusters = 1u32; // This process is one cluster; multi-cluster = multiple processes
-            // Extended ArcaneServerStats: adds ws_accepts / msgs / parse_failures so log-only
-            // analysis (no /stats query) can still surface silent failures.
+                                 // Extended ArcaneServerStats: adds ws_accepts / msgs / parse_failures so log-only
+                                 // analysis (no /stats query) can still surface silent failures.
             eprintln!(
                 "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={}",
                 entities,
