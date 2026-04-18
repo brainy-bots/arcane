@@ -13,10 +13,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::Ordering;
+
 use arcane_core::cluster_simulation::{ClusterSimulation, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
+#[cfg(feature = "cluster-ws")]
+use crate::cluster_stats::{serve_stats_http, ClusterStats};
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
 #[cfg(feature = "spacetimedb-persist")]
@@ -78,7 +82,21 @@ where
     let (state_tx, state_rx) = std::sync::mpsc::channel();
     let (client_updates_tx, client_updates_rx) = std::sync::mpsc::channel();
     let (game_actions_tx, game_actions_rx) = std::sync::mpsc::channel::<GameAction>();
-    crate::ws_server::run_ws_server(ws_port, state_rx, client_updates_tx, game_actions_tx);
+
+    let stats = ClusterStats::new();
+    let stats_port = std::env::var("CLUSTER_STATS_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(ws_port.saturating_add(1));
+    serve_stats_http(stats_port, cluster_id.to_string(), stats.clone());
+
+    crate::ws_server::run_ws_server(
+        ws_port,
+        state_rx,
+        client_updates_tx,
+        game_actions_tx,
+        stats.clone(),
+    );
 
     let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel::<EntityStateDelta>();
     spawn_neighbor_subscriber(redis_url.clone(), neighbor_ids.clone(), neighbor_tx);
@@ -123,7 +141,8 @@ where
             &tick_actions,
         );
         let our_delta = server.tick();
-        let tick_elapsed_ms = tick_start.elapsed().as_secs_f64() * 1000.0;
+        let tick_elapsed = tick_start.elapsed();
+        let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
         let merged_delta = merge_with_neighbor_latest(our_delta, &neighbor_latest);
         #[cfg(feature = "spacetimedb-persist")]
         if let Some(ref persist) = persist {
@@ -131,6 +150,15 @@ where
         }
 
         let _ = state_tx.send(merged_delta);
+
+        stats.set_entities(server.entity_count() as u64);
+        stats.tick.store(server.current_tick(), Ordering::Relaxed);
+        stats
+            .seq
+            .store(server.current_seq() as u64, Ordering::Relaxed);
+        stats
+            .last_tick_us
+            .store(tick_elapsed.as_micros() as u64, Ordering::Relaxed);
 
         tick_count += 1;
         if tick_count.is_multiple_of(LOG_EVERY_TICKS) {
@@ -143,9 +171,18 @@ where
         if tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
             let entities = server.entity_count();
             let clusters = 1u32; // This process is one cluster; multi-cluster = multiple processes
+            // Extended ArcaneServerStats: adds ws_accepts / msgs / parse_failures so log-only
+            // analysis (no /stats query) can still surface silent failures.
             eprintln!(
-                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2}",
-                entities, clusters, tick_elapsed_ms
+                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={}",
+                entities,
+                clusters,
+                tick_elapsed_ms,
+                stats.ws_accepts.load(Ordering::Relaxed),
+                stats.msgs_player_state.load(Ordering::Relaxed),
+                stats.msgs_game_action.load(Ordering::Relaxed),
+                stats.parse_failures.load(Ordering::Relaxed),
+                stats.bytes_in.load(Ordering::Relaxed),
             );
         }
         thread::sleep(interval);

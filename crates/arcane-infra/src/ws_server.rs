@@ -7,7 +7,9 @@
 //! never taken from the client; it stays default until the cluster sets it server-side.
 
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
@@ -16,6 +18,8 @@ use futures_util::{sink::SinkExt, stream::StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+
+use crate::cluster_stats::ClusterStats;
 
 /// Incoming message from a client. Expects JSON:
 /// `{"type":"PLAYER_STATE","entity_id":"uuid","position":{...},"velocity":{...},"user_data":?}`.
@@ -114,13 +118,20 @@ pub fn run_ws_server(
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
+    stats: Arc<ClusterStats>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
-        rt.block_on(ws_loop(port, state_rx, client_updates_tx, game_actions_tx));
+        rt.block_on(ws_loop(
+            port,
+            state_rx,
+            client_updates_tx,
+            game_actions_tx,
+            stats,
+        ));
     });
 }
 
@@ -129,6 +140,7 @@ async fn ws_loop(
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
+    stats: Arc<ClusterStats>,
 ) {
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(256);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -158,14 +170,19 @@ async fn ws_loop(
         }
     });
 
-    while let Ok((stream, _)) = listener.accept().await {
+    while let Ok((stream, peer_addr)) = listener.accept().await {
         let mut ws_stream = match tokio_tungstenite::accept_async(stream).await {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let accept_n = stats.ws_accepts.fetch_add(1, Ordering::Relaxed) + 1;
+        if accept_n <= 3 || accept_n.is_power_of_two() {
+            eprintln!("ws accept #{} from {}", accept_n, peer_addr);
+        }
         let mut recv = broadcast_tx.subscribe();
         let updates_tx = client_updates_tx.clone();
         let actions_tx = game_actions_tx.clone();
+        let stats = stats.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -188,14 +205,19 @@ async fn ws_loop(
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
+                                stats.bytes_in.fetch_add(text.len() as u64, Ordering::Relaxed);
                                 match parse_client_message(&text) {
                                     Some(ClientMessage::PlayerState(entry)) => {
+                                        stats.msgs_player_state.fetch_add(1, Ordering::Relaxed);
                                         let _ = updates_tx.send(entry);
                                     }
                                     Some(ClientMessage::Action(action)) => {
+                                        stats.msgs_game_action.fetch_add(1, Ordering::Relaxed);
                                         let _ = actions_tx.send(action);
                                     }
-                                    None => {}
+                                    None => {
+                                        stats.parse_failures.fetch_add(1, Ordering::Relaxed);
+                                    }
                                 }
                             }
                             Some(Err(_)) | None => break,
