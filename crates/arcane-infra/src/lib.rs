@@ -24,6 +24,8 @@ pub mod spacetimedb_persist;
 #[cfg(feature = "cluster-ws")]
 pub mod cluster_runner;
 #[cfg(feature = "cluster-ws")]
+pub mod cluster_stats;
+#[cfg(feature = "cluster-ws")]
 pub mod ws_server;
 
 #[cfg(feature = "cluster-ws")]
