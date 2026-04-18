@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-18
+
+### Added
+- **arcane-core**: `GameAction` struct for client-to-cluster game action messages (entity_id, action_type, JSON payload).
+- **arcane-core**: `ClusterTickContext::game_actions` field — simulation receives client actions each tick.
+- **arcane-infra**: WebSocket server parses `GAME_ACTION` messages alongside `PLAYER_STATE`, routes to separate channel.
+- **arcane-infra**: `cluster_runner` drains game actions per tick and passes to `simulate_before_tick`.
+- **docs**: Connection types architecture doc — the four connection types in an Arcane deployment and developer decision guide.
+
 ## [0.1.0] - 2026-04-17
 
 ### Added
@@ -32,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **arcane-pool**: LocalPool / ClusterServerPool (IN-07) — IServerPool implementation.
 - **arcane-infra**: ClusterManager, ClusterServer, ReplicationChannelManager, RPCHandler; binaries `arcane-cluster` and `arcane-manager` (reference server).
 
-[Unreleased]: https://github.com/brainy-bots/arcane/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/brainy-bots/arcane/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/brainy-bots/arcane/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/brainy-bots/arcane/releases/tag/v0.1.0
 [0.0.1]: https://github.com/brainy-bots/arcane/releases/tag/v0.0.1
