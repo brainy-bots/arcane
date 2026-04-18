@@ -76,50 +76,6 @@ impl ClusterStats {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn set_entities_tracks_peak() {
-        let s = ClusterStats::new();
-        s.set_entities(10);
-        s.set_entities(5);
-        s.set_entities(20);
-        s.set_entities(15);
-        assert_eq!(s.entities_current.load(Ordering::Relaxed), 15);
-        assert_eq!(s.entities_peak.load(Ordering::Relaxed), 20);
-    }
-
-    #[test]
-    fn to_json_includes_all_counters() {
-        let s = ClusterStats::new();
-        s.ws_accepts.store(3, Ordering::Relaxed);
-        s.msgs_player_state.store(100, Ordering::Relaxed);
-        s.msgs_game_action.store(7, Ordering::Relaxed);
-        s.parse_failures.store(2, Ordering::Relaxed);
-        s.bytes_in.store(12345, Ordering::Relaxed);
-        s.set_entities(42);
-        s.tick.store(500, Ordering::Relaxed);
-        s.seq.store(501, Ordering::Relaxed);
-        s.last_tick_us.store(780, Ordering::Relaxed);
-        let json = s.to_json("abc-123");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(parsed["cluster_id"], "abc-123");
-        assert_eq!(parsed["ws_accepts"], 3);
-        assert_eq!(parsed["msgs_player_state"], 100);
-        assert_eq!(parsed["msgs_game_action"], 7);
-        assert_eq!(parsed["parse_failures"], 2);
-        assert_eq!(parsed["bytes_in"], 12345);
-        assert_eq!(parsed["entities_current"], 42);
-        assert_eq!(parsed["entities_peak"], 42);
-        assert_eq!(parsed["tick"], 500);
-        assert_eq!(parsed["seq"], 501);
-        assert_eq!(parsed["last_tick_us"], 780);
-    }
-}
-
 /// Minimal HTTP server that returns `stats.to_json(cluster_id)` on GET `/stats`
 /// and a liveness blob on `/`. Binds on `0.0.0.0:<port>` and never returns; run
 /// in its own OS thread with a private Tokio runtime.
@@ -181,4 +137,48 @@ pub fn serve_stats_http(port: u16, cluster_id: String, stats: Arc<ClusterStats>)
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn set_entities_tracks_peak() {
+        let s = ClusterStats::new();
+        s.set_entities(10);
+        s.set_entities(5);
+        s.set_entities(20);
+        s.set_entities(15);
+        assert_eq!(s.entities_current.load(Ordering::Relaxed), 15);
+        assert_eq!(s.entities_peak.load(Ordering::Relaxed), 20);
+    }
+
+    #[test]
+    fn to_json_includes_all_counters() {
+        let s = ClusterStats::new();
+        s.ws_accepts.store(3, Ordering::Relaxed);
+        s.msgs_player_state.store(100, Ordering::Relaxed);
+        s.msgs_game_action.store(7, Ordering::Relaxed);
+        s.parse_failures.store(2, Ordering::Relaxed);
+        s.bytes_in.store(12345, Ordering::Relaxed);
+        s.set_entities(42);
+        s.tick.store(500, Ordering::Relaxed);
+        s.seq.store(501, Ordering::Relaxed);
+        s.last_tick_us.store(780, Ordering::Relaxed);
+        let json = s.to_json("abc-123");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["cluster_id"], "abc-123");
+        assert_eq!(parsed["ws_accepts"], 3);
+        assert_eq!(parsed["msgs_player_state"], 100);
+        assert_eq!(parsed["msgs_game_action"], 7);
+        assert_eq!(parsed["parse_failures"], 2);
+        assert_eq!(parsed["bytes_in"], 12345);
+        assert_eq!(parsed["entities_current"], 42);
+        assert_eq!(parsed["entities_peak"], 42);
+        assert_eq!(parsed["tick"], 500);
+        assert_eq!(parsed["seq"], 501);
+        assert_eq!(parsed["last_tick_us"], 780);
+    }
 }
