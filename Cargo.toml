@@ -10,4 +10,4 @@ members = [
 ]
 
 [workspace.package]
-license-file = "LICENSE"
+license = "AGPL-3.0-only"

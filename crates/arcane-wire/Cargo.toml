@@ -3,7 +3,7 @@ name = "arcane-wire"
 version = "0.1.0"
 edition = "2021"
 description = "Stable wire schema + codec helpers for Arcane cluster <-> client WebSocket messages."
-license-file.workspace = true
+license.workspace = true
 
 # Intentionally minimal dependencies — this crate is the shared wire contract
 # between the cluster (`arcane-infra`) and any external client (swarm driver,
