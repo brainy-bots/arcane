@@ -1,0 +1,19 @@
+[package]
+name = "arcane-wire"
+version = "0.1.0"
+edition = "2021"
+description = "Stable wire schema + codec helpers for Arcane cluster <-> client WebSocket messages."
+license-file.workspace = true
+
+# Intentionally minimal dependencies — this crate is the shared wire contract
+# between the cluster (`arcane-infra`) and any external client (swarm driver,
+# UE5 adapter, etc.). Keep it free of tokio, tungstenite, game logic, or
+# internal Arcane types so downstream consumers can take a dep on the schema
+# without pulling a server-shaped tree.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"
