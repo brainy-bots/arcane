@@ -5,8 +5,16 @@
 //! - encode `EntityStateEntry` batches into SpacetimeDB reducer payload shape
 //! - send chunked HTTP requests and log success/failure totals
 //!
-//! **Four buckets:** this path mirrors **bucket 1** (pose) into **bucket 4** (durable tables) at a
-//! throttled cadence — not a substitute for hot Redis replication between clusters.
+//! **Four buckets:** this path mirrors **bucket 1** (pose) *and* **bucket 2** (`user_data`) into
+//! **bucket 4** (durable tables) at a throttled cadence — not a substitute for hot Redis
+//! replication between clusters. The target SpacetimeDB module's `Entity` table must include
+//! columns matching the fields this encoder emits (`entity_id`, `x`, `y`, `z`, `user_data`).
+//!
+//! **Progressive-API note (see `docs/architecture/progressive-api.md`):** this is the level-1
+//! auto-persist path. Level-0 users get positions for free; level-1 users put any additional
+//! per-entity state in `EntityStateEntry::user_data` and it rides along in the same snapshot.
+//! Level-2+ (explicit flush trigger, custom reducer, typed schemas) is deferred until a real
+//! game-driven use case demands it.
 //!
 //! This module does not own simulation timing; `cluster_runner` decides when to call it.
 
@@ -27,12 +35,27 @@ struct SpacetimeEntityRow {
     x: f64,
     y: f64,
     z: f64,
+    /// Serialized `EntityStateEntry::user_data` (JSON). Empty string when the entry has no
+    /// user_data. Keeping it as a string (not a structured type) lets the SpacetimeDB module
+    /// column be a simple `String` that any game can stuff its own JSON into without this
+    /// library knowing the schema.
+    user_data: String,
+}
+
+fn encode_user_data(value: &serde_json::Value) -> String {
+    if value.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(value).unwrap_or_default()
+    }
 }
 
 fn encode_spacetimedb_entities_body(
     chunk: &[EntityStateEntry],
 ) -> Result<String, serde_json::Error> {
-    // SpacetimeDB Entity table is position-only (entity_id, x, y, z); omit velocity.
+    // Snapshot carries pose (bucket 1) plus user_data (bucket 2). The SpacetimeDB module's
+    // Entity table is expected to have a `user_data: String` column; games that don't use
+    // bucket 2 get an empty string and pay no meaningful cost.
     let entities: Vec<SpacetimeEntityRow> = chunk
         .iter()
         .map(|e| SpacetimeEntityRow {
@@ -42,6 +65,7 @@ fn encode_spacetimedb_entities_body(
             x: e.position.x,
             y: e.position.y,
             z: e.position.z,
+            user_data: encode_user_data(&e.user_data),
         })
         .collect();
     serde_json::to_string(&vec![entities])
@@ -202,6 +226,26 @@ mod tests {
         let body = encode_spacetimedb_entities_body(&[e1, e2]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v[0].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn encode_spacetimedb_entities_body_carries_user_data() {
+        // Null user_data → empty string (bucket 2 not used by this game).
+        let mut null_entry = mk_entry(Uuid::from_u128(20), 0.0, 0.0, 0.0);
+        null_entry.user_data = serde_json::Value::Null;
+
+        // Populated user_data → JSON-encoded string column.
+        let mut rich_entry = mk_entry(Uuid::from_u128(21), 0.0, 0.0, 0.0);
+        rich_entry.user_data = serde_json::json!({ "hp": 73, "inv": ["sword"] });
+
+        let body = encode_spacetimedb_entities_body(&[null_entry, rich_entry]).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rows = v[0].as_array().unwrap();
+        assert_eq!(rows[0]["user_data"].as_str().unwrap(), "");
+        let parsed: serde_json::Value =
+            serde_json::from_str(rows[1]["user_data"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["hp"], 73);
+        assert_eq!(parsed["inv"][0], "sword");
     }
 
     #[test]
