@@ -6,6 +6,7 @@ members = [
     "crates/arcane-rules",
     "crates/arcane-pool",
     "crates/arcane-infra",
+    "crates/arcane-wire",
 ]
 
 [workspace.package]
