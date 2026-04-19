@@ -116,13 +116,28 @@ pub enum ServerFrame {
     Delta(DeltaPayload),
 }
 
-/// Encode a value as postcard bytes. Returns a newly allocated `Vec<u8>`.
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, postcard::Error> {
-    postcard::to_allocvec(value)
+/// Encode a `ClientFrame` as postcard bytes.
+///
+/// Typed rather than generic on purpose: callers should not be able to
+/// serialize arbitrary types through this crate — only the wire-contract
+/// frame types. This keeps the "what goes on the wire" story monotonic.
+pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(frame)
 }
 
-/// Decode a postcard byte slice into a value.
-pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, postcard::Error> {
+/// Decode a postcard byte slice into a `ClientFrame`.
+pub fn decode_client(bytes: &[u8]) -> Result<ClientFrame, postcard::Error> {
+    postcard::from_bytes(bytes)
+}
+
+/// Encode a `ServerFrame` as postcard bytes. Typed for the same reason as
+/// [`encode_client`].
+pub fn encode_server(frame: &ServerFrame) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(frame)
+}
+
+/// Decode a postcard byte slice into a `ServerFrame`.
+pub fn decode_server(bytes: &[u8]) -> Result<ServerFrame, postcard::Error> {
     postcard::from_bytes(bytes)
 }
 
@@ -148,8 +163,8 @@ mod tests {
             velocity: Vec3::new(0.5, 0.0, -0.5),
             user_data: Vec::new(),
         });
-        let bytes = encode(&frame).unwrap();
-        let back: ClientFrame = decode(&bytes).unwrap();
+        let bytes = encode_client(&frame).unwrap();
+        let back = decode_client(&bytes).unwrap();
         assert_eq!(frame, back);
     }
 
@@ -160,8 +175,8 @@ mod tests {
             action_type: "use_item".to_string(),
             payload: br#"{"item_type":5}"#.to_vec(),
         });
-        let bytes = encode(&frame).unwrap();
-        let back: ClientFrame = decode(&bytes).unwrap();
+        let bytes = encode_client(&frame).unwrap();
+        let back = decode_client(&bytes).unwrap();
         assert_eq!(frame, back);
     }
 
@@ -175,8 +190,8 @@ mod tests {
             updated: vec![sample_entity()],
             removed: vec![Uuid::from_u128(99)],
         });
-        let bytes = encode(&frame).unwrap();
-        let back: ServerFrame = decode(&bytes).unwrap();
+        let bytes = encode_server(&frame).unwrap();
+        let back = decode_server(&bytes).unwrap();
         assert_eq!(frame, back);
     }
 
@@ -188,8 +203,8 @@ mod tests {
             velocity: Vec3::new(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         });
-        let bytes = encode(&frame).unwrap();
-        let back: ClientFrame = decode(&bytes).unwrap();
+        let bytes = encode_client(&frame).unwrap();
+        let back = decode_client(&bytes).unwrap();
         assert_eq!(frame, back);
     }
 
@@ -213,8 +228,8 @@ mod tests {
             user_data: json_bytes,
         });
 
-        let wire_bytes = encode(&frame).unwrap();
-        let decoded: ClientFrame = decode(&wire_bytes).unwrap();
+        let wire_bytes = encode_client(&frame).unwrap();
+        let decoded = decode_client(&wire_bytes).unwrap();
 
         let ClientFrame::PlayerState(payload) = decoded else {
             panic!("expected PlayerState variant");
@@ -231,9 +246,9 @@ mod tests {
             velocity: Vec3::new(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         });
-        let bytes = encode(&frame).unwrap();
+        let bytes = encode_client(&frame).unwrap();
         let truncated = &bytes[..bytes.len() - 1];
-        let result: Result<ClientFrame, _> = decode(truncated);
+        let result = decode_client(truncated);
         assert!(
             result.is_err(),
             "truncated postcard bytes should fail to decode"
