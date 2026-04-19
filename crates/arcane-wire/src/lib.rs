@@ -193,6 +193,36 @@ mod tests {
         assert_eq!(frame, back);
     }
 
+    /// The intended real-world use of `user_data`: carry JSON bytes produced
+    /// by `serde_json::to_vec`, round-trip them through postcard, and
+    /// deserialize back on the other side. Validates that the opaque-bytes
+    /// design actually works for its primary use case.
+    #[test]
+    fn user_data_as_json_bytes_roundtrips_end_to_end() {
+        let original_value = serde_json::json!({
+            "hp": 42,
+            "buffs": ["haste", "shield"],
+            "pos": {"x": 1.5, "y": -3.0},
+        });
+        let json_bytes = serde_json::to_vec(&original_value).unwrap();
+
+        let frame = ClientFrame::PlayerState(PlayerStatePayload {
+            entity_id: Uuid::from_u128(7),
+            position: Vec3::new(1.0, 2.0, 3.0),
+            velocity: Vec3::new(0.0, 0.0, 0.0),
+            user_data: json_bytes,
+        });
+
+        let wire_bytes = encode(&frame).unwrap();
+        let decoded: ClientFrame = decode(&wire_bytes).unwrap();
+
+        let ClientFrame::PlayerState(payload) = decoded else {
+            panic!("expected PlayerState variant");
+        };
+        let recovered: serde_json::Value = serde_json::from_slice(&payload.user_data).unwrap();
+        assert_eq!(recovered, original_value);
+    }
+
     #[test]
     fn decode_rejects_truncated_bytes() {
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
