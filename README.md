@@ -38,7 +38,13 @@ The Unreal Engine client plugin lives in a separate repo: **arcane-client-unreal
 
 ## License
 
-Arcane is **source-available**. You may view, evaluate, and build the code for non-commercial purposes. Production use, commercial distribution, and managed service offerings require a commercial license from Brainy Bots Inc. See [LICENSE](LICENSE) for details.
+Arcane is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](LICENSE) for the full text.
+
+In practice:
+
+- **You may use, modify, and distribute** the software under the AGPL-3.0, including integrating it into your own AGPL-licensed projects.
+- **If you embed Arcane into a server or service that users interact with over a network**, AGPL requires you to make your modified source available to those users.
+- **If you want to ship proprietary/closed-source software that links Arcane**, contact the copyright holder for a commercial license. The AGPL obligations do not apply under a commercial agreement.
 
 For licensing inquiries: martin.mba@gmail.com
 
