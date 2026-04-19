@@ -7,8 +7,8 @@
 //!
 //! **Four buckets:** this path mirrors **bucket 1** (pose) *and* **bucket 2** (`user_data`) into
 //! **bucket 4** (durable tables) at a throttled cadence — not a substitute for hot Redis
-//! replication between clusters. The module's `Entity` table schema determines which fields are
-//! actually consumed; unused fields are safely ignored.
+//! replication between clusters. The target SpacetimeDB module's `Entity` table must include
+//! columns matching the fields this encoder emits (`entity_id`, `x`, `y`, `z`, `user_data`).
 //!
 //! **Progressive-API note (see `docs/architecture/progressive-api.md`):** this is the level-1
 //! auto-persist path. Level-0 users get positions for free; level-1 users put any additional
