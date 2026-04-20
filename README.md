@@ -2,6 +2,8 @@
 
 Multiplayer backend library: cluster management, replication, and reference server. Use this crate for your game server or backend; use **arcane-client-unreal** for the Unreal Engine client plugin.
 
+**New readers:** for the positioning story — what Arcane is, who it's for, and how it compares to SpacetimeDB, Unreal/Unity dedicated servers, and traditional MMO backends — see [`WHY_ARCANE.md`](WHY_ARCANE.md).
+
 ## Crates
 
 | Crate | Description |
