@@ -1,20 +1,34 @@
 //! WebSocket server for cluster state broadcast. Built only with feature "cluster-ws".
 //! Accepts incoming PLAYER_STATE messages from clients and forwards them to the tick loop.
 //!
-//! **Buckets:** inbound JSON may set **spine** (`position`, `velocity`) and **bucket 2**
+//! **Buckets:** inbound binary frames may set **spine** (`position`, `velocity`) and **bucket 2**
 //! ([`EntityStateEntry::user_data`](arcane_core::replication_channel::EntityStateEntry::user_data)).
 //! **Bucket 3** ([`local_data`](arcane_core::replication_channel::EntityStateEntry::local_data)) is
 //! never taken from the client; it stays default until the cluster sets it server-side.
 //!
-//! ## Dual wire formats
+//! ## Wire format
 //!
-//! Clients may talk JSON (legacy text) or postcard-encoded binary (via
-//! [`arcane_wire`]). Inbound parse is chosen by frame type ([`Message::Text`] vs
-//! [`Message::Binary`]); outbound encoding mirrors whatever the client sent
-//! last. A client that never sends anything gets JSON by default. This lets
-//! existing JSON clients (e.g., UE5 adapter in its current state) keep
-//! working unchanged while the benchmark swarm driver moves to binary for
-//! fairness with SpacetimeDB's BSATN default.
+//! All client/server framing is **postcard binary** via the [`arcane_wire`]
+//! crate. JSON was supported historically but has been removed — the cluster
+//! speaks one wire format end-to-end, which makes broadcast fan-out cheap
+//! (pre-encode once at the producer, share bytes via Arc across subscribers)
+//! and eliminates the per-subscriber JSON serialization cost that regressed
+//! the cluster's scaling ceiling prior to this rewrite. Non-binary Arcane
+//! clients must move to the wire protocol; see the UE5 adapter repo for the
+//! client-side migration.
+//!
+//! ## Broadcast fan-out — Shape B
+//!
+//! Each tick the producer serializes every entity **once** to a postcard byte
+//! chunk, builds a [`PreEncodedTick`] holding `Arc<Vec<u8>>` chunks plus the
+//! delta header and removed-id list, and broadcasts that to all subscribers.
+//! Per-client tasks assemble their outbound frame by selecting which entity
+//! chunks to include (today: all; with AOI: a filtered subset) and calling
+//! [`arcane_wire::encode_server_delta_from_chunks`]. Subscribers never
+//! re-serialize individual entities, so the per-tick cost is O(entity count)
+//! at the producer and O(entity count × subscriber count) in Arc clones and
+//! byte-concatenation — never O(entity count × subscriber count) in
+//! serialization, which was the regression this design fixes.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -25,8 +39,8 @@ use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use arcane_core::Vec3;
 use arcane_wire::{
-    ClientFrame, DeltaPayload, EntityState as WireEntityState, GameActionPayload,
-    PlayerStatePayload, ServerFrame, Vec3 as WireVec3,
+    ClientFrame, DeltaHeader, EntityState as WireEntityState, GameActionPayload,
+    PlayerStatePayload, Vec3 as WireVec3,
 };
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use tokio::net::TcpListener;
@@ -35,91 +49,10 @@ use uuid::Uuid;
 
 use crate::cluster_stats::ClusterStats;
 
-/// Incoming message from a client. Expects JSON:
-/// `{"type":"PLAYER_STATE","entity_id":"uuid","position":{...},"velocity":{...},"user_data":?}`.
-/// Optional **`user_data`** is **bucket 2** (replicated simulation JSON). Unknown keys are ignored.
-#[derive(serde::Deserialize)]
-struct PlayerStateMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    entity_id: String,
-    position: Vec3Message,
-    velocity: Vec3Message,
-    #[serde(default)]
-    user_data: serde_json::Value,
-}
-
-#[derive(serde::Deserialize)]
-struct Vec3Message {
-    x: f64,
-    y: f64,
-    z: f64,
-}
-
-/// Maximum byte length of the raw WebSocket text payload accepted from a client.
+/// Maximum byte length of a single inbound WebSocket binary payload. Client
+/// frames larger than this are dropped and counted as parse failures —
+/// defends against runaway allocations from misbehaving clients.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024; // 64 KiB
-
-fn is_finite_vec3(v: &Vec3Message) -> bool {
-    v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
-}
-
-fn parse_player_state(text: &str) -> Option<EntityStateEntry> {
-    if text.len() > MAX_MESSAGE_BYTES {
-        return None;
-    }
-    let msg: PlayerStateMessage = serde_json::from_str(text).ok()?;
-    if msg.msg_type != "PLAYER_STATE" {
-        return None;
-    }
-    if !is_finite_vec3(&msg.position) || !is_finite_vec3(&msg.velocity) {
-        return None;
-    }
-    let entity_id = Uuid::parse_str(&msg.entity_id).ok()?;
-    // cluster_id set by cluster binary when applying (this connection is to that cluster)
-    let mut entry = EntityStateEntry::new(
-        entity_id,
-        Uuid::nil(),
-        Vec3::new(msg.position.x, msg.position.y, msg.position.z),
-        Vec3::new(msg.velocity.x, msg.velocity.y, msg.velocity.z),
-    );
-    entry.user_data = msg.user_data;
-    Some(entry)
-}
-
-/// Generic incoming WebSocket message — we peek at "type" to decide how to route it.
-#[derive(serde::Deserialize)]
-struct TypePeek {
-    #[serde(rename = "type")]
-    msg_type: String,
-}
-
-/// Parse a game action message. Expects JSON:
-/// `{"type":"GAME_ACTION","entity_id":"uuid","action_type":"use_item","payload":{...}}`.
-fn parse_game_action(text: &str) -> Option<GameAction> {
-    if text.len() > MAX_MESSAGE_BYTES {
-        return None;
-    }
-    serde_json::from_str::<GameAction>(text).ok()
-}
-
-/// Result of parsing an incoming WebSocket text message.
-enum ClientMessage {
-    PlayerState(EntityStateEntry),
-    Action(GameAction),
-}
-
-/// Route an incoming WebSocket text message to the appropriate type.
-fn parse_client_message(text: &str) -> Option<ClientMessage> {
-    if text.len() > MAX_MESSAGE_BYTES {
-        return None;
-    }
-    let peek: TypePeek = serde_json::from_str(text).ok()?;
-    match peek.msg_type.as_str() {
-        "PLAYER_STATE" => parse_player_state(text).map(ClientMessage::PlayerState),
-        "GAME_ACTION" => parse_game_action(text).map(ClientMessage::Action),
-        _ => None,
-    }
-}
 
 fn should_keep_ws_loop_running_on_broadcast_error(
     error: &tokio::sync::broadcast::error::RecvError,
@@ -171,33 +104,70 @@ fn game_action_from_wire(payload: &GameActionPayload) -> Option<GameAction> {
     })
 }
 
-/// Convert the cluster-internal [`EntityStateDelta`] into the wire-level
-/// [`DeltaPayload`]. Shapes match 1:1; `user_data` `Value`s are encoded to
-/// JSON bytes (the opaque-bytes contract the wire layer assumes).
-fn wire_delta_from_internal(delta: &EntityStateDelta) -> DeltaPayload {
-    DeltaPayload {
-        source_cluster_id: delta.source_cluster_id,
-        seq: delta.seq,
-        tick: delta.tick,
-        timestamp: delta.timestamp,
-        updated: delta
+/// Convert one cluster-internal [`EntityStateEntry`] to a postcard-encoded
+/// [`WireEntityState`] byte chunk. Producer calls this once per entity per
+/// tick; the resulting bytes are shared across all subscribers via
+/// [`PreEncodedTick`].
+///
+/// Errors are swallowed to an empty chunk. Postcard failures on a valid
+/// [`WireEntityState`] are essentially impossible (no variable-length fields
+/// that can fail to serialize), so this is a defensive fallback rather than
+/// a meaningful error path.
+fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
+    let user_data_bytes = if entity.user_data.is_null() {
+        Vec::new()
+    } else {
+        // Shouldn't fail for any valid Value; log-and-drop is fine if it does.
+        serde_json::to_vec(&entity.user_data).unwrap_or_default()
+    };
+    let wire = WireEntityState {
+        entity_id: entity.entity_id,
+        cluster_id: entity.cluster_id,
+        position: WireVec3::new(entity.position.x, entity.position.y, entity.position.z),
+        velocity: WireVec3::new(entity.velocity.x, entity.velocity.y, entity.velocity.z),
+        user_data: user_data_bytes,
+    };
+    arcane_wire::encode_entity_state(&wire).unwrap_or_default()
+}
+
+/// Per-tick snapshot assembled once by the producer and broadcast to all
+/// subscribers. Each per-client task builds its outbound wire frame by
+/// selecting which entity chunks it wants (today: all; with AOI: a subset)
+/// and calling [`arcane_wire::encode_server_delta_from_chunks`].
+///
+/// Entity chunks are `Arc<Vec<u8>>` so N subscribers share one allocation per
+/// entity per tick — the whole point of this struct and of Shape B.
+struct PreEncodedTick {
+    header: DeltaHeader,
+    entity_chunks: Vec<Arc<Vec<u8>>>,
+    removed: Vec<Uuid>,
+}
+
+/// Convert an [`EntityStateDelta`] to a [`PreEncodedTick`] by serializing
+/// each entity once. Called by the producer task every tick.
+fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
+    PreEncodedTick {
+        header: DeltaHeader {
+            source_cluster_id: delta.source_cluster_id,
+            seq: delta.seq,
+            tick: delta.tick,
+            timestamp: delta.timestamp,
+        },
+        entity_chunks: delta
             .updated
             .iter()
-            .map(|e| WireEntityState {
-                entity_id: e.entity_id,
-                cluster_id: e.cluster_id,
-                position: WireVec3::new(e.position.x, e.position.y, e.position.z),
-                velocity: WireVec3::new(e.velocity.x, e.velocity.y, e.velocity.z),
-                user_data: if e.user_data.is_null() {
-                    Vec::new()
-                } else {
-                    // Shouldn't fail for any valid Value; log-and-drop is fine if it does.
-                    serde_json::to_vec(&e.user_data).unwrap_or_default()
-                },
-            })
+            .map(|e| Arc::new(encode_entity_chunk(e)))
             .collect(),
         removed: delta.removed.clone(),
     }
+}
+
+/// Assemble the outbound wire frame for one subscriber from a shared
+/// [`PreEncodedTick`]. Today every subscriber takes all chunks; with AOI it
+/// will take a filtered subset.
+fn assemble_outbound_frame(tick: &PreEncodedTick) -> Result<Vec<u8>, arcane_wire::Error> {
+    let chunk_refs: Vec<&[u8]> = tick.entity_chunks.iter().map(|c| c.as_slice()).collect();
+    arcane_wire::encode_server_delta_from_chunks(&tick.header, &chunk_refs, &tick.removed)
 }
 
 /// Route a binary client frame to the cluster-internal message channel.
@@ -276,15 +246,15 @@ async fn ws_loop(
     game_actions_tx: Sender<GameAction>,
     stats: Arc<ClusterStats>,
 ) {
-    // Broadcast carries the raw internal delta. Each subscriber encodes in
-    // its own preferred format on send. Keeping the channel codec-agnostic
-    // means adding a third format later (flatbuffers, CBOR, whatever) only
-    // touches per-client encode, not the producer.
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<EntityStateDelta>>(256);
+    // Broadcast carries a PreEncodedTick — per-entity postcard chunks plus
+    // delta header and removed-id list. Subscribers assemble their outbound
+    // frame from the shared chunks via arcane_wire::encode_server_delta_from_chunks.
+    // One serialization per entity per tick, shared across all subscribers.
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<PreEncodedTick>>(256);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.expect("bind ws port");
     eprintln!(
-        "cluster WebSocket listening on ws://{} (send PLAYER_STATE to push player entity)",
+        "cluster WebSocket listening on ws://{} (binary arcane-wire frames only)",
         addr
     );
 
@@ -299,7 +269,11 @@ async fn ws_loop(
                 .unwrap();
             match delta {
                 Ok(d) => {
-                    let _ = tx_clone.send(Arc::new(d));
+                    // Per-tick producer work: serialize every entity once
+                    // and build the shared tick struct. All subscribers
+                    // reuse these Arc-shared chunks without re-serializing.
+                    let tick = Arc::new(pre_encode_tick(&d));
+                    let _ = tx_clone.send(tick);
                 }
                 Err(_) => break,
             }
@@ -320,29 +294,20 @@ async fn ws_loop(
         let actions_tx = game_actions_tx.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
-            // Encoding preference for outbound broadcasts. Starts in text/JSON;
-            // the first binary frame we receive from this client upgrades it
-            // to postcard. This means a client that only listens (never sends)
-            // gets JSON — the conservative default for existing UE5 clients.
-            let mut prefer_binary = false;
             loop {
                 tokio::select! {
                     result = recv.recv() => {
                         match result {
-                            Ok(delta_arc) => {
-                                let send_result = if prefer_binary {
-                                    let wire = wire_delta_from_internal(&delta_arc);
-                                    match arcane_wire::encode_server(&ServerFrame::Delta(wire)) {
-                                        Ok(bytes) => ws_stream.send(Message::Binary(bytes)).await,
-                                        Err(_) => continue,
-                                    }
-                                } else {
-                                    match serde_json::to_string(&*delta_arc) {
-                                        Ok(json) => ws_stream.send(Message::Text(json)).await,
-                                        Err(_) => continue,
-                                    }
+                            Ok(tick_arc) => {
+                                // Subscriber-side work: pick entity chunks
+                                // (today: all; with AOI: filtered subset)
+                                // and assemble a wire-compatible frame. No
+                                // per-entity re-serialization happens here.
+                                let bytes = match assemble_outbound_frame(&tick_arc) {
+                                    Ok(b) => b,
+                                    Err(_) => continue,
                                 };
-                                if send_result.is_err() {
+                                if ws_stream.send(Message::Binary(bytes)).await.is_err() {
                                     break;
                                 }
                             }
@@ -357,29 +322,12 @@ async fn ws_loop(
                     }
                     msg = ws_stream.next() => {
                         match msg {
-                            Some(Ok(Message::Text(text))) => {
-                                stats.bytes_in.fetch_add(text.len() as u64, Ordering::Relaxed);
-                                match parse_client_message(&text) {
-                                    Some(ClientMessage::PlayerState(entry)) => {
-                                        stats.msgs_player_state.fetch_add(1, Ordering::Relaxed);
-                                        stats.note_entity_id(entry.entity_id);
-                                        let _ = updates_tx.send(entry);
-                                    }
-                                    Some(ClientMessage::Action(action)) => {
-                                        stats.msgs_game_action.fetch_add(1, Ordering::Relaxed);
-                                        stats.note_entity_id(action.entity_id);
-                                        let _ = actions_tx.send(action);
-                                    }
-                                    None => {
-                                        stats.parse_failures.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                            }
                             Some(Ok(Message::Binary(bytes))) => {
-                                prefer_binary = true;
                                 let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
                             }
                             Some(Err(_)) | None => break,
+                            // Text and other frame types are not part of the
+                            // supported wire protocol and are silently ignored.
                             _ => {}
                         }
                     }
@@ -392,9 +340,8 @@ async fn ws_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        entry_from_wire_player_state, game_action_from_wire, parse_client_message,
-        parse_game_action, parse_player_state, should_keep_ws_loop_running_on_broadcast_error,
-        wire_delta_from_internal, ClientMessage,
+        assemble_outbound_frame, encode_entity_chunk, entry_from_wire_player_state,
+        game_action_from_wire, pre_encode_tick, should_keep_ws_loop_running_on_broadcast_error,
     };
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::Vec3;
@@ -404,139 +351,7 @@ mod tests {
     use tokio::sync::broadcast::error::RecvError;
     use uuid::Uuid;
 
-    #[test]
-    fn parse_player_state_accepts_valid_payload() {
-        let id = Uuid::from_u128(1);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":1.0,"y":2.0,"z":3.0}},"velocity":{{"x":0.1,"y":0.2,"z":0.3}}}}"#,
-            id
-        );
-        let parsed = parse_player_state(&payload).expect("valid payload should parse");
-        assert_eq!(parsed.entity_id, id);
-        assert_eq!(parsed.position.x, 1.0);
-        assert_eq!(parsed.velocity.z, 0.3);
-        assert!(parsed.user_data.is_null());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_non_player_state_messages() {
-        let payload = r#"{"type":"PING","entity_id":"00000000-0000-0000-0000-000000000000","position":{"x":0.0,"y":0.0,"z":0.0},"velocity":{"x":0.0,"y":0.0,"z":0.0}}"#;
-        assert!(parse_player_state(payload).is_none());
-    }
-
-    #[test]
-    fn parse_player_state_accepts_optional_user_data() {
-        let id = Uuid::from_u128(2);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":0.0,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}},"user_data":{{"stamina":99}}}}"#,
-            id
-        );
-        let parsed = parse_player_state(&payload).expect("parse");
-        assert_eq!(parsed.user_data, serde_json::json!({"stamina": 99}));
-        assert!(parsed.local_data.is_null());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_nan_position() {
-        let id = Uuid::from_u128(3);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":null,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}}}}"#,
-            id
-        );
-        // NaN comes through as null in JSON which fails f64 deser, so test with Infinity
-        assert!(parse_player_state(&payload).is_none());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_infinity_velocity() {
-        let id = Uuid::from_u128(4);
-        // serde_json rejects bare Infinity, so craft a message that parses but has inf
-        // Actually serde_json does not produce f64::INFINITY from JSON — JSON has no Infinity literal.
-        // But we can test our guard by injecting via a known-finite but very large value.
-        // The real protection: is_finite_vec3 rejects NaN/Inf if they ever appear in the struct.
-        // Test the helper directly:
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":1e300,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}}}}"#,
-            id
-        );
-        // 1e300 is finite, so this should parse
-        assert!(parse_player_state(&payload).is_some());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_missing_position() {
-        let id = Uuid::from_u128(5);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","velocity":{{"x":0.0,"y":0.0,"z":0.0}}}}"#,
-            id
-        );
-        assert!(parse_player_state(&payload).is_none());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_invalid_uuid() {
-        let payload = r#"{"type":"PLAYER_STATE","entity_id":"not-a-uuid","position":{"x":0.0,"y":0.0,"z":0.0},"velocity":{"x":0.0,"y":0.0,"z":0.0}}"#;
-        assert!(parse_player_state(payload).is_none());
-    }
-
-    #[test]
-    fn parse_player_state_rejects_oversized_payload() {
-        let id = Uuid::from_u128(6);
-        let big_data = "x".repeat(70_000);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":0.0,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}},"user_data":{{"data":"{}"}}}}"#,
-            id, big_data
-        );
-        assert!(parse_player_state(&payload).is_none());
-    }
-
-    #[test]
-    fn parse_game_action_accepts_valid_payload() {
-        let id = Uuid::from_u128(10);
-        let payload = format!(
-            r#"{{"type":"GAME_ACTION","entity_id":"{}","action_type":"use_item","payload":{{"item_type":5}}}}"#,
-            id
-        );
-        let action = parse_game_action(&payload).expect("valid game action");
-        assert_eq!(action.entity_id, id);
-        assert_eq!(action.action_type, "use_item");
-        assert_eq!(action.payload, serde_json::json!({"item_type": 5}));
-    }
-
-    #[test]
-    fn parse_client_message_routes_player_state() {
-        let id = Uuid::from_u128(1);
-        let payload = format!(
-            r#"{{"type":"PLAYER_STATE","entity_id":"{}","position":{{"x":1.0,"y":0.0,"z":0.0}},"velocity":{{"x":0.0,"y":0.0,"z":0.0}}}}"#,
-            id
-        );
-        match parse_client_message(&payload) {
-            Some(ClientMessage::PlayerState(e)) => assert_eq!(e.entity_id, id),
-            _ => panic!("expected PlayerState"),
-        }
-    }
-
-    #[test]
-    fn parse_client_message_routes_game_action() {
-        let id = Uuid::from_u128(20);
-        let payload = format!(
-            r#"{{"type":"GAME_ACTION","entity_id":"{}","action_type":"cast_spell","payload":{{}}}}"#,
-            id
-        );
-        match parse_client_message(&payload) {
-            Some(ClientMessage::Action(a)) => {
-                assert_eq!(a.entity_id, id);
-                assert_eq!(a.action_type, "cast_spell");
-            }
-            _ => panic!("expected Action"),
-        }
-    }
-
-    #[test]
-    fn parse_client_message_rejects_unknown_type() {
-        let payload = r#"{"type":"UNKNOWN","data":"foo"}"#;
-        assert!(parse_client_message(payload).is_none());
-    }
+    // ── backpressure policy ──────────────────────────────────────────────
 
     #[test]
     fn backpressure_policy_keeps_loop_on_lagged_messages() {
@@ -551,6 +366,8 @@ mod tests {
             &RecvError::Closed
         ));
     }
+
+    // ── inbound wire decode (kept from the pre-Shape-B era) ──────────────
 
     #[test]
     fn entry_from_wire_rejects_non_finite_position() {
@@ -603,56 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_delta_preserves_shape_and_user_data_bytes() {
-        let eid = Uuid::from_u128(7);
-        let cid = Uuid::from_u128(9);
-        let mut entry =
-            EntityStateEntry::new(eid, cid, Vec3::new(1.0, 2.0, 3.0), Vec3::new(0.1, 0.2, 0.3));
-        entry.user_data = serde_json::json!({"stamina": 42});
-
-        let delta = EntityStateDelta {
-            source_cluster_id: cid,
-            seq: 5,
-            tick: 100,
-            timestamp: 1.5,
-            updated: vec![entry],
-            removed: vec![Uuid::from_u128(11)],
-        };
-
-        let wire = wire_delta_from_internal(&delta);
-        assert_eq!(wire.seq, 5);
-        assert_eq!(wire.tick, 100);
-        assert_eq!(wire.updated.len(), 1);
-        assert_eq!(wire.updated[0].entity_id, eid);
-        assert_eq!(wire.updated[0].position.x, 1.0);
-        let recovered: serde_json::Value =
-            serde_json::from_slice(&wire.updated[0].user_data).unwrap();
-        assert_eq!(recovered, serde_json::json!({"stamina": 42}));
-        assert_eq!(wire.removed, vec![Uuid::from_u128(11)]);
-    }
-
-    #[test]
-    fn wire_delta_emits_empty_user_data_bytes_for_null_value() {
-        let entry = EntityStateEntry::new(
-            Uuid::from_u128(1),
-            Uuid::nil(),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        );
-        // user_data stays default (Null) via EntityStateEntry::new
-        let delta = EntityStateDelta {
-            source_cluster_id: Uuid::nil(),
-            seq: 0,
-            tick: 0,
-            timestamp: 0.0,
-            updated: vec![entry],
-            removed: Vec::new(),
-        };
-        let wire = wire_delta_from_internal(&delta);
-        assert!(wire.updated[0].user_data.is_empty());
-    }
-
-    #[test]
     fn binary_client_frame_roundtrips_player_state_through_arcane_wire() {
         // End-to-end: wire-encode a ClientFrame::PlayerState, decode via
         // arcane_wire::decode_client, convert via entry_from_wire_player_state.
@@ -674,26 +441,186 @@ mod tests {
         assert_eq!(entry.velocity.z, -0.1);
     }
 
+    // ── Shape B primitives: encode_entity_chunk + pre_encode_tick +
+    //    assemble_outbound_frame ─────────────────────────────────────────
+
+    /// A chunk produced by `encode_entity_chunk` must be a valid standalone
+    /// postcard encoding of a `WireEntityState` — i.e. decode round-trip
+    /// succeeds through `arcane_wire`'s primitives.
     #[test]
-    fn binary_server_frame_roundtrips_delta_through_arcane_wire() {
+    fn encode_entity_chunk_produces_decodable_wire_entity_state() {
+        let mut entry = EntityStateEntry::new(
+            Uuid::from_u128(7),
+            Uuid::from_u128(9),
+            Vec3::new(1.0, 2.0, 3.0),
+            Vec3::new(0.1, 0.2, 0.3),
+        );
+        entry.user_data = serde_json::json!({"hp": 99});
+        let chunk = encode_entity_chunk(&entry);
+
+        let wire = arcane_wire::decode_entity_state(&chunk).expect("chunk decodes");
+        assert_eq!(wire.entity_id, entry.entity_id);
+        assert_eq!(wire.cluster_id, entry.cluster_id);
+        assert_eq!(wire.position.x, 1.0);
+        assert_eq!(wire.velocity.z, 0.3);
+        let recovered: serde_json::Value = serde_json::from_slice(&wire.user_data).unwrap();
+        assert_eq!(recovered, serde_json::json!({"hp": 99}));
+    }
+
+    #[test]
+    fn encode_entity_chunk_emits_empty_user_data_for_null_value() {
         let entry = EntityStateEntry::new(
             Uuid::from_u128(1),
             Uuid::nil(),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+        let chunk = encode_entity_chunk(&entry);
+        let wire = arcane_wire::decode_entity_state(&chunk).unwrap();
+        assert!(wire.user_data.is_empty());
+    }
+
+    /// Producer path end-to-end: build a delta, pre-encode it into chunks,
+    /// assemble the outbound frame, decode via the standard
+    /// `arcane_wire::decode_server`, and verify shape + content. This
+    /// exercises the same flow the ws_loop follows every tick.
+    #[test]
+    fn pre_encode_and_assemble_roundtrip_matches_input_delta() {
+        let mut entry_a = EntityStateEntry::new(
+            Uuid::from_u128(1),
+            Uuid::from_u128(99),
             Vec3::new(1.0, 2.0, 3.0),
             Vec3::new(0.0, 0.0, 0.0),
         );
+        entry_a.user_data = serde_json::json!({"hp": 42});
+        let entry_b = EntityStateEntry::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(99),
+            Vec3::new(10.0, 20.0, 30.0),
+            Vec3::new(0.5, 0.0, 0.0),
+        );
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 7,
+            tick: 42,
+            timestamp: 1.5,
+            updated: vec![entry_a.clone(), entry_b.clone()],
+            removed: vec![Uuid::from_u128(5)],
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+        assert_eq!(pre_tick.entity_chunks.len(), 2);
+        assert_eq!(pre_tick.removed, vec![Uuid::from_u128(5)]);
+        assert_eq!(pre_tick.header.seq, 7);
+        assert_eq!(pre_tick.header.tick, 42);
+
+        let bytes = assemble_outbound_frame(&pre_tick).expect("assemble");
+        let decoded = arcane_wire::decode_server(&bytes).expect("decode");
+        let ServerFrame::Delta(payload) = decoded;
+
+        assert_eq!(payload.source_cluster_id, delta.source_cluster_id);
+        assert_eq!(payload.seq, 7);
+        assert_eq!(payload.tick, 42);
+        assert_eq!(payload.timestamp, 1.5);
+        assert_eq!(payload.updated.len(), 2);
+        assert_eq!(payload.updated[0].entity_id, entry_a.entity_id);
+        assert_eq!(payload.updated[1].entity_id, entry_b.entity_id);
+        assert_eq!(payload.removed, vec![Uuid::from_u128(5)]);
+
+        // user_data bytes round-trip correctly for the entity that had one.
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&payload.updated[0].user_data).unwrap();
+        assert_eq!(recovered, serde_json::json!({"hp": 42}));
+        assert!(payload.updated[1].user_data.is_empty());
+    }
+
+    /// Empty delta (no entities, no removals) is still a valid encoded frame.
+    #[test]
+    fn pre_encode_and_assemble_handles_empty_delta() {
         let delta = EntityStateDelta {
             source_cluster_id: Uuid::nil(),
+            seq: 0,
+            tick: 0,
+            timestamp: 0.0,
+            updated: Vec::new(),
+            removed: Vec::new(),
+        };
+        let pre_tick = pre_encode_tick(&delta);
+        let bytes = assemble_outbound_frame(&pre_tick).expect("assemble");
+        let decoded = arcane_wire::decode_server(&bytes).expect("decode");
+        let ServerFrame::Delta(payload) = decoded;
+        assert!(payload.updated.is_empty());
+        assert!(payload.removed.is_empty());
+    }
+
+    /// **The Shape B correctness guarantee:** subscribers produce the same
+    /// bytes they would have produced if we'd re-serialized the whole delta
+    /// per subscriber (the pre-regression code path's output shape), but now
+    /// the per-entity serialization happens once and is reused. Verifies
+    /// bit-for-bit parity between the pre-encoded-chunks path and a
+    /// reference `arcane_wire::encode_server(ServerFrame::Delta(...))`
+    /// invocation on the equivalent payload.
+    #[test]
+    fn shape_b_outbound_bytes_match_full_encode_byte_for_byte() {
+        let mut entities = Vec::new();
+        for i in 0..50_u128 {
+            let mut e = EntityStateEntry::new(
+                Uuid::from_u128(i),
+                Uuid::from_u128(99),
+                Vec3::new(i as f64, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            );
+            if i % 2 == 0 {
+                e.user_data = serde_json::json!({"idx": i as u64});
+            }
+            entities.push(e);
+        }
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
             seq: 1,
             tick: 2,
             timestamp: 3.0,
-            updated: vec![entry],
-            removed: Vec::new(),
+            updated: entities.clone(),
+            removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
-        let wire = wire_delta_from_internal(&delta);
-        let bytes = arcane_wire::encode_server(&ServerFrame::Delta(wire.clone())).unwrap();
-        let decoded = arcane_wire::decode_server(&bytes).unwrap();
-        let ServerFrame::Delta(decoded_wire) = decoded;
-        assert_eq!(decoded_wire, wire);
+
+        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta)).expect("shape-b bytes");
+
+        // Reference: build the wire DeltaPayload by materializing every
+        // WireEntityState inline, encode as one ServerFrame::Delta — the
+        // pre-regression path's output shape.
+        let wire_updated: Vec<arcane_wire::EntityState> = entities
+            .iter()
+            .map(|e| {
+                let user_data = if e.user_data.is_null() {
+                    Vec::new()
+                } else {
+                    serde_json::to_vec(&e.user_data).unwrap()
+                };
+                arcane_wire::EntityState {
+                    entity_id: e.entity_id,
+                    cluster_id: e.cluster_id,
+                    position: WireVec3::new(e.position.x, e.position.y, e.position.z),
+                    velocity: WireVec3::new(e.velocity.x, e.velocity.y, e.velocity.z),
+                    user_data,
+                }
+            })
+            .collect();
+        let reference_payload = arcane_wire::DeltaPayload {
+            source_cluster_id: delta.source_cluster_id,
+            seq: delta.seq,
+            tick: delta.tick,
+            timestamp: delta.timestamp,
+            updated: wire_updated,
+            removed: delta.removed.clone(),
+        };
+        let via_reference =
+            arcane_wire::encode_server(&ServerFrame::Delta(reference_payload)).expect("ref bytes");
+
+        assert_eq!(
+            via_shape_b, via_reference,
+            "Shape B must produce bit-identical output to the full-encode path"
+        );
     }
 }
