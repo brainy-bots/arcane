@@ -524,8 +524,7 @@ mod tests {
         // Producer pre-encodes all three entities once. Subscriber takes only
         // the first and third — the AOI filter result.
         let via_chunks =
-            encode_server_delta_from_chunks(&header, &[c1.as_slice(), c3.as_slice()], &[])
-                .unwrap();
+            encode_server_delta_from_chunks(&header, &[c1.as_slice(), c3.as_slice()], &[]).unwrap();
 
         let decoded = decode_server(&via_chunks).unwrap();
         let ServerFrame::Delta(payload) = decoded;

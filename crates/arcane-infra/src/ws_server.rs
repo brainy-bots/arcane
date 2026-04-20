@@ -585,8 +585,7 @@ mod tests {
             removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
 
-        let via_shape_b =
-            assemble_outbound_frame(&pre_encode_tick(&delta)).expect("shape-b bytes");
+        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta)).expect("shape-b bytes");
 
         // Reference: build the wire DeltaPayload by materializing every
         // WireEntityState inline, encode as one ServerFrame::Delta — the
