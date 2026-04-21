@@ -147,14 +147,13 @@ struct PreEncodedTick {
 /// Convert an [`EntityStateDelta`] to a [`PreEncodedTick`] by serializing
 /// each entity once. Called by the producer task every tick.
 ///
-/// Entity encoding is **parallelized across rayon's thread pool** via
-/// `par_iter`. At scale the per-tick encode is O(P) in total world entity
-/// count (every cluster encodes every entity it broadcasts, including
-/// remote entities replicated from neighbors under full-mesh). On an
-/// 8-vCPU cluster node this work was the dominant serial bottleneck in
-/// the tick budget — measured at ~35 ms/tick for P=6750. Distributing it
-/// across cores cuts the wall-clock proportionally (memory-bandwidth-
-/// bounded, so usually 4-6× on 8 cores, not 8×).
+/// Entity encoding is **parallelized across a bounded rayon pool** via
+/// `par_iter`. The pool is sized by [`encode_pool_thread_count`] — by
+/// default half the node's logical cores. The bound is deliberate: giving
+/// rayon every core starves tokio's per-subscriber send tasks and causes
+/// `broadcast_lagged_events` to explode (see AWS run `20260421_224830`
+/// for the empirical demonstration). Half-cores-for-encoding leaves the
+/// other half reliably available for broadcast fan-out.
 ///
 /// Correctness: the output order must match the input order because
 /// `assemble_outbound_frame` and downstream decoders do not have primary
@@ -234,6 +233,62 @@ fn handle_binary_client_frame(
     }
 }
 
+/// Decide how many threads the encoding rayon pool gets.
+///
+/// Default: half the node's logical cores, floor of 1. This leaves the
+/// other half of the cores reliably available for tokio's per-subscriber
+/// send tasks — they individually cost microseconds but collectively need
+/// continuous scheduler access to drain the broadcast channel in time.
+/// When rayon grabbed every core during each encode burst, subscribers
+/// couldn't keep up and `broadcast_lagged_events` exploded (observed
+/// empirically, see AWS run `20260421_224830`).
+///
+/// The split matches the standard "compute pool + reactive IO pool"
+/// pattern used in production systems (Cassandra, TiKV, ClickHouse).
+/// Half rather than a small fixed reserve (e.g. `N - 2`) because
+/// subscriber task count scales with connected clients; on bigger nodes
+/// we typically host more clients per cluster, so tokio's CPU share
+/// should scale with node size, not be a fixed number.
+///
+/// `ARCANE_CLUSTER_ENCODE_THREADS` env var overrides the default for
+/// operators who want to tune per-workload without rebuilding — e.g.
+/// workloads with very few subscribers can push more cores to rayon;
+/// bursty reactive workloads can push fewer.
+fn encode_pool_thread_count() -> usize {
+    if let Ok(s) = std::env::var("ARCANE_CLUSTER_ENCODE_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|nz| nz.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Initialize the global rayon thread pool used by `pre_encode_tick`.
+/// Idempotent in effect — rayon's `build_global` fails if already set,
+/// which is fine (tests and repeated calls inherit whatever pool was set
+/// first). The pool is named so that cluster operators can distinguish
+/// encoding threads from tokio workers in `top`/`perf` output.
+fn init_encode_thread_pool() {
+    let n = encode_pool_thread_count();
+    let result = rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .thread_name(|i| format!("arcane-encode-{i}"))
+        .build_global();
+    match result {
+        Ok(()) => {
+            eprintln!("cluster encode pool: {n} threads (override: ARCANE_CLUSTER_ENCODE_THREADS)")
+        }
+        Err(_) => {
+            // Already initialized earlier in the process (e.g. by a test
+            // or a previous call). Not fatal; we just reuse the existing
+            // pool.
+        }
+    }
+}
+
 pub fn run_ws_server(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -241,6 +296,9 @@ pub fn run_ws_server(
     game_actions_tx: Sender<GameAction>,
     stats: Arc<ClusterStats>,
 ) {
+    // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
+    // so the pool is ready by the time the first tick fires.
+    init_encode_thread_pool();
     std::thread::spawn(move || {
         // Multi-thread runtime so broadcast fan-out (one subscriber task per
         // connected client) and inbound WS-frame decode can run concurrently
@@ -710,6 +768,52 @@ mod tests {
         let ServerFrame::Delta(payload) = decoded;
         for (i, e) in payload.updated.iter().enumerate() {
             assert_eq!(e.entity_id, entities[i].entity_id);
+        }
+    }
+
+    // ── encode thread pool sizing ────────────────────────────────────────
+
+    /// Single serial test covering both env override and default-half-cores
+    /// behavior. Kept as one test because cargo test runs tests in parallel
+    /// by default and both paths mutate the same env var — splitting them
+    /// would introduce a race. Saved-and-restored around any other test
+    /// that happens to observe the env.
+    #[test]
+    fn encode_pool_thread_count_default_and_override() {
+        let prev = std::env::var("ARCANE_CLUSTER_ENCODE_THREADS").ok();
+
+        // Default: no env var → half cores, floor of 1.
+        std::env::remove_var("ARCANE_CLUSTER_ENCODE_THREADS");
+        let cores = std::thread::available_parallelism()
+            .map(|nz| nz.get())
+            .unwrap_or(1);
+        let expected_default = (cores / 2).max(1);
+        assert_eq!(
+            super::encode_pool_thread_count(),
+            expected_default,
+            "default should be max(1, num_cpus / 2)"
+        );
+
+        // Valid positive integer override honored.
+        std::env::set_var("ARCANE_CLUSTER_ENCODE_THREADS", "3");
+        assert_eq!(super::encode_pool_thread_count(), 3);
+
+        // 0 clamped to floor of 1 (rayon rejects 0-thread pools).
+        std::env::set_var("ARCANE_CLUSTER_ENCODE_THREADS", "0");
+        assert_eq!(super::encode_pool_thread_count(), 1);
+
+        // Non-numeric falls through to default; must not panic.
+        std::env::set_var("ARCANE_CLUSTER_ENCODE_THREADS", "not-a-number");
+        assert_eq!(
+            super::encode_pool_thread_count(),
+            expected_default,
+            "garbage env should fall through to the default"
+        );
+
+        // Restore prior state.
+        match prev {
+            Some(v) => std::env::set_var("ARCANE_CLUSTER_ENCODE_THREADS", v),
+            None => std::env::remove_var("ARCANE_CLUSTER_ENCODE_THREADS"),
         }
     }
 }
