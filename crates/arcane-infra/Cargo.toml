@@ -12,6 +12,7 @@ arcane-pool = { path = "../arcane-pool" }
 arcane-wire = { path = "../arcane-wire" }
 axum = { version = "0.7", optional = true }
 futures-util = { version = "0.3", optional = true }
+rayon = { version = "1", optional = true }
 redis = "0.27"
 reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -23,7 +24,7 @@ uuid = { version = "1.0", features = ["v4"] }
 [features]
 default = ["cluster-ws"]
 manager = ["dep:axum", "dep:tokio"]
-cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon"]
 spacetimedb-persist = ["dep:reqwest"]
 
 [[bin]]
