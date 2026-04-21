@@ -143,6 +143,7 @@ Being explicit about scope because this is what investors and early customers wi
 - [`README.md`](README.md) — library and crate layout.
 - [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md) — full system diagrams and data flows.
 - [`docs/architecture/interface-iclusteringmodel.md`](docs/architecture/interface-iclusteringmodel.md) — the affinity-clustering interface, in detail.
+- [`docs/architecture/clustering-system-requirements.md`](docs/architecture/clustering-system-requirements.md) — system-level capability spec for the full clustering system (joint optimization over player grouping, instance-class placement, AZ diversification, cost/market signals), with the benchmark evidence that motivates each dimension.
 - [`docs/architecture/physics-backends-and-unreal.md`](docs/architecture/physics-backends-and-unreal.md) — physics-backend integration guide.
 - [`docs/architecture/progressive-api.md`](docs/architecture/progressive-api.md) — the Arcane design pillar that governs how capabilities are exposed to developers (L0 default → L4 escape hatch).
 - [`docs/architecture/four-bucket-state-model.md`](docs/architecture/four-bucket-state-model.md) — how entity state is partitioned across replication, persistence, and process-local tiers.
