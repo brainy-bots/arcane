@@ -13,6 +13,7 @@
 | **Language** | Rust |
 | **Depends On** | None |
 | **Required By** | IN-01 ClusterManager · IN-04 RulesEngine |
+| **System-level companion** | [SYS-01 clustering-system-requirements.md](clustering-system-requirements.md) — describes what the full clustering system must eventually do end-to-end (capability-aware placement, market signals, temporal prediction, cost optimization). This interface is one piece of that system. |
 
 ---
 
