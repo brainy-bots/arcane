@@ -307,13 +307,20 @@ async fn ws_loop(
                                     Ok(b) => b,
                                     Err(_) => continue,
                                 };
+                                let byte_len = bytes.len() as u64;
                                 if ws_stream.send(Message::Binary(bytes)).await.is_err() {
+                                    stats.ws_send_errors.fetch_add(1, Ordering::Relaxed);
                                     break;
                                 }
+                                stats.bytes_out.fetch_add(byte_len, Ordering::Relaxed);
                             }
                             Err(error) => {
                                 // Backpressure/loss policy: tolerate dropped broadcast frames (`Lagged`)
                                 // and continue with freshest state; terminate only when channel is closed.
+                                if let tokio::sync::broadcast::error::RecvError::Lagged(n) = error {
+                                    stats.broadcast_lagged_events.fetch_add(1, Ordering::Relaxed);
+                                    stats.broadcast_lagged_frames.fetch_add(n, Ordering::Relaxed);
+                                }
                                 if !should_keep_ws_loop_running_on_broadcast_error(&error) {
                                     break;
                                 }
