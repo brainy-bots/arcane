@@ -225,7 +225,14 @@ pub fn run_ws_server(
     stats: Arc<ClusterStats>,
 ) {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread runtime so broadcast fan-out (one subscriber task per
+        // connected client) and inbound WS-frame decode can run concurrently
+        // across CPU cores. The pre-Shape-B regression forced every subscriber
+        // to serialize on a single reactor; even after Shape B removed the
+        // per-subscriber re-serialization, the subscriber send + inbound decode
+        // workload still scales with connected-client count and benefits from
+        // parallel execution. Defaults to one worker thread per available core.
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
