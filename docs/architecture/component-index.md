@@ -92,7 +92,13 @@ Components are grouped into four layers. Documents within each layer are written
 | CA-03 | GodotAdapter | `ca_03_godot_adapter.md` | Godot 4 implementation using MultiMesh for static/grey-box demo rendering. |
 | CA-04 | UnityAdapter | `ca_04_unity_adapter.md` | Unity DOTS implementation using GPU animation baking for high animated entity counts. |
 
-### 3.2 Infrastructure Interfaces
+### 3.2 System Requirements
+
+| ID | Component | Document | Summary |
+|----|-----------|----------|---------|
+| SYS-01 | Clustering System | [`clustering-system-requirements.md`](clustering-system-requirements.md) | System-level requirements spec for the clustering system as a whole. Covers joint optimization over player grouping + capability-aware placement, input signals (interaction graph, live telemetry, spot market data, temporal patterns), output decisions (groupings, placement, migration), workload-to-capability mapping, economic objectives, observability requirements, and the thin execution layer. Benchmark evidence for why the roadmap is scoped as it is. Complements IF-01 (interface contract) by defining the system envelope it plugs into. |
+
+### 3.3 Infrastructure Interfaces
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
@@ -101,7 +107,7 @@ Components are grouped into four layers. Documents within each layer are written
 | IF-03 | IReplicationChannel | `if_03_ireplicationchannel.md` | Cluster-to-cluster state broadcast via pub/sub (publish/subscribe). Default transport Redis. Allows replication transport substitution. |
 | IF-04 | IWorldSimulator | `if_04_iworldsimulator.md` | Unobserved entity state contract. Implemented by Static, FastForward, and MLPredictive modes. |
 
-### 3.3 Infrastructure Components
+### 3.4 Infrastructure Components
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
@@ -113,7 +119,7 @@ Components are grouped into four layers. Documents within each layer are written
 | IN-06 | ReplicationChannelManager | `in_06_replication_channel_manager.md` | Manages which clusters each server subscribes to (and publishes to); replication transport is Redis pub/sub. Receives neighbor list updates from ClusterManager. |
 | IN-07 | ClusterServerPool | `in_07_cluster_server_pool.md` | Implements IServerPool. Pre-provisioned local pool for development; ECS Fargate pool for production. |
 
-### 3.4 AI Layer
+### 3.5 AI Layer
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
@@ -123,7 +129,7 @@ Components are grouped into four layers. Documents within each layer are written
 | AI-04 | EntityInstantiationManager | `ai_04_entity_instantiation.md` | Lazy entity instantiation. Detects player approach, hydrates entity from world state, allocates AI node. |
 | AI-05 | WorldBossNode | `ai_05_world_boss_node.md` | Dedicated AI node with permanent entity authority. Hub-and-spoke RPC endpoint. Writes state to SpacetimeDB. |
 
-### 3.5 Game Layer (ADS — Separate Series)
+### 3.6 Game Layer (ADS — Separate Series)
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|

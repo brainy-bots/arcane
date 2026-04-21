@@ -10,6 +10,7 @@
 | **Type** | Component (implementation of IF-01 IClusteringModel) |
 | **Purpose** | Provide the MVP, non-ML implementation of `IClusteringModel`: a stateless, pure-function “rules engine” that evaluates the `WorldStateView` and returns merge/split `ClusterDecision`s based on explicit rules (thresholds, proximity, load, interaction), with no I/O or side effects. |
 | **Document version** | 1.0 |
+| **System-level companion** | [SYS-01 clustering-system-requirements.md](clustering-system-requirements.md) — RulesEngine is the MVP implementation of IF-01's interface. The full system described in SYS-01 (capability-aware placement, market-signal awareness, temporal prediction, joint cost optimization) is what the production MLClusteringModel will deliver once RulesEngine is swapped out. |
 
 ---
 

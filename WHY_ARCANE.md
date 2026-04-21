@@ -28,13 +28,25 @@ Every multiplayer backend has to decide how to partition server authority across
 - **Spatial partitioning** (Star Citizen server meshing, traditional MMO zones) — each server owns a volume of the world; entity authority transfers at geographic boundaries. Works for persistent worlds but struggles with the "zerg at the border" problem (many players piling onto a boundary simultaneously) and doesn't capture non-spatial relationships like party membership, guild affiliation, or social graphs.
 - **Flat hash partitioning with full-mesh replication** (most session-based BaaS platforms) — players are bucketed onto servers by ID hash; every server replicates all state to every other server. Simple but quadratic in replication bandwidth.
 
-**Arcane partitions by predicted interaction probability.** An AI clustering model (specified in [`IClusteringModel`](docs/architecture/interface-iclusteringmodel.md), MVP implementation in place, ML production model planned) consumes live signals — player positions, party and guild relationships, recent interaction history, cross-cluster RPC load, game-layer hints from combat systems — and groups entities that *will* interact onto the same server. Spatial proximity is one signal among many, not the partitioning rule.
+**Arcane partitions by predicted interaction probability.** An AI clustering model (specified in [`IClusteringModel`](docs/architecture/interface-iclusteringmodel.md) for the decision contract and [`clustering-system-requirements`](docs/architecture/clustering-system-requirements.md) for the full system envelope; MVP implementation in place, ML production model planned) consumes live signals — player positions, party and guild relationships, recent interaction history, cross-cluster RPC load, game-layer hints from combat systems — and groups entities that *will* interact onto the same server. Spatial proximity is one signal among many, not the partitioning rule.
+
+The model does not only decide *who groups with whom*. It makes a **joint decision** across three coupled dimensions in a single pass:
+
+1. **Player grouping** — interaction-probability-driven clustering (the pillar as stated above).
+2. **Capability-matched placement** — what hardware each cluster runs on (CPU-heavy, RAM-heavy, engine type, GPU where relevant), in which availability zone, at what cost class (spot vs on-demand vs reserved).
+3. **Temporal and cost-aware capacity mix** — live cloud-market signals (spot placement scores, price trends, reclamation rates) and learned temporal patterns (per-user session windows, scheduled events, seasonal load curves) feed the model as first-class inputs, so placement optimizes cost alongside game-world affinity.
+
+All three are optimized jointly, not in sequence. That is the value a learned model provides over rule-based scheduling.
 
 **What this unlocks:**
 
 - **Dense combat without authority-transfer storms.** The traditional spatial-meshing pain point is a 200-player fight at a zone boundary. Arcane avoids it by construction: the clustering model pre-merges the two groups before combat begins, so the fight happens inside a single cluster's authority with no cross-boundary hot path.
 - **Social relationships respected.** Two guildmates converging across the world map can be pre-merged onto the same cluster before they arrive. Spatial architectures can't do that — they only see position.
+- **Localized hot zones, contained.** A 10,000-player scheduled raid doesn't degrade the 20,000 players standing in cities elsewhere on the server — because the clusters serving those cities don't even know the raid is happening. Partial-mesh replication is the emergent consequence of the model's grouping decisions; clusters only replicate with clusters they're predicted to interact with. SpacetimeDB's single-node architecture cannot make this claim; every transaction affects every subscriber's baseline.
+- **Hardware that matches the workload.** A quiet zone with many unrelated players gets placed on a memory-optimized instance (connection count dominates; replication is cheap). A hot zone with dense interaction gets placed on a compute-optimized instance (per-tick CPU dominates). The model predicts the workload shape from the interaction graph it's already computing for grouping — same signal, dual-use output.
+- **Cost-optimized capacity mix via cloud markets.** Because migration between clusters is a first-class capability (epic [#34](https://github.com/brainy-bots/arcane/issues/34)), clusters can safely run on spot instances: a reclamation triggers migration instead of disconnects. The model's market-aware placement layer dynamically tunes the spot/on-demand ratio based on live placement scores, pushing aggregate fleet cost roughly **60–75% below all-on-demand pricing** at production scale. SpacetimeDB's single-node architecture structurally cannot take advantage of spot (one node dies, shard dies); traditional dedicated-server MMOs can spot session servers but not persistent-world nodes. Arcane's architecture is spot-compatible by construction.
 - **O(1) cross-cluster traffic in the common case.** Because the model pushes interacting entities into the same cluster, cross-cluster RPC rates stay low by design.
+- **Empirical validation.** On a 4-cluster AWS deployment at equivalent per-node hardware, Arcane sustains 6000 concurrent players with real client-perceived latency in the ~50–130 ms range vs SpacetimeDB's 1750-player ceiling on equivalent hardware. The scaling curve shape also motivates the roadmap directly: full-mesh replication shows diminishing returns past ~4 clusters on identical hardware; affinity clustering breaks that wall by design. Detailed methodology, per-tier data, and benchmark reproducibility in [`arcane-scaling-benchmarks`](https://github.com/brainy-bots/arcane-scaling-benchmarks).
 
 ### 2. Physics-at-scale — authoritative real physics at player counts existing infrastructure can't reach
 
@@ -54,7 +66,7 @@ The key property: **physics is per-entity, not per-engine-instance.** Because ea
 
 Two otherwise-compelling architectures — dedicated engine servers and WASM-based BaaS — share a limitation: **they assume every entity costs the same.** A world boss and a background bird run on the same engine at the same fidelity. That's why studios building persistent worlds at scale end up cheating on fidelity or hard-capping entity counts.
 
-**Arcane supports multiple kinds of node in one deployment, each making a different cost/fidelity tradeoff.** An entity's declared requirements (what engine it needs, what physics level, what compute budget) determine which pool of nodes hosts it:
+**Arcane supports multiple kinds of node in one deployment, each making a different cost/fidelity tradeoff.** An entity's declared requirements (what engine it needs, what physics level, what compute budget) determine which pool of nodes hosts it. Node-type selection is one dimension of the capability-matched placement the clustering model performs (see pillar #1) — the same learned decision that picks CPU-heavy vs RAM-heavy instance classes also picks Rust-kinematic vs Rapier vs Unreal-Dedicated-Server engine tiers. Heterogeneous tiers and capability-aware clustering are the same system, not separate mechanisms.
 
 | Node kind | Cost | Typical for |
 |---|---|---|
@@ -143,6 +155,7 @@ Being explicit about scope because this is what investors and early customers wi
 - [`README.md`](README.md) — library and crate layout.
 - [`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md) — full system diagrams and data flows.
 - [`docs/architecture/interface-iclusteringmodel.md`](docs/architecture/interface-iclusteringmodel.md) — the affinity-clustering interface, in detail.
+- [`docs/architecture/clustering-system-requirements.md`](docs/architecture/clustering-system-requirements.md) — system-level capability spec for the full clustering system (joint optimization over player grouping, instance-class placement, AZ diversification, cost/market signals), with the benchmark evidence that motivates each dimension.
 - [`docs/architecture/physics-backends-and-unreal.md`](docs/architecture/physics-backends-and-unreal.md) — physics-backend integration guide.
 - [`docs/architecture/progressive-api.md`](docs/architecture/progressive-api.md) — the Arcane design pillar that governs how capabilities are exposed to developers (L0 default → L4 escape hatch).
 - [`docs/architecture/four-bucket-state-model.md`](docs/architecture/four-bucket-state-model.md) — how entity state is partitioned across replication, persistence, and process-local tiers.

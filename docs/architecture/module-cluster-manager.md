@@ -10,6 +10,7 @@
 | **Type** | Component |
 | **Purpose** | Central coordinator: assign players to cluster servers, maintain spatial index and neighbor topology, invoke the clustering model, and write assignment and topology state to SpacetimeDB. Clients connect to the ClusterManager for join/leave and cluster assignment; cluster servers learn their workload and neighbors from SpacetimeDB. |
 | **Document version** | 1.0 |
+| **System-level companion** | [SYS-01 clustering-system-requirements.md](clustering-system-requirements.md) — ClusterManager is the orchestration component that executes on the clustering model's decisions. The SYS-01 spec describes the full decision space (capability-aware placement, market signals, etc.) this module must eventually support. |
 
 ---
 
