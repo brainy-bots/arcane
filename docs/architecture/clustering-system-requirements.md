@@ -150,7 +150,7 @@ Per IF-01, evaluation runs on a fixed cadence — fast enough to catch interacti
 
 ## 7. Workload-to-capability mapping
 
-The model learns, from telemetry, how workload shapes map to resource consumption on each capability class. Concrete examples drawn from the current benchmark fleet (c7i.2xlarge kinematic nodes, full-mesh replication):
+The model learns, from telemetry, how workload shapes map to resource consumption on each capability class. Concrete examples drawn from the current benchmark fleet (`t3.large` cluster nodes — 2 vCPU burstable, 8 GiB — same box class for every server role; full-mesh replication):
 
 | Workload shape | Resource profile | Right capability class |
 |---|---|---|
@@ -162,7 +162,7 @@ The model learns, from telemetry, how workload shapes map to resource consumptio
 
 These mappings are *learned* from the observability substrate — the model sees actual latency / saturation curves across capability classes and updates its predictions over time. They are not hard-coded.
 
-Empirical evidence from the current workload (full-mesh kinematic, 10 Hz, c7i.2xlarge):
+Empirical evidence from the current workload (full-mesh kinematic, 10 Hz, `t3.large` cluster nodes):
 
 - The ~4-cluster sweet spot (3500 at 2c → 6000 at 4c → 6750 at 6c) reflects the per-cluster tick work being O(P) in total player count regardless of N. Past N ≈ 4, adding clusters buys little ceiling and costs latency. This shape is specific to the full-mesh-replication workload; affinity clustering breaks the O(P) term by design.
 - RAM was the binding constraint at N=2 (cluster OOM at ~1800 local clients); CPU is the binding constraint at N≥4. The model's choice of capability class should reflect which constraint it predicts binding for the cluster shape it's about to place.
@@ -194,7 +194,7 @@ Target behavior, stated at the system level:
 - **Savings plan coverage** — the always-on baseline (manager, control-plane services, a small reserve of cluster nodes) runs under a 1- or 3-year commitment. The model does not place fresh decisions here; this is operator-configured.
 - **AZ and instance-type diversification** — the model avoids concentrating clusters in a single `(instance_type × AZ)` bucket so correlated spot reclamations can't take down a large fraction simultaneously.
 
-The per-player cost target depends on workload; for the current kinematic full-mesh scenario on c7i.2xlarge at 4 clusters (6000 players), a rough target is $0.15–$0.20 / player / month cluster cost. Affinity clustering is expected to push this lower by allowing smaller per-cluster memory footprints and denser packing on cheaper instance types.
+The per-player cost target depends on workload and hardware class; the current benchmark runs on `t3.large` cluster nodes and shouldn't be used as the cost target for production hardware. The target-setting exercise is deferred until we have runs on compute-class hardware at roughly the same player count. Affinity clustering is expected to push the per-player cost down materially by allowing smaller per-cluster memory footprints and denser packing on cheaper instance types.
 
 ---
 
@@ -273,13 +273,15 @@ Compositionally: affinity-clustering-model + engine-type + migration + market-si
 The empirical findings that motivate this spec and inform the model's future training:
 
 - **Client-perceived latency floor** at 10 Hz tick rate: ~50 ms. Structural to the tick rate; not backend-specific. Floor would shift with tick rate, not with architectural choices.
-- **SpacetimeDB-only single node** (c7i.2xlarge): ceiling 1750 players at ~50 ms; fails via server-unreachable at 2000. Single-node architecture, vertically scaled only.
-- **Arcane 2-cluster** (c7i.2xlarge × 2): ceiling 3500 at ~50 ms; fails via cluster OOM at 3750 (~1800 clients/cluster RAM ceiling, see #62).
-- **Arcane 4-cluster** (c7i.2xlarge × 4): ceiling 6000 at 126 ms; latency climbs from ~50 ms to 126 ms across the range. CPU-bound, not RAM-bound.
-- **Arcane 6-cluster** (c7i.2xlarge × 6): ceiling 6750 at 196 ms (200 ms gate); latency climbs faster than 4-cluster. Diminishing returns past 4 clusters in current full-mesh workload.
+All runs below use identical per-node hardware: every server-side role (SpacetimeDB, Arcane cluster ×N, Redis, manager) on `t3.large` (2 vCPU burstable, 8 GiB). The swarm driver runs on a separate oversized `c7i.2xlarge` (8 vCPU) purely so it doesn't cap the test. This isolates architecture from hardware — both backends get the same per-node budget.
+
+- **SpacetimeDB-only single node** (1 × `t3.large`): ceiling 1750 players at ~50 ms; fails via server-unreachable at 2000. Single-node architecture, vertically scaled only.
+- **Arcane 2-cluster** (2 × `t3.large`): ceiling 3500 at ~50 ms; fails via cluster OOM at 3750 (~1800 clients/cluster RAM ceiling on 8 GiB, see #62).
+- **Arcane 4-cluster** (4 × `t3.large`): ceiling 6000 at 126 ms; latency climbs from ~50 ms to 126 ms across the range. CPU-bound on 2 vCPU per cluster.
+- **Arcane 6-cluster** (6 × `t3.large`): ceiling 6750 at 196 ms (200 ms gate); latency climbs faster than 4-cluster. Diminishing returns past 4 clusters in current full-mesh workload.
 - **Scaling shape at 100 ms threshold**: 2c passes 3500, 4c passes 5750, 6c passes 4000 — 6c is *actively worse* than 4c at a competitive-game latency budget, because the full-mesh neighbor-replication tax grows with N faster than the local-client workload shrinks.
 
-Headline consequence: **in the current full-mesh implementation, per-cluster tick CPU is O(P) in total player count regardless of N**. This is the architectural wall affinity clustering is designed to break — once the clustering model partitions the interaction graph such that each cluster only sees its neighborhood's entities, per-cluster work drops to O(AOI_size × local_clients), which is independent of total P. That's what enables 100+ cluster scaling; without it, adding clusters hits a wall at N ≈ 4 on this hardware.
+Headline consequence: **in the current full-mesh implementation, per-cluster tick CPU is O(P) in total player count regardless of N**. This is the architectural wall affinity clustering is designed to break — once the clustering model partitions the interaction graph such that each cluster only sees its neighborhood's entities, per-cluster work drops to O(AOI_size × local_clients), which is independent of total P. That's what enables 100+ cluster scaling; without it, adding clusters hits a wall at N ≈ 4 on `t3.large`-class hardware. The wall's *location* is hardware-dependent (it moves with per-cluster CPU budget); its *existence* under full-mesh is not.
 
 This is also the strongest empirical argument for why affinity clustering is a near-term priority — not a theoretical niceness, a measured necessity.
 
