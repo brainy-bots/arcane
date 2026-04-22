@@ -38,6 +38,40 @@ See [arcane-demos](https://github.com/brainy-bots/arcane-demos) for a full demo 
 
 The Unreal Engine client plugin lives in a separate repo: **arcane-client-unreal**. Add it to your project's `Plugins/` folder.
 
+## Development vault
+
+The [`arcane-vault/`](arcane-vault/) directory is an [Obsidian](https://obsidian.md/) knowledge vault that documents how Arcane was built. It was generated from the full history of AI coding sessions (Cursor IDE + Claude Code) using an LLM-powered pipeline inspired by [Karpathy's LLM-wiki approach](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
+
+**Contents:**
+
+| Folder | What's in it |
+|--------|-------------|
+| `conversations/` | One distilled note per coding session — summary, key decisions, problems solved, entities mentioned |
+| `entities/` | Concept pages for every system, interface, and component — cross-linked with `[[wikilinks]]` |
+| `timeline.md` | Chronological narrative of the project from first spec to current state |
+| `00-INDEX.md` | Master navigation table |
+| `SCHEMA.md` | Vault conventions and how to update |
+
+**Opening in Obsidian:**
+
+1. Install [Obsidian](https://obsidian.md/) (free for local use)
+2. **Open folder as vault** → select `arcane-vault/`
+3. Open **Graph view** (left sidebar) to explore the concept map — 20 conversation nodes + 99 entity nodes, all interconnected
+
+**Regenerating the vault:**
+
+The vault is built by `arcane-vault-builder.py` in the repo root. It reads chat exports from `arcane-scaling-benchmarks/` and READMEs from all Arcane repos, then calls the Anthropic API to summarize and cross-link everything.
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY=<your-key>
+python arcane-vault-builder.py            # estimate cost
+python arcane-vault-builder.py --sample   # process one file (sanity check)
+python arcane-vault-builder.py --confirm  # full build (~$10, ~20 min)
+```
+
+Intermediate results are cached in `.vault-build/` (gitignored). Re-runs skip already-processed files.
+
 ## License
 
 Arcane is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](LICENSE) for the full text.
