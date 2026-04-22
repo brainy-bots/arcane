@@ -1,0 +1,212 @@
+{
+  "main": {
+    "id": "91edb2b670be36a4",
+    "type": "split",
+    "children": [
+      {
+        "id": "42c1503984eac19c",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e9d4d5c9cd75d2f1",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "4a4fdb9096c2dd26",
+    "type": "split",
+    "children": [
+      {
+        "id": "886d512edb8c585b",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "82ebbb9d4badfa18",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "baa0055503843451",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "312dd7c6e1ddc549",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "d8edbb25a417a39d",
+    "type": "split",
+    "children": [
+      {
+        "id": "28acb058ae7d9f9d",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "a5b2749cb2e90b4c",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "arcane-scaling-benchmarks.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for arcane-scaling-benchmarks"
+            }
+          },
+          {
+            "id": "1e1ccfdf831307a6",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "arcane-scaling-benchmarks.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from arcane-scaling-benchmarks"
+            }
+          },
+          {
+            "id": "089b468f1cba3517",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "c5d81a994cff9e22",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "ca9f11bf305f6aa9",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "arcane-scaling-benchmarks.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of arcane-scaling-benchmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "e9d4d5c9cd75d2f1",
+  "lastOpenFiles": [
+    "entities/BenchmarkSimulation.md",
+    "00-INDEX.md",
+    "timeline.md",
+    "entities/CI Pipeline.md",
+    "entities/arcane-wire.md",
+    "entities/ArcaneAdapterSubsystem.md",
+    "entities/ClusterServer.md",
+    "entities/SpaceTimeDB.md",
+    "entities/arcane_swarm.md",
+    "entities/Arcane Engine.md",
+    "entities/ClusterManager.md",
+    "arcane-scaling-benchmarks.md",
+    "entities/Spatial Grid.md",
+    "entities/Redis.md",
+    "entities/Rapier.md",
+    "entities/AWS Infrastructure.md",
+    "entities/Benchmark System.md",
+    "entities/Unreal Engine Client.md",
+    "SCHEMA.md",
+    "ArcaneClient Plugin.md",
+    "entities/Heterogeneous Node Tiers.md",
+    "entities/Physics at Scale.md",
+    "entities/Affinity Clustering.md",
+    "entities/PGP Architecture.md",
+    "entities",
+    "conversations/2026-02-20 Specification implementation for concept demonstration.md",
+    "arcane_swarm.md"
+  ]
+}
