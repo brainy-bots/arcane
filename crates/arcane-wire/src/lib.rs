@@ -38,9 +38,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// 3D position / velocity. Wire-level primitive; mirrors the cluster-internal
-/// `arcane_core::Vec3` but is declared here so this crate carries no
-/// dependency on `arcane-core`.
+/// 3D position / velocity in continuous f64 — the in-process representation
+/// the cluster simulation uses. Mirrors `arcane_core::Vec3` so this crate
+/// stays decoupled from the core types.
+///
+/// **Not the on-wire type for entities** — see [`Vec3Q`]. `Vec3` is exposed
+/// so callers (sim code, tests, conversions at the wire boundary) keep
+/// working in f64; quantization happens at the wire boundary via
+/// [`Vec3Q::from_vec3`].
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vec3 {
     pub x: f64,
@@ -54,16 +59,77 @@ impl Vec3 {
     }
 }
 
+/// 3D position / velocity quantized to `i16` (24 B → 6 B per Vec3 on the
+/// wire). Used for [`EntityState`] and [`PlayerStatePayload`] fields where
+/// per-entity bandwidth dominates the cluster outbound NIC bottleneck.
+///
+/// **Scale = 1.0** today: one i16 unit = one f64 unit. The benchmark world
+/// is `0..5000` units, well inside i16's `±32_767` range with massive
+/// safety margin. Loses sub-unit precision (1 unit = 2% of `COLLISION_RADIUS=50`,
+/// well below the kinematic sim's noise floor).
+///
+/// If a future game needs sub-unit precision, scale is the easiest knob to
+/// add — convention is to track it as a const generic or a wire-format
+/// version field. Today it's hard-coded to keep the change minimal.
+///
+/// **Saturation behavior:** out-of-range f64 values clamp to i16 bounds
+/// rather than wrap, so a runaway entity stays at the world edge instead of
+/// teleporting across the map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Vec3Q {
+    pub x: i16,
+    pub y: i16,
+    pub z: i16,
+}
+
+impl Vec3Q {
+    pub const fn new(x: i16, y: i16, z: i16) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Quantize a continuous Vec3 (f64) to i16. NaN coerces to 0; out-of-
+    /// range values saturate at i16 bounds.
+    pub fn from_vec3(v: Vec3) -> Self {
+        Self {
+            x: quantize(v.x),
+            y: quantize(v.y),
+            z: quantize(v.z),
+        }
+    }
+
+    /// Dequantize back to f64. The conversion is lossless on the i16 itself
+    /// but the original f64's sub-unit precision was discarded at quantize
+    /// time.
+    pub fn to_vec3(self) -> Vec3 {
+        Vec3 {
+            x: self.x as f64,
+            y: self.y as f64,
+            z: self.z as f64,
+        }
+    }
+}
+
+#[inline]
+fn quantize(v: f64) -> i16 {
+    if v.is_nan() {
+        return 0;
+    }
+    v.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
+}
+
 /// One entity's replicated state (spine + opaque user_data bytes).
+///
+/// `position` and `velocity` are quantized — see [`Vec3Q`] for the
+/// scale + range tradeoff.
 ///
 /// The wire layout intentionally omits the four-bucket model's `local_data`:
 /// it is never meant to cross the replication boundary.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityState {
     pub entity_id: Uuid,
     pub cluster_id: Uuid,
-    pub position: Vec3,
-    pub velocity: Vec3,
+    pub position: Vec3Q,
+    pub velocity: Vec3Q,
     /// Opaque application-replicated state (typically JSON bytes). Empty
     /// vector means "no user_data set."
     pub user_data: Vec<u8>,
@@ -82,12 +148,12 @@ pub struct DeltaPayload {
 }
 
 /// `PLAYER_STATE`-equivalent: client pushing its own entity spine + optional
-/// user_data.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// user_data. Position/velocity quantized — see [`Vec3Q`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerStatePayload {
     pub entity_id: Uuid,
-    pub position: Vec3,
-    pub velocity: Vec3,
+    pub position: Vec3Q,
+    pub velocity: Vec3Q,
     /// Empty = "no user_data."
     pub user_data: Vec<u8>,
 }
@@ -263,12 +329,19 @@ fn chunks_total_len(chunks: &[&[u8]]) -> usize {
 mod tests {
     use super::*;
 
+    /// Test-side shorthand: build a Vec3Q from f64 components via the public
+    /// quantize path. Lets the test corpus continue to read in real-world
+    /// units (e.g. `q3(1.5, 2.0, -3.25)`) instead of pre-rounded i16 literals.
+    fn q3(x: f64, y: f64, z: f64) -> Vec3Q {
+        Vec3Q::from_vec3(Vec3::new(x, y, z))
+    }
+
     fn sample_entity() -> EntityState {
         EntityState {
             entity_id: Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888),
             cluster_id: Uuid::from_u128(0xaaaa_bbbb_cccc_dddd_eeee_ffff_0000_1111),
-            position: Vec3::new(1.5, 2.0, -3.25),
-            velocity: Vec3::new(0.0, 0.1, 0.0),
+            position: q3(1.5, 2.0, -3.25),
+            velocity: q3(0.0, 0.1, 0.0),
             user_data: b"{\"hp\":42}".to_vec(),
         }
     }
@@ -277,8 +350,8 @@ mod tests {
     fn client_frame_player_state_roundtrip() {
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
             entity_id: Uuid::from_u128(7),
-            position: Vec3::new(1.0, 2.0, 3.0),
-            velocity: Vec3::new(0.5, 0.0, -0.5),
+            position: q3(1.0, 2.0, 3.0),
+            velocity: q3(0.5, 0.0, -0.5),
             user_data: Vec::new(),
         });
         let bytes = encode_client(&frame).unwrap();
@@ -317,8 +390,8 @@ mod tests {
     fn user_data_empty_preserved() {
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
             entity_id: Uuid::nil(),
-            position: Vec3::new(0.0, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(0.0, 0.0, 0.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         });
         let bytes = encode_client(&frame).unwrap();
@@ -341,8 +414,8 @@ mod tests {
 
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
             entity_id: Uuid::from_u128(7),
-            position: Vec3::new(1.0, 2.0, 3.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(1.0, 2.0, 3.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: json_bytes,
         });
 
@@ -381,8 +454,8 @@ mod tests {
         let e2 = EntityState {
             entity_id: Uuid::from_u128(7),
             cluster_id: Uuid::from_u128(9),
-            position: Vec3::new(0.0, 0.0, 0.0),
-            velocity: Vec3::new(0.25, -0.5, 0.75),
+            position: q3(0.0, 0.0, 0.0),
+            velocity: q3(0.25, -0.5, 0.75),
             user_data: Vec::new(),
         };
         let removed = vec![Uuid::from_u128(0xdead), Uuid::from_u128(0xbeef)];
@@ -461,8 +534,8 @@ mod tests {
             let e = EntityState {
                 entity_id: Uuid::from_u128(i),
                 cluster_id: Uuid::nil(),
-                position: Vec3::new(i as f64, 0.0, 0.0),
-                velocity: Vec3::new(0.0, 0.0, 0.0),
+                position: q3(i as f64, 0.0, 0.0),
+                velocity: q3(0.0, 0.0, 0.0),
                 user_data: Vec::new(),
             };
             chunks.push(encode_entity(&e));
@@ -499,22 +572,22 @@ mod tests {
         let e1 = EntityState {
             entity_id: Uuid::from_u128(1),
             cluster_id: Uuid::nil(),
-            position: Vec3::new(1.0, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(1.0, 0.0, 0.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         };
         let e2 = EntityState {
             entity_id: Uuid::from_u128(2),
             cluster_id: Uuid::nil(),
-            position: Vec3::new(2.0, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(2.0, 0.0, 0.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         };
         let e3 = EntityState {
             entity_id: Uuid::from_u128(3),
             cluster_id: Uuid::nil(),
-            position: Vec3::new(3.0, 0.0, 0.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(3.0, 0.0, 0.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         };
         let c1 = encode_entity(&e1);
@@ -546,8 +619,8 @@ mod tests {
         let e = EntityState {
             entity_id: Uuid::from_u128(42),
             cluster_id: Uuid::from_u128(99),
-            position: Vec3::new(1.0, 2.0, 3.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(1.0, 2.0, 3.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: br#"{"hp":99,"status":"poisoned"}"#.to_vec(),
         };
         let chunk = encode_entity(&e);
@@ -561,12 +634,72 @@ mod tests {
         assert_eq!(payload.updated[0].user_data, e.user_data);
     }
 
+    // ── Vec3Q: quantization properties at the wire boundary ──
+
+    #[test]
+    fn vec3q_roundtrip_within_quantization_step() {
+        // Sub-unit components round to the nearest i16 step. Loss is
+        // bounded by 0.5 unit per component.
+        let v = Vec3::new(1.4, 2.6, -3.5);
+        let q = Vec3Q::from_vec3(v);
+        let back = q.to_vec3();
+        assert!((back.x - 1.0).abs() <= 0.5);
+        assert!((back.y - 3.0).abs() <= 0.5);
+        assert!((back.z - -4.0).abs() <= 0.5);
+    }
+
+    #[test]
+    fn vec3q_saturates_above_i16_max() {
+        let q = Vec3Q::from_vec3(Vec3::new(1e9, 0.0, 0.0));
+        assert_eq!(q.x, i16::MAX);
+    }
+
+    #[test]
+    fn vec3q_saturates_below_i16_min() {
+        let q = Vec3Q::from_vec3(Vec3::new(-1e9, 0.0, 0.0));
+        assert_eq!(q.x, i16::MIN);
+    }
+
+    #[test]
+    fn vec3q_nan_becomes_zero() {
+        let q = Vec3Q::from_vec3(Vec3::new(f64::NAN, f64::NAN, f64::NAN));
+        assert_eq!(q, Vec3Q::new(0, 0, 0));
+    }
+
+    #[test]
+    fn vec3q_infinity_clamps_to_bounds() {
+        let q_pos = Vec3Q::from_vec3(Vec3::new(f64::INFINITY, 0.0, 0.0));
+        let q_neg = Vec3Q::from_vec3(Vec3::new(f64::NEG_INFINITY, 0.0, 0.0));
+        assert_eq!(q_pos.x, i16::MAX);
+        assert_eq!(q_neg.x, i16::MIN);
+    }
+
+    #[test]
+    fn vec3q_is_smaller_on_wire_than_vec3() {
+        // Postcard varint-encodes integers (zigzag for signed). Small i16
+        // components pack into 1 byte each; near-i16-max into 3 bytes each.
+        // Either way Vec3Q is meaningfully smaller than Vec3 (24 bytes
+        // fixed-width). The exact saving depends on the value distribution
+        // — we just guard that the size relationship holds.
+        let near_origin = Vec3Q::new(1, 2, 3);
+        let near_world_max = Vec3Q::new(5000, 5000, 5000);
+        let f64_v = Vec3::new(1.0, 2.0, 3.0);
+
+        let q_origin_bytes = postcard::to_allocvec(&near_origin).unwrap();
+        let q_max_bytes = postcard::to_allocvec(&near_world_max).unwrap();
+        let f64_bytes = postcard::to_allocvec(&f64_v).unwrap();
+
+        assert!(q_origin_bytes.len() < f64_bytes.len());
+        assert!(q_max_bytes.len() < f64_bytes.len());
+        assert_eq!(f64_bytes.len(), 24);
+    }
+
     #[test]
     fn decode_rejects_truncated_bytes() {
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
             entity_id: Uuid::from_u128(1),
-            position: Vec3::new(1.0, 2.0, 3.0),
-            velocity: Vec3::new(0.0, 0.0, 0.0),
+            position: q3(1.0, 2.0, 3.0),
+            velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
         });
         let bytes = encode_client(&frame).unwrap();
