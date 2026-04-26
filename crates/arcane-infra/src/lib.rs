@@ -11,6 +11,8 @@
 //! - `spacetimedb_persist`: throttled persistence adapter for state snapshots.
 //! - `cluster_runner`: loop composition that wires server, replication, ws, and persistence.
 
+#[cfg(feature = "cluster-ws")]
+pub mod broadcast_channel_cap;
 pub mod cluster_manager;
 pub mod cluster_server;
 #[cfg(feature = "cluster-ws")]

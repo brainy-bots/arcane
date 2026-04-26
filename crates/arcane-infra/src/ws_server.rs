@@ -340,7 +340,16 @@ async fn ws_loop(
     // delta header and removed-id list. Subscribers assemble their outbound
     // frame from the shared chunks via arcane_wire::encode_server_delta_from_chunks.
     // One serialization per entity per tick, shared across all subscribers.
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<PreEncodedTick>>(256);
+    //
+    // Buffer cap is the deepest backlog the slowest subscriber can fall
+    // behind by before the channel fires `Lagged` and drops oldest frames.
+    // Sourced from `ARCANE_BROADCAST_CHANNEL_CAP` (see
+    // crate::broadcast_channel_cap) — empirically the binding constraint
+    // at 30 Hz / 100 ms after dead reckoning + quantization landed (cluster
+    // CPU and NIC both had headroom; lagged_frames kept firing).
+    let cap = crate::broadcast_channel_cap::broadcast_channel_cap();
+    eprintln!("cluster broadcast channel cap: {cap} (override: ARCANE_BROADCAST_CHANNEL_CAP)");
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<PreEncodedTick>>(cap);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.expect("bind ws port");
     eprintln!(
