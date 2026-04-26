@@ -65,26 +65,23 @@ fn should_keep_ws_loop_running_on_broadcast_error(
 /// [`EntityStateEntry`]. `user_data` bytes are deserialized as JSON if
 /// non-empty; empty bytes produce [`serde_json::Value::Null`]. `cluster_id`
 /// is set to nil — the cluster binary applies its own when routing.
+///
+/// The wire-side `Vec3Q` is dequantized at this boundary; downstream sim
+/// code stays in continuous f64. Quantized i16 is always finite by
+/// construction, so the previous NaN/inf gate is unnecessary.
 fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntityStateEntry> {
-    if !payload.position.x.is_finite()
-        || !payload.position.y.is_finite()
-        || !payload.position.z.is_finite()
-        || !payload.velocity.x.is_finite()
-        || !payload.velocity.y.is_finite()
-        || !payload.velocity.z.is_finite()
-    {
-        return None;
-    }
     let user_data = if payload.user_data.is_empty() {
         serde_json::Value::Null
     } else {
         serde_json::from_slice(&payload.user_data).ok()?
     };
+    let pos = payload.position.to_vec3();
+    let vel = payload.velocity.to_vec3();
     let mut entry = EntityStateEntry::new(
         payload.entity_id,
         Uuid::nil(),
-        Vec3::new(payload.position.x, payload.position.y, payload.position.z),
-        Vec3::new(payload.velocity.x, payload.velocity.y, payload.velocity.z),
+        Vec3::new(pos.x, pos.y, pos.z),
+        Vec3::new(vel.x, vel.y, vel.z),
     );
     entry.user_data = user_data;
     Some(entry)
@@ -121,11 +118,22 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
         // Shouldn't fail for any valid Value; log-and-drop is fine if it does.
         serde_json::to_vec(&entity.user_data).unwrap_or_default()
     };
+    // Quantize at the wire boundary: continuous f64 sim positions become i16
+    // on the wire (~6 B per Vec3 instead of 24 B). See `arcane_wire::Vec3Q`
+    // for the scale + range tradeoff.
     let wire = WireEntityState {
         entity_id: entity.entity_id,
         cluster_id: entity.cluster_id,
-        position: WireVec3::new(entity.position.x, entity.position.y, entity.position.z),
-        velocity: WireVec3::new(entity.velocity.x, entity.velocity.y, entity.velocity.z),
+        position: arcane_wire::Vec3Q::from_vec3(WireVec3::new(
+            entity.position.x,
+            entity.position.y,
+            entity.position.z,
+        )),
+        velocity: arcane_wire::Vec3Q::from_vec3(WireVec3::new(
+            entity.velocity.x,
+            entity.velocity.y,
+            entity.velocity.z,
+        )),
         user_data: user_data_bytes,
     };
     arcane_wire::encode_entity_state(&wire).unwrap_or_default()
@@ -458,15 +466,11 @@ mod tests {
 
     // ── inbound wire decode (kept from the pre-Shape-B era) ──────────────
 
-    #[test]
-    fn entry_from_wire_rejects_non_finite_position() {
-        let payload = PlayerStatePayload {
-            entity_id: Uuid::from_u128(1),
-            position: WireVec3::new(f64::INFINITY, 0.0, 0.0),
-            velocity: WireVec3::new(0.0, 0.0, 0.0),
-            user_data: Vec::new(),
-        };
-        assert!(entry_from_wire_player_state(&payload).is_none());
+    /// Test-side shorthand for building the on-wire quantized vector from
+    /// f64 components. The non-finite-position regression test that used to
+    /// guard against `f64::INFINITY` is gone — i16 can't represent it.
+    fn wire_q3(x: f64, y: f64, z: f64) -> arcane_wire::Vec3Q {
+        arcane_wire::Vec3Q::from_vec3(WireVec3::new(x, y, z))
     }
 
     #[test]
@@ -474,8 +478,8 @@ mod tests {
         let id = Uuid::from_u128(42);
         let payload = PlayerStatePayload {
             entity_id: id,
-            position: WireVec3::new(1.0, 2.0, 3.0),
-            velocity: WireVec3::new(0.0, 0.1, 0.0),
+            position: wire_q3(1.0, 2.0, 3.0),
+            velocity: wire_q3(0.0, 0.1, 0.0),
             user_data: Vec::new(),
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
@@ -488,8 +492,8 @@ mod tests {
     fn entry_from_wire_deserializes_user_data_json_bytes() {
         let payload = PlayerStatePayload {
             entity_id: Uuid::from_u128(1),
-            position: WireVec3::new(0.0, 0.0, 0.0),
-            velocity: WireVec3::new(0.0, 0.0, 0.0),
+            position: wire_q3(0.0, 0.0, 0.0),
+            velocity: wire_q3(0.0, 0.0, 0.0),
             user_data: serde_json::to_vec(&serde_json::json!({"hp": 99})).unwrap(),
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
@@ -512,11 +516,13 @@ mod tests {
     fn binary_client_frame_roundtrips_player_state_through_arcane_wire() {
         // End-to-end: wire-encode a ClientFrame::PlayerState, decode via
         // arcane_wire::decode_client, convert via entry_from_wire_player_state.
+        // Sub-unit components are rounded by the i16 quantization step at
+        // the wire boundary, so we assert against the rounded values.
         let id = Uuid::from_u128(123);
         let frame = ClientFrame::PlayerState(PlayerStatePayload {
             entity_id: id,
-            position: WireVec3::new(1.25, 2.5, 3.75),
-            velocity: WireVec3::new(0.1, 0.0, -0.1),
+            position: wire_q3(1.25, 2.5, 3.75),
+            velocity: wire_q3(0.1, 0.0, -0.1),
             user_data: Vec::new(),
         });
         let bytes = arcane_wire::encode_client(&frame).unwrap();
@@ -526,8 +532,8 @@ mod tests {
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
         assert_eq!(entry.entity_id, id);
-        assert_eq!(entry.position.x, 1.25);
-        assert_eq!(entry.velocity.z, -0.1);
+        assert_eq!(entry.position.x, 1.0);
+        assert_eq!(entry.velocity.z, 0.0);
     }
 
     // ── Shape B primitives: encode_entity_chunk + pre_encode_tick +
@@ -550,8 +556,9 @@ mod tests {
         let wire = arcane_wire::decode_entity_state(&chunk).expect("chunk decodes");
         assert_eq!(wire.entity_id, entry.entity_id);
         assert_eq!(wire.cluster_id, entry.cluster_id);
-        assert_eq!(wire.position.x, 1.0);
-        assert_eq!(wire.velocity.z, 0.3);
+        // Wire is now Vec3Q (i16). 1.0 quantizes to 1; 0.3 rounds to 0.
+        assert_eq!(wire.position.x, 1i16);
+        assert_eq!(wire.velocity.z, 0i16);
         let recovered: serde_json::Value = serde_json::from_slice(&wire.user_data).unwrap();
         assert_eq!(recovered, serde_json::json!({"hp": 99}));
     }
@@ -690,8 +697,16 @@ mod tests {
                 arcane_wire::EntityState {
                     entity_id: e.entity_id,
                     cluster_id: e.cluster_id,
-                    position: WireVec3::new(e.position.x, e.position.y, e.position.z),
-                    velocity: WireVec3::new(e.velocity.x, e.velocity.y, e.velocity.z),
+                    position: arcane_wire::Vec3Q::from_vec3(WireVec3::new(
+                        e.position.x,
+                        e.position.y,
+                        e.position.z,
+                    )),
+                    velocity: arcane_wire::Vec3Q::from_vec3(WireVec3::new(
+                        e.velocity.x,
+                        e.velocity.y,
+                        e.velocity.z,
+                    )),
                     user_data,
                 }
             })
