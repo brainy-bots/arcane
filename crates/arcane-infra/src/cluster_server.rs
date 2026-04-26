@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
@@ -117,11 +118,23 @@ impl ClusterServer {
             (updated, removed)
         };
 
+        // Wall-clock UNIX seconds at the moment the cluster produced this
+        // delta. Driver-side latency decomposition uses this as T2 (the
+        // server-stamped point on the timeline) so it can split the existing
+        // T3 - T1 client-perceived latency into a wire portion (T2 - T1) and
+        // a driver-processing portion. EC2 instances are chrony-synced to
+        // ~1ms, well below the 200ms latency budget; the cross-clock noise
+        // is acceptable for diagnosis. Falls back to 0.0 if the system
+        // clock is somehow before UNIX_EPOCH (impossible on AWS in practice).
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let delta = EntityStateDelta {
             source_cluster_id: self.cluster_id,
             seq: s,
             tick: t,
-            timestamp: 0.0,
+            timestamp,
             updated,
             removed,
         };
