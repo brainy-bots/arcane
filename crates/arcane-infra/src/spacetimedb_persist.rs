@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 
 use arcane_core::replication_channel::EntityStateEntry;
 
-const TICK_RATE_HZ: u64 = 20;
-
 #[derive(serde::Serialize)]
 struct SpacetimeUuid {
     __uuid__: u128,
@@ -98,7 +96,12 @@ impl SpacetimeDbPersist {
         if !enabled {
             return None;
         }
-        let interval_ticks = (TICK_RATE_HZ / hz.max(1)).max(1);
+        // Persist cadence is computed from the resolved cluster tick rate so the
+        // SpacetimeDB snapshot rate stays at the requested Hz regardless of the
+        // simulation tick rate. e.g. cluster at 30 Hz + persist at 1 Hz =
+        // every 30 ticks.
+        let tick_rate_hz = crate::tick_rate::tick_rate_hz();
+        let interval_ticks = (tick_rate_hz / hz.max(1)).max(1);
         let max_batch_size: usize = std::env::var("SPACETIMEDB_PERSIST_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
