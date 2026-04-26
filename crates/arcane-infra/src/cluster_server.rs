@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+use arcane_wire::Vec3Q;
 use uuid::Uuid;
 
 use crate::ReplicationChannelManager;
@@ -15,6 +16,25 @@ use crate::ReplicationChannelManager;
 /// growth from misbehaving clients sending unique entity IDs. The cap applies to `add_entity`;
 /// entities injected by `simulate_before_tick` are not capped (they are server-authoritative).
 pub const DEFAULT_MAX_ENTITIES: usize = 100_000;
+
+/// Default resync cadence for velocity-based dead reckoning, in ticks. Every
+/// N ticks the cluster broadcasts every entity regardless of velocity change,
+/// so clients that missed a velocity-change broadcast (packet loss, late
+/// join) re-anchor to fresh server state. 60 ticks ≈ 2-3 sec wall-clock
+/// across the benchmark's tick range (20-60 Hz). Override via
+/// `ARCANE_RESYNC_EVERY_N_TICKS`.
+pub const DEFAULT_RESYNC_EVERY_N_TICKS: u64 = 60;
+
+/// Read the resync cadence from the environment. Clamped to `>= 1` so a
+/// misconfigured value can't accidentally disable resync entirely (which
+/// would leave dropped-velocity-change entities stale forever).
+fn resolve_resync_every_n_ticks() -> u64 {
+    std::env::var("ARCANE_RESYNC_EVERY_N_TICKS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_RESYNC_EVERY_N_TICKS)
+}
 
 /// One process per cluster. Runs simulation, replication, client connections.
 pub struct ClusterServer {
@@ -25,6 +45,17 @@ pub struct ClusterServer {
     entities: Mutex<HashMap<Uuid, EntityStateEntry>>,
     pending_removed: Mutex<Vec<Uuid>>,
     max_entities: usize,
+    /// Last-broadcast velocity per entity (quantized to wire form). Used for
+    /// velocity-based dead reckoning: an entity is omitted from a broadcast
+    /// when its current velocity quantizes identically to its last-broadcast
+    /// velocity. New entities and the periodic resync tick force inclusion.
+    /// Comparing in `Vec3Q` (i16) instead of `Vec3` (f64) means the skip
+    /// decision matches the client's view exactly — if the wire bytes
+    /// wouldn't change, the broadcast doesn't happen.
+    last_broadcast_velocity: Mutex<HashMap<Uuid, Vec3Q>>,
+    /// Resync cadence in ticks. Read once at construction from
+    /// `ARCANE_RESYNC_EVERY_N_TICKS`. See [`DEFAULT_RESYNC_EVERY_N_TICKS`].
+    resync_every_n_ticks: u64,
 }
 
 impl ClusterServer {
@@ -41,6 +72,8 @@ impl ClusterServer {
             entities: Mutex::new(HashMap::new()),
             pending_removed: Mutex::new(Vec::new()),
             max_entities,
+            last_broadcast_velocity: Mutex::new(HashMap::new()),
+            resync_every_n_ticks: resolve_resync_every_n_ticks(),
         }
     }
 
@@ -106,15 +139,63 @@ impl ClusterServer {
     }
 
     /// Advance simulation by one tick, build delta from current entities, broadcast to neighbors if set, and return the delta.
+    ///
+    /// **Velocity-based dead reckoning.** Entities whose current velocity
+    /// quantizes identically to their last-broadcast velocity are omitted
+    /// from the `updated` list (clients hold the last anchor and extrapolate
+    /// position locally via `pos(t) = pos_last + vel_last × (t − t_last)`).
+    /// First-broadcast entities and the periodic resync tick force inclusion
+    /// so packet-loss / late-join scenarios converge. The `removed` list is
+    /// always carried verbatim — removals can't be inferred client-side.
     pub fn tick(&self) -> EntityStateDelta {
         let t = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let s = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
 
+        // A resync tick rebroadcasts every entity (both for late joiners and
+        // to recover from any silently dropped velocity-change broadcasts).
+        // Tick 0 is impossible here (we just incremented), so the first
+        // resync naturally fires at tick `resync_every_n_ticks` rather than
+        // on the very first tick — that's fine, the first-broadcast path
+        // below already includes every entity once.
+        let is_resync_tick = t.is_multiple_of(self.resync_every_n_ticks);
+
         let (updated, removed) = {
             let entities = self.entities.lock().expect("entities lock");
-            let updated: Vec<EntityStateEntry> = entities.values().cloned().collect();
+            let mut last_vel = self
+                .last_broadcast_velocity
+                .lock()
+                .expect("last_broadcast_velocity lock");
+
+            // Collect entities that need broadcasting this tick. New entity
+            // (no last-broadcast record), velocity-quantum-changed entity,
+            // or every entity on a resync tick — otherwise skip and let the
+            // client extrapolate from its last anchor.
+            let mut updated: Vec<EntityStateEntry> = Vec::new();
+            for entry in entities.values() {
+                let current_vel_q = Vec3Q::from_vec3(arcane_wire::Vec3::new(
+                    entry.velocity.x,
+                    entry.velocity.y,
+                    entry.velocity.z,
+                ));
+                let include = match last_vel.get(&entry.entity_id) {
+                    None => true, // new entity — first broadcast
+                    Some(_) if is_resync_tick => true,
+                    Some(prev) => *prev != current_vel_q,
+                };
+                if include {
+                    last_vel.insert(entry.entity_id, current_vel_q);
+                    updated.push(entry.clone());
+                }
+            }
+
             let mut pending = self.pending_removed.lock().expect("pending_removed lock");
             let removed = std::mem::take(&mut *pending);
+            // Drop the dead-reckoning record for entities that just left so
+            // the map stays bounded by `entity_count`, not lifetime-unique
+            // ids ever seen.
+            for id in &removed {
+                last_vel.remove(id);
+            }
             (updated, removed)
         };
 

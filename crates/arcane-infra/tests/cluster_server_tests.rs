@@ -287,3 +287,134 @@ fn simulate_before_tick_panicking_simulation_poisons_but_does_not_cascade() {
         "poisoned lock makes subsequent operations fail"
     );
 }
+
+// ── Velocity-based dead reckoning ─────────────────────────────────────────
+
+mod dead_reckoning {
+    use super::*;
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+
+    fn entry(id: Uuid, vx: f64) -> EntityStateEntry {
+        EntityStateEntry::new(
+            id,
+            Uuid::nil(),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(vx, 0.0, 0.0),
+        )
+    }
+
+    #[test]
+    fn first_broadcast_includes_every_entity_regardless_of_velocity() {
+        // First-ever broadcast must include each entity once so the client
+        // has an anchor to extrapolate from. Without this, a constant-velocity
+        // entity that just joined would never be sent at all.
+        let server = ClusterServer::new(Uuid::new_v4());
+        for i in 0..5_u128 {
+            server.add_entity(entry(Uuid::from_u128(i + 1), 0.0));
+        }
+        let delta = server.tick();
+        assert_eq!(delta.updated.len(), 5);
+    }
+
+    #[test]
+    fn unchanged_velocity_is_skipped_after_first_broadcast() {
+        // The whole point of dead reckoning: a moving-in-a-straight-line
+        // entity should produce one broadcast (the anchor), then nothing,
+        // until either velocity changes or a resync tick fires.
+        let server = ClusterServer::new(Uuid::new_v4());
+        let id = Uuid::from_u128(1);
+        server.add_entity(entry(id, 5.0));
+        let delta1 = server.tick();
+        assert_eq!(delta1.updated.len(), 1);
+
+        // Re-add the same entity with the same velocity so it stays in
+        // entities (add_entity is the only way the swarm side feeds state).
+        server.add_entity(entry(id, 5.0));
+        let delta2 = server.tick();
+        assert!(
+            delta2.updated.is_empty(),
+            "entity with unchanged velocity must be omitted from broadcast"
+        );
+    }
+
+    #[test]
+    fn changed_velocity_is_included() {
+        let server = ClusterServer::new(Uuid::new_v4());
+        let id = Uuid::from_u128(1);
+        server.add_entity(entry(id, 5.0));
+        let _ = server.tick();
+
+        // Velocity changes to 10.0 — the entity must be in the next delta
+        // so the client re-anchors before extrapolating further.
+        server.add_entity(entry(id, 10.0));
+        let delta = server.tick();
+        assert_eq!(delta.updated.len(), 1);
+        assert_eq!(delta.updated[0].velocity.x, 10.0);
+    }
+
+    #[test]
+    fn sub_quantum_velocity_change_is_treated_as_unchanged() {
+        // The skip decision is made in the wire's Vec3Q (i16) representation,
+        // so a 0.1-unit jitter that quantizes to the same i16 doesn't trigger
+        // a redundant broadcast — wire bytes wouldn't change anyway.
+        let server = ClusterServer::new(Uuid::new_v4());
+        let id = Uuid::from_u128(1);
+        server.add_entity(entry(id, 5.0));
+        let _ = server.tick();
+
+        server.add_entity(entry(id, 5.1)); // quantizes to 5
+        let delta = server.tick();
+        assert!(
+            delta.updated.is_empty(),
+            "5.0 and 5.1 quantize to the same i16; broadcast must be skipped"
+        );
+    }
+
+    #[test]
+    fn resync_tick_rebroadcasts_unchanged_entities() {
+        // Every Nth tick (default 60 in production; we override to 3 here so
+        // the test is fast), the cluster must broadcast every entity even if
+        // velocity didn't change. Late joiners and packet-loss recovery rely
+        // on this.
+        std::env::set_var("ARCANE_RESYNC_EVERY_N_TICKS", "3");
+        let server = ClusterServer::new(Uuid::new_v4());
+        std::env::remove_var("ARCANE_RESYNC_EVERY_N_TICKS");
+
+        let id = Uuid::from_u128(1);
+        server.add_entity(entry(id, 5.0));
+        // Tick 1: anchor broadcast.
+        assert_eq!(server.tick().updated.len(), 1);
+        // Ticks 2: skipped (velocity unchanged).
+        server.add_entity(entry(id, 5.0));
+        assert_eq!(server.tick().updated.len(), 0);
+        // Tick 3: resync — rebroadcast even though velocity unchanged.
+        server.add_entity(entry(id, 5.0));
+        assert_eq!(server.tick().updated.len(), 1);
+    }
+
+    #[test]
+    fn removed_entity_drops_dead_reckoning_record() {
+        // After an entity is removed, its last-broadcast-velocity record
+        // must be dropped so the map stays bounded by current_entities and
+        // not lifetime-unique-ids-ever-seen. We verify this indirectly: an
+        // entity with the same id rejoining at the same velocity should be
+        // treated as new (first broadcast includes it) — which only happens
+        // if the prior record was forgotten.
+        let server = ClusterServer::new(Uuid::new_v4());
+        let id = Uuid::from_u128(1);
+        server.add_entity(entry(id, 5.0));
+        let _ = server.tick();
+        server.remove_entity(id);
+        let _ = server.tick(); // emits the removal
+
+        // Same entity, same velocity, but treated as a fresh first broadcast.
+        server.add_entity(entry(id, 5.0));
+        let delta = server.tick();
+        assert_eq!(
+            delta.updated.len(),
+            1,
+            "rejoining entity must be broadcast as if new (record was dropped)"
+        );
+    }
+}
