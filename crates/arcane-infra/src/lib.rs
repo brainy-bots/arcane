@@ -20,6 +20,7 @@ pub mod replication_channel_manager;
 pub mod rpc_handler;
 #[cfg(feature = "spacetimedb-persist")]
 pub mod spacetimedb_persist;
+pub mod tick_rate;
 
 #[cfg(feature = "cluster-ws")]
 pub mod cluster_runner;

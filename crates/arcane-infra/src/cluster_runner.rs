@@ -27,7 +27,6 @@ use crate::neighbor_subscriber::spawn_neighbor_subscriber;
 use crate::spacetimedb_persist::SpacetimeDbPersist;
 use crate::{ClusterServer, ReplicationChannelManager};
 
-const TICK_RATE_HZ: u64 = 20;
 const LOG_EVERY_TICKS: u64 = 100;
 /// Log parseable server stats every N ticks (for benchmark: entities, clusters, tick_ms).
 const LOG_STATS_EVERY_TICKS: u64 = 40;
@@ -56,8 +55,8 @@ fn merge_with_neighbor_latest(
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
 ///
 /// When `simulation` is `Some`, [`ClusterSimulation::on_tick`] runs after those steps and before
-/// [`ClusterServer::tick`], using `1 / TICK_RATE_HZ` as `dt_seconds`.
-/// Never returns on success (infinite loop); returns Err only if setup fails.
+/// [`ClusterServer::tick`], using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
+/// [`crate::tick_rate`]). Never returns on success (infinite loop); returns Err only if setup fails.
 #[cfg(feature = "cluster-ws")]
 pub fn run_cluster_loop<F>(
     cluster_id: Uuid,
@@ -102,17 +101,18 @@ where
     spawn_neighbor_subscriber(redis_url.clone(), neighbor_ids.clone(), neighbor_tx);
     let mut neighbor_latest: HashMap<Uuid, Vec<EntityStateEntry>> = HashMap::new();
 
+    let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     eprintln!(
         "arcane-cluster started cluster_id={} neighbors={} tick_rate={}Hz",
         cluster_id,
         neighbor_ids.len(),
-        TICK_RATE_HZ
+        tick_rate_hz
     );
 
     #[cfg(feature = "spacetimedb-persist")]
     let persist = SpacetimeDbPersist::from_env();
 
-    let interval = Duration::from_millis(1000 / TICK_RATE_HZ);
+    let interval = Duration::from_millis(1000 / tick_rate_hz);
     let dt_seconds = interval.as_secs_f64();
     let mut tick_count: u64 = 0;
 
