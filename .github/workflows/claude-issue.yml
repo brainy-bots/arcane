@@ -1,0 +1,34 @@
+name: Claude on labeled issue
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  claude:
+    if: github.event.label.name == 'claude-ready' && github.event.sender.login == 'martinjms'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Pick up GitHub issue #${{ github.event.issue.number }} in this repo: "${{ github.event.issue.title }}".
+
+            Issue body:
+            ${{ github.event.issue.body }}
+
+            Working rules (override any conflicting habits):
+            - Open a pull request with your changes. Do NOT merge it; Martin reviews every PR.
+            - When you finish, comment on the issue summarizing what was done and what still remains. Do NOT close the issue.
+            - If you introduce something to replace existing code or docs, remove the old version in the same PR — do not let both live in parallel.
+            - Do not frame work by release stage (no "MVP", "v1", "post-MVP", "future"). Describe work by merit and dependencies.
+            - Follow existing project conventions. If a CLAUDE.md exists in the repo, treat its rules as binding.
+
+            Begin.
