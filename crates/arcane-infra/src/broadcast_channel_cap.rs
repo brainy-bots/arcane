@@ -29,12 +29,21 @@
 
 const ENV_VAR: &str = "ARCANE_BROADCAST_CHANNEL_CAP";
 
-/// Default buffer cap. Larger than the prior hardcoded 256 because the
-/// 2026-04-27 measurements found 256 was the binding constraint at the
-/// headline 30 Hz / 100 ms tier on commodity hardware. 2048 ≈ 70 sec of
-/// 30 Hz cluster-tick history; chosen to give substantial headroom
-/// without runaway memory growth at typical entity counts.
-const DEFAULT_CAP: usize = 2048;
+/// Default buffer cap. Empirically 256 is the right value for tight
+/// latency gates (≤100 ms): smaller caps force aggressive Lagged
+/// dropping for slow subscribers, which keeps the broadcast pipeline
+/// "hot" for fast subscribers and protects total wall-clock latency.
+/// Bigger caps eliminate Lagged events but let stale broadcasts queue,
+/// which pushes wire latency up at the slowest-subscriber rate.
+///
+/// **Empirical evidence (2026-04-27 journal, Runs G + H):** raising the
+/// default to 2048 *regressed* the published 30 Hz / 100 ms ceiling
+/// from 5,500 → 4,250 (lean) and 4,750 → 4,250 (realistic). Run F at
+/// cap=256 had `broadcast_lagged_frames=342k` and a 4,750 ceiling;
+/// Run H at cap=2048 had zero Lagged events but a lower ceiling.
+/// Operators with relaxed latency budgets (≥200 ms) can raise via the
+/// env override.
+const DEFAULT_CAP: usize = 256;
 
 /// Lower bound. Below this the channel basically can't absorb any
 /// scheduler jitter; tokio's broadcast docs require a positive non-zero
