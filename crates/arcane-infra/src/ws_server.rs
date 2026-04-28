@@ -418,7 +418,7 @@ async fn ws_loop(
                                 // and continue with freshest state; terminate only when channel is closed.
                                 if let tokio::sync::broadcast::error::RecvError::Lagged(n) = error {
                                     stats.broadcast_lagged_events.fetch_add(1, Ordering::Relaxed);
-                                    stats.broadcast_lagged_frames.fetch_add(n, Ordering::Relaxed);
+                                    stats.lagged_clients_total.fetch_add(n, Ordering::Relaxed);
                                 }
                                 if !should_keep_ws_loop_running_on_broadcast_error(&error) {
                                     break;

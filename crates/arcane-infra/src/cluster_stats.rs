@@ -33,10 +33,11 @@ pub struct ClusterStats {
     /// broadcast channel — i.e. the producer emitted frames faster than that
     /// subscriber drained them. Non-zero under fan-out saturation.
     pub broadcast_lagged_events: AtomicU64,
-    /// Sum of `n` across all `Lagged(n)` events — total broadcast frames that
-    /// subscribers skipped. Scales with both how bad the lag is and how many
-    /// subscribers are affected.
-    pub broadcast_lagged_frames: AtomicU64,
+    /// Sum of `n` across all `Lagged(n)` events — total count of broadcast
+    /// frames that subscribers skipped due to receiver lag. Incremented by `n`
+    /// each time `recv()` returns `Lagged(n)`. Scales with both how bad the lag
+    /// is and how many subscribers are affected.
+    pub lagged_clients_total: AtomicU64,
     /// WebSocket send attempts that returned an error (peer closed or
     /// transport failure). Non-zero under WS-egress saturation or client
     /// drops. Paired with `ws_accepts` to compute active-connection churn.
@@ -99,7 +100,7 @@ impl ClusterStats {
     /// so the harness's SSM/poll path is cheap.
     pub fn to_json(&self, cluster_id: &str) -> String {
         format!(
-            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"broadcast_lagged_frames":{},"ws_send_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
+            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"lagged_clients_total":{},"ws_send_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
             cluster_id,
             self.ws_accepts.load(Ordering::Relaxed),
             self.msgs_player_state.load(Ordering::Relaxed),
@@ -108,7 +109,7 @@ impl ClusterStats {
             self.bytes_in.load(Ordering::Relaxed),
             self.bytes_out.load(Ordering::Relaxed),
             self.broadcast_lagged_events.load(Ordering::Relaxed),
-            self.broadcast_lagged_frames.load(Ordering::Relaxed),
+            self.lagged_clients_total.load(Ordering::Relaxed),
             self.ws_send_errors.load(Ordering::Relaxed),
             self.entities_current.load(Ordering::Relaxed),
             self.entities_peak.load(Ordering::Relaxed),
@@ -209,7 +210,7 @@ mod tests {
         s.bytes_in.store(12345, Ordering::Relaxed);
         s.bytes_out.store(67890, Ordering::Relaxed);
         s.broadcast_lagged_events.store(4, Ordering::Relaxed);
-        s.broadcast_lagged_frames.store(17, Ordering::Relaxed);
+        s.lagged_clients_total.store(17, Ordering::Relaxed);
         s.ws_send_errors.store(1, Ordering::Relaxed);
         s.set_entities(42);
         s.tick.store(500, Ordering::Relaxed);
@@ -228,7 +229,7 @@ mod tests {
         assert_eq!(parsed["bytes_in"], 12345);
         assert_eq!(parsed["bytes_out"], 67890);
         assert_eq!(parsed["broadcast_lagged_events"], 4);
-        assert_eq!(parsed["broadcast_lagged_frames"], 17);
+        assert_eq!(parsed["lagged_clients_total"], 17);
         assert_eq!(parsed["ws_send_errors"], 1);
         assert_eq!(parsed["entities_current"], 42);
         assert_eq!(parsed["entities_peak"], 42);

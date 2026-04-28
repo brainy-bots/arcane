@@ -11,7 +11,7 @@
 //! 4,750-CCU realistic-state ceiling on c7i.2xlarge clusters_4 + dead
 //! reckoning, cluster CPU ran at 18% of the 30 Hz tick budget and NIC was
 //! at ~80% of c7i.2xlarge sustained throughput — *not* multi-x oversubscribed.
-//! Yet `broadcast_lagged_frames` kept firing in the hundreds-of-thousands.
+//! Yet `lagged_clients_total` kept firing in the hundreds-of-thousands.
 //! That means the channel cap was the binding constraint, not CPU and not
 //! NIC. The fix lets operators raise it past the prior hardcoded 256
 //! without rebuilding.
@@ -39,7 +39,7 @@ const ENV_VAR: &str = "ARCANE_BROADCAST_CHANNEL_CAP";
 /// **Empirical evidence (2026-04-27 journal, Runs G + H):** raising the
 /// default to 2048 *regressed* the published 30 Hz / 100 ms ceiling
 /// from 5,500 → 4,250 (lean) and 4,750 → 4,250 (realistic). Run F at
-/// cap=256 had `broadcast_lagged_frames=342k` and a 4,750 ceiling;
+/// cap=256 had `lagged_clients_total=342k` and a 4,750 ceiling;
 /// Run H at cap=2048 had zero Lagged events but a lower ceiling.
 /// Operators with relaxed latency budgets (≥200 ms) can raise via the
 /// env override.
