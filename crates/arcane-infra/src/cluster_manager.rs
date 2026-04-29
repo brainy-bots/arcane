@@ -17,8 +17,8 @@ pub struct ClusterManager {
     model: Arc<dyn IClusteringModel>,
     pool: Arc<dyn IServerPool>,
     spatial_index: SpatialIndex,
-    /// Allocated cluster servers. active_count = allocated_servers.len().
-    allocated_servers: Vec<ServerHandle>,
+    /// cluster_id → ServerHandle. One entry per live cluster server.
+    servers: HashMap<Uuid, ServerHandle>,
 }
 
 impl ClusterManager {
@@ -31,7 +31,7 @@ impl ClusterManager {
             model,
             pool,
             spatial_index,
-            allocated_servers: Vec::new(),
+            servers: HashMap::new(),
         }
     }
 
@@ -128,12 +128,12 @@ impl ClusterManager {
         };
         let _decisions = self.model.evaluate(&view);
         // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.
-        if !self.allocated_servers.is_empty() {
+        if !self.servers.is_empty() {
             return Ok(());
         }
         match self.pool.allocate() {
             Ok(handle) => {
-                self.allocated_servers.push(handle);
+                self.servers.insert(handle.server_id, handle);
                 Ok(())
             }
             Err(e) => Err(format!(
@@ -145,7 +145,7 @@ impl ClusterManager {
 
     /// Current number of active clusters (for tests / metrics).
     pub fn active_cluster_count(&self) -> u32 {
-        self.allocated_servers.len() as u32
+        self.servers.len() as u32
     }
 
     /// Snapshot of cluster geometry from the spatial index (for visualization / debugging).
