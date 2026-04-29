@@ -10,8 +10,7 @@ use scorer::score_entity;
 
 use arcane_core::{
     clustering_model::{
-        ClusterDecision, DecisionReason, DecisionType, ModelInfo, ValidationResult,
-        WorldStateView,
+        ClusterDecision, DecisionReason, DecisionType, ModelInfo, ValidationResult, WorldStateView,
     },
     types::Vec2,
     IClusteringModel,
@@ -181,8 +180,7 @@ impl AffinityEngine {
         }
 
         // Phase 6: clean up removed entities
-        let active: std::collections::HashSet<Uuid> =
-            players.iter().map(|p| p.player_id).collect();
+        let active: std::collections::HashSet<Uuid> = players.iter().map(|p| p.player_id).collect();
         for entity in assignments
             .keys()
             .filter(|e| !active.contains(*e))
@@ -298,7 +296,9 @@ fn assignments_to_decisions(
         }
     }
     for player in &view.players {
-        current_cluster.entry(player.player_id).or_insert(player.cluster_id);
+        current_cluster
+            .entry(player.player_id)
+            .or_insert(player.cluster_id);
     }
 
     // Count how many entities want to move from cluster A to cluster B
@@ -314,14 +314,19 @@ fn assignments_to_decisions(
     }
 
     let mut decisions = Vec::new();
-    let mut handled_pairs: std::collections::HashSet<(Uuid, Uuid)> = std::collections::HashSet::new();
+    let mut handled_pairs: std::collections::HashSet<(Uuid, Uuid)> =
+        std::collections::HashSet::new();
 
     for ((src, dst), count) in &migration_counts {
         if *count < config.merge_entity_threshold as u32 {
             continue;
         }
         // Normalize pair to avoid duplicate decisions
-        let key = if src < dst { (*src, *dst) } else { (*dst, *src) };
+        let key = if src < dst {
+            (*src, *dst)
+        } else {
+            (*dst, *src)
+        };
         if handled_pairs.contains(&key) {
             continue;
         }

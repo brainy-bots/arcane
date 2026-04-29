@@ -60,13 +60,11 @@ pub fn score_entity(
         // Soft capacity penalty
         if config.max_entities_per_cluster > 0 {
             let size = cluster_sizes.get(cluster_id).copied().unwrap_or(0);
-            let soft_limit =
-                (config.max_entities_per_cluster as f64 * config.capacity_soft_limit_fraction)
-                    as usize;
+            let soft_limit = (config.max_entities_per_cluster as f64
+                * config.capacity_soft_limit_fraction) as usize;
             if size > soft_limit {
                 let overflow = (size - soft_limit) as f64;
-                let max_overflow =
-                    (config.max_entities_per_cluster - soft_limit).max(1) as f64;
+                let max_overflow = (config.max_entities_per_cluster - soft_limit).max(1) as f64;
                 let penalty = 1.0 - (overflow / max_overflow);
                 score *= penalty.max(0.1);
             }
@@ -139,7 +137,11 @@ mod tests {
         let f1 = uuid(2);
         let f2 = uuid(3);
 
-        let assignments = [(e, c1, vec2(0.0, 0.0)), (f1, c1, vec2(1.0, 0.0)), (f2, c2, vec2(100.0, 0.0))];
+        let assignments = [
+            (e, c1, vec2(0.0, 0.0)),
+            (f1, c1, vec2(1.0, 0.0)),
+            (f2, c2, vec2(100.0, 0.0)),
+        ];
         let (members, centroids, sizes) = build_test_clusters(&assignments);
 
         let mut graph = InteractionGraph::new();
@@ -149,7 +151,16 @@ mod tests {
             spatial_weight: 0.0, // pure interaction
             ..AffinityConfig::default()
         };
-        let result = score_entity(e, vec2(0.0, 0.0), c1, &members, &centroids, &sizes, &graph, &config);
+        let result = score_entity(
+            e,
+            vec2(0.0, 0.0),
+            c1,
+            &members,
+            &centroids,
+            &sizes,
+            &graph,
+            &config,
+        );
 
         assert_eq!(result.best_cluster, c2);
     }
@@ -169,7 +180,16 @@ mod tests {
         let config = AffinityConfig::default();
 
         // Entity at (0,0) — closer to c2 centroid at (5,0) than c1 at (1000,0)
-        let result = score_entity(e, vec2(0.0, 0.0), c1, &members, &centroids, &sizes, &graph, &config);
+        let result = score_entity(
+            e,
+            vec2(0.0, 0.0),
+            c1,
+            &members,
+            &centroids,
+            &sizes,
+            &graph,
+            &config,
+        );
         assert_eq!(result.best_cluster, c2);
     }
 
@@ -183,10 +203,9 @@ mod tests {
         let mut members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         members.insert(c1, members_c1);
         members.insert(c2, vec![uuid(20)]);
-        let centroids: HashMap<Uuid, Vec2> = [
-            (c1, vec2(0.0, 0.0)),
-            (c2, vec2(0.0, 0.0)),
-        ].into_iter().collect();
+        let centroids: HashMap<Uuid, Vec2> = [(c1, vec2(0.0, 0.0)), (c2, vec2(0.0, 0.0))]
+            .into_iter()
+            .collect();
         let sizes: HashMap<Uuid, usize> = [(c1, 10), (c2, 1)].into_iter().collect();
 
         let graph = InteractionGraph::new();
@@ -197,7 +216,16 @@ mod tests {
             ..AffinityConfig::default()
         };
 
-        let result = score_entity(e, vec2(0.0, 0.0), c1, &members, &centroids, &sizes, &graph, &config);
+        let result = score_entity(
+            e,
+            vec2(0.0, 0.0),
+            c1,
+            &members,
+            &centroids,
+            &sizes,
+            &graph,
+            &config,
+        );
         // c1 at capacity, c2 has room — c2 should score better despite same spatial distance
         assert_eq!(result.best_cluster, c2);
     }
@@ -219,7 +247,16 @@ mod tests {
             ..AffinityConfig::default()
         };
 
-        let result = score_entity(e, vec2(0.0, 0.0), c1, &members, &centroids, &sizes, &graph, &config);
+        let result = score_entity(
+            e,
+            vec2(0.0, 0.0),
+            c1,
+            &members,
+            &centroids,
+            &sizes,
+            &graph,
+            &config,
+        );
         assert!(result.best_score > 0.0);
     }
 }

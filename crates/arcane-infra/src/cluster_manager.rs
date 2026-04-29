@@ -5,10 +5,10 @@ use arcane_core::{
     types::Vec2,
     IClusteringModel, IServerPool, ServerHandle,
 };
-use std::collections::HashMap;
 use arcane_pool::LocalPool;
 use arcane_rules::RulesEngine;
 use arcane_spatial::SpatialIndex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -77,7 +77,10 @@ impl ClusterManager {
         let entity_data = self.spatial_index.snapshot_entities();
         let mut cluster_player_ids: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
         for &(entity_id, cluster_id, _) in &entity_data {
-            cluster_player_ids.entry(cluster_id).or_default().push(entity_id);
+            cluster_player_ids
+                .entry(cluster_id)
+                .or_default()
+                .push(entity_id);
         }
 
         let clusters: Vec<ClusterInfo> = snapshot
