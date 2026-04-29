@@ -111,6 +111,15 @@ impl SpatialIndex {
         cluster_ids
     }
 
+    /// Return all entities as (entity_id, cluster_id, position) triples.
+    /// Used by ClusterManager to populate WorldStateView.players.
+    pub fn snapshot_entities(&self) -> Vec<(Uuid, Uuid, Vec3)> {
+        self.entities
+            .iter()
+            .map(|(&entity_id, &(cluster_id, position))| (entity_id, cluster_id, position))
+            .collect()
+    }
+
     /// Snapshot of all clusters for building WorldStateView. Called by ClusterManager before evaluate().
     pub fn snapshot_for_view(&self) -> Vec<ClusterGeometry> {
         let mut cluster_ids: Vec<Uuid> = self.entities.values().map(|(c, _)| *c).collect();

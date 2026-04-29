@@ -4,6 +4,7 @@ members = [
     "crates/arcane-core",
     "crates/arcane-spatial",
     "crates/arcane-rules",
+    "crates/arcane-affinity",
     "crates/arcane-pool",
     "crates/arcane-infra",
     "crates/arcane-wire",

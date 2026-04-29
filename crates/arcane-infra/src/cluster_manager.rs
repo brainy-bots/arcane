@@ -1,10 +1,11 @@
 //! ClusterManager (IN-01) — central coordinator.
 
 use arcane_core::{
-    clustering_model::{ClusterInfo, WorldStateView},
+    clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
     types::Vec2,
     IClusteringModel, IServerPool, ServerHandle,
 };
+use std::collections::HashMap;
 use arcane_pool::LocalPool;
 use arcane_rules::RulesEngine;
 use arcane_spatial::SpatialIndex;
@@ -71,12 +72,20 @@ impl ClusterManager {
         if snapshot.is_empty() {
             return Ok(());
         }
+
+        // Build entity data for WorldStateView.players
+        let entity_data = self.spatial_index.snapshot_entities();
+        let mut cluster_player_ids: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+        for &(entity_id, cluster_id, _) in &entity_data {
+            cluster_player_ids.entry(cluster_id).or_default().push(entity_id);
+        }
+
         let clusters: Vec<ClusterInfo> = snapshot
             .into_iter()
             .map(|g| ClusterInfo {
                 cluster_id: g.cluster_id,
                 server_host: "localhost".to_string(),
-                player_ids: vec![],
+                player_ids: cluster_player_ids.remove(&g.cluster_id).unwrap_or_default(),
                 player_count: g.entity_count,
                 cpu_pct: 0.0,
                 centroid: Vec2::new(g.centroid.x, g.centroid.z),
@@ -84,11 +93,24 @@ impl ClusterManager {
                 rpc_rate_out: 0.0,
             })
             .collect();
+
+        let players: Vec<PlayerInfo> = entity_data
+            .iter()
+            .map(|&(entity_id, cluster_id, pos)| PlayerInfo {
+                player_id: entity_id,
+                cluster_id,
+                position: Vec2::new(pos.x, pos.z),
+                velocity: Vec2::new(0.0, 0.0),
+                guild_id: None,
+                party_id: None,
+            })
+            .collect();
+
         let view = WorldStateView {
             timestamp: 0.0,
             evaluation_budget_ms: 50,
             clusters,
-            players: vec![],
+            players,
         };
         let _decisions = self.model.evaluate(&view);
         // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.

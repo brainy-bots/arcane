@@ -1,0 +1,14 @@
+[package]
+name = "arcane-affinity"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Arcane Engine — AffinityEngine (IN-08), interaction-weighted IClusteringModel"
+
+[dependencies]
+arcane-core = { path = "../arcane-core" }
+uuid = { version = "1.0", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+uuid = { version = "1.0", features = ["v4"] }
