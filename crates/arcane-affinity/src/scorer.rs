@@ -18,6 +18,7 @@ pub struct ScoringResult {
 /// spatial_score     = spatial_weight / (1.0 + distance(E_pos, C_centroid))
 ///
 /// A soft capacity penalty is applied when a cluster exceeds capacity_soft_limit_fraction.
+#[allow(clippy::too_many_arguments)]
 pub fn score_entity(
     entity: Uuid,
     entity_pos: Vec2,
@@ -103,13 +104,13 @@ mod tests {
         Vec2::new(x, y)
     }
 
-    fn build_test_clusters(
-        assignments: &[(Uuid, Uuid, Vec2)], // (entity, cluster, pos)
-    ) -> (
+    type ClusterMaps = (
         HashMap<Uuid, Vec<Uuid>>,
         HashMap<Uuid, Vec2>,
         HashMap<Uuid, usize>,
-    ) {
+    );
+
+    fn build_test_clusters(assignments: &[(Uuid, Uuid, Vec2)]) -> ClusterMaps {
         let mut members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         let mut centroids: HashMap<Uuid, Vec2> = HashMap::new();
         let mut sizes: HashMap<Uuid, usize> = HashMap::new();
@@ -199,7 +200,7 @@ mod tests {
         let c1 = uuid(10);
         let c2 = uuid(11);
 
-        let members_c1: Vec<Uuid> = (2..12).map(|n| uuid(n)).collect();
+        let members_c1: Vec<Uuid> = (2..12).map(uuid).collect();
         let mut members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         members.insert(c1, members_c1);
         members.insert(c2, vec![uuid(20)]);

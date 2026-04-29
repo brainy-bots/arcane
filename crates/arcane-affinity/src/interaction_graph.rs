@@ -46,7 +46,7 @@ impl InteractionGraph {
             *weight *= decay_factor;
         }
 
-        if gc_interval > 0 && self.tick_count % gc_interval == 0 {
+        if gc_interval > 0 && self.tick_count.is_multiple_of(gc_interval) {
             self.weights.retain(|_, w| *w >= gc_threshold);
         }
     }

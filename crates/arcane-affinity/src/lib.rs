@@ -171,10 +171,11 @@ impl AffinityEngine {
 
         // Phase 5: new entities with no history → spatial fallback
         for player in players {
-            if !new_assignments.contains_key(&player.player_id) {
-                let nearest = nearest_cluster(player.position, &cluster_centroids);
-                if let Some(cid) = nearest {
-                    new_assignments.insert(player.player_id, cid);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                new_assignments.entry(player.player_id)
+            {
+                if let Some(cid) = nearest_cluster(player.position, &cluster_centroids) {
+                    e.insert(cid);
                 }
             }
         }
@@ -441,7 +442,7 @@ mod tests {
 
         // Every entity must be assigned to an existing cluster
         let cluster_ids: std::collections::HashSet<Uuid> = [c1, c2].into_iter().collect();
-        for (_, assigned_cluster) in &result {
+        for assigned_cluster in result.values() {
             assert!(cluster_ids.contains(assigned_cluster));
         }
     }
