@@ -167,21 +167,38 @@ impl ClusterManager {
             clusters,
             players,
         };
-        let _decisions = self.model.evaluate(&view);
-        // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.
-        if !self.servers.is_empty() {
-            return Ok(());
-        }
-        match self.pool.allocate() {
-            Ok(handle) => {
-                self.servers.insert(handle.server_id, handle);
-                Ok(())
+        // Bootstrap: allocate one server when clusters exist but none are tracked yet.
+        if self.servers.is_empty() {
+            match self.pool.allocate() {
+                Ok(handle) => {
+                    self.servers.insert(handle.server_id, handle);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "pool allocate failed: {} - {}",
+                        e.code as u32, e.detail
+                    ));
+                }
             }
-            Err(e) => Err(format!(
-                "pool allocate failed: {} - {}",
-                e.code as u32, e.detail
-            )),
         }
+
+        let decisions = self.model.evaluate(&view);
+        let max = self.exec_config.max_per_cycle;
+        let mut executed = 0;
+        for decision in decisions.iter() {
+            if executed >= max {
+                break;
+            }
+            let result = match decision.decision_type {
+                DecisionType::Merge => self.execute_merge(decision),
+                DecisionType::Split => self.execute_split(decision),
+            };
+            match result {
+                Ok(()) => executed += 1,
+                Err(e) => tracing::warn!("decision execution error: {}", e),
+            }
+        }
+        Ok(())
     }
 
     /// Execute a Merge decision: migrate all entities from source to target, release source server.
