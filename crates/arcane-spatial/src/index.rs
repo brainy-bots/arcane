@@ -111,6 +111,15 @@ impl SpatialIndex {
         cluster_ids
     }
 
+    /// Bulk-reassign all entities currently in `from` to `to`. Called by ClusterManager during merge.
+    pub fn reassign_cluster(&mut self, from: Uuid, to: Uuid) {
+        for (cluster_id, _) in self.entities.values_mut() {
+            if *cluster_id == from {
+                *cluster_id = to;
+            }
+        }
+    }
+
     /// Return all entities as (entity_id, cluster_id, position) triples.
     /// Used by ClusterManager to populate WorldStateView.players.
     pub fn snapshot_entities(&self) -> Vec<(Uuid, Uuid, Vec3)> {
