@@ -12,6 +12,30 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Guardrails for decision execution. All thresholds are per-cycle or per-pair.
+#[derive(Clone, Debug)]
+pub struct ExecutionConfig {
+    /// Minimum model confidence to execute a decision (0.0–1.0).
+    pub min_confidence: f32,
+    /// Ticks to suppress further merges involving the surviving cluster after a merge.
+    pub merge_cooldown_ticks: u32,
+    /// Ticks to suppress further splits involving either resulting cluster after a split.
+    pub split_cooldown_ticks: u32,
+    /// Maximum decisions executed per evaluation cycle (merge + split combined).
+    pub max_per_cycle: usize,
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            min_confidence: 0.7,
+            merge_cooldown_ticks: 20,
+            split_cooldown_ticks: 30,
+            max_per_cycle: 3,
+        }
+    }
+}
+
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ClusterManager {
     model: Arc<dyn IClusteringModel>,
@@ -19,6 +43,11 @@ pub struct ClusterManager {
     spatial_index: SpatialIndex,
     /// cluster_id → ServerHandle. One entry per live cluster server.
     servers: HashMap<Uuid, ServerHandle>,
+    exec_config: ExecutionConfig,
+    /// cluster_id → remaining cooldown ticks after a merge.
+    merge_cooldowns: HashMap<Uuid, u32>,
+    /// cluster_id → remaining cooldown ticks after a split.
+    split_cooldowns: HashMap<Uuid, u32>,
 }
 
 impl ClusterManager {
@@ -32,6 +61,9 @@ impl ClusterManager {
             pool,
             spatial_index,
             servers: HashMap::new(),
+            exec_config: ExecutionConfig::default(),
+            merge_cooldowns: HashMap::new(),
+            split_cooldowns: HashMap::new(),
         }
     }
 
@@ -79,6 +111,15 @@ impl ClusterManager {
     /// Run one evaluation cycle: build view from spatial snapshot, run model, apply decisions.
     /// Without SpacetimeDB we allocate from pool when we have clusters (entities) and no servers yet.
     pub fn run_evaluation_cycle(&mut self) -> Result<(), String> {
+        self.merge_cooldowns
+            .values_mut()
+            .for_each(|v| *v = v.saturating_sub(1));
+        self.merge_cooldowns.retain(|_, v| *v > 0);
+        self.split_cooldowns
+            .values_mut()
+            .for_each(|v| *v = v.saturating_sub(1));
+        self.split_cooldowns.retain(|_, v| *v > 0);
+
         let snapshot = self.spatial_index.snapshot_for_view();
         if snapshot.is_empty() {
             return Ok(());
