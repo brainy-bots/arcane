@@ -496,4 +496,207 @@ mod tests {
         // No panic, decisions is a valid vec (may be empty)
         let _ = decisions;
     }
+
+    // ── Integration / behavioural tests (#76) ──────────────────────────────────
+
+    /// A raid group of 20 entities with heavy mutual interactions stays on the same
+    /// cluster even after moving into the other cluster's spatial territory.
+    ///
+    /// Setup: cluster 1 centroid at x=-200, cluster 2 centroid at x=+200.
+    /// All 20 entities start in cluster 1 at x=-5 and interact heavily.
+    /// After building history, we reposition them to x=+5 (closer to C2 spatially).
+    ///
+    /// Expected: interaction score with C1 (all 19 partners in C1) >> spatial score
+    /// for C2, so improvement = score(C2) - score(C1) is negative → no migration.
+    #[test]
+    fn raid_group_stays_together_across_boundary() {
+        let c1 = uuid(10);
+        let c2 = uuid(11);
+
+        // 20 group members
+        let members: Vec<Uuid> = (1u8..=20).map(uuid).collect();
+
+        let engine = AffinityEngine::new(AffinityConfig {
+            weight_game_action: 2.0,
+            spatial_weight: 0.2,
+            migration_threshold: 3.0,
+            ..AffinityConfig::default()
+        });
+
+        // Phase A: build interaction history — all members fight each other in C1.
+        // C1 centroid at x=-200, C2 centroid at x=+200.
+        // Members at x=-5: clearly C1 territory spatially.
+        let view_build = make_view(
+            vec![
+                cluster(c1, members.clone(), -200.0, 0.0),
+                cluster(c2, vec![], 200.0, 0.0),
+            ],
+            members
+                .iter()
+                .map(|&id| player(id, c1, -5.0, 0.0))
+                .collect(),
+        );
+
+        // Run 10 ticks of interaction: record game_action between every pair
+        // by evaluating the view (proximity signal fires every tick since all at x=-5
+        // and proximity_radius=50 covers them all).
+        for _ in 0..10 {
+            engine.evaluate(&view_build);
+        }
+
+        // Phase B: reposition all members to x=+5 — spatially closer to C2.
+        // But they're still assigned to C1, and interaction history is rich.
+        let view_moved = make_view(
+            vec![
+                cluster(c1, members.clone(), -200.0, 0.0),
+                cluster(c2, vec![], 200.0, 0.0),
+            ],
+            members.iter().map(|&id| player(id, c1, 5.0, 0.0)).collect(),
+        );
+
+        let assignments = engine.compute_entity_assignments(&view_moved);
+
+        // All 20 members must be assigned to the same cluster (they stay together).
+        let assigned_clusters: std::collections::HashSet<Uuid> =
+            members.iter().map(|id| assignments[id]).collect();
+        assert_eq!(
+            assigned_clusters.len(),
+            1,
+            "raid group scattered across clusters: {:?}",
+            assigned_clusters
+        );
+    }
+
+    /// Two-part hysteresis test:
+    ///
+    /// Part 1 — threshold guard: entity has marginal interaction with C2 entities
+    /// (weight < migration_threshold) so it stays in C1 despite spatial pull toward C2.
+    ///
+    /// Part 2 — cooldown guard: entity gets overwhelming interaction with C2 and
+    /// migrates. Immediately after, cooldown prevents a re-migration back to C1.
+    #[test]
+    fn hysteresis_prevents_boundary_oscillation() {
+        let c1 = uuid(10);
+        let c2 = uuid(11);
+        let entity = uuid(1);
+        let c1_partner = uuid(2); // lives in C1
+        let c2_partner = uuid(3); // lives in C2
+
+        // Config: migration_threshold=3.0, cooldown_ticks=5 (short for test speed)
+        let engine = AffinityEngine::new(AffinityConfig {
+            spatial_weight: 0.0, // pure interaction — isolates the hysteresis logic
+            migration_threshold: 3.0,
+            cooldown_ticks: 5,
+            ..AffinityConfig::default()
+        });
+
+        // ── Part 1: threshold guard ──────────────────────────────────────────
+        // Entity is in C1. It has interaction weight 1.0 with a C2 entity.
+        // improvement = score(C2) - score(C1) = 1.0 - 0.0 = 1.0 < 3.0 → no migration.
+
+        // Seed a single interaction with the C2 partner (weight 1.0).
+        {
+            let mut graph = engine.interaction_graph.lock().unwrap();
+            graph.record_interaction(entity, c2_partner, 1.0);
+        }
+
+        let view_threshold = make_view(
+            vec![
+                cluster(c1, vec![entity, c1_partner], 0.0, 0.0),
+                cluster(c2, vec![c2_partner], 0.0, 0.0),
+            ],
+            vec![
+                player(entity, c1, 0.0, 0.0),
+                player(c1_partner, c1, 0.0, 0.0),
+                player(c2_partner, c2, 0.0, 0.0),
+            ],
+        );
+
+        let assignments = engine.compute_entity_assignments(&view_threshold);
+        assert_eq!(
+            assignments.get(&entity).copied().unwrap_or(c1),
+            c1,
+            "threshold guard failed: entity migrated with insufficient improvement"
+        );
+
+        // ── Part 2a: overwhelming interaction triggers migration ──────────────
+        // Add strong interaction with C2 partner: total weight now >> migration_threshold.
+        {
+            let mut graph = engine.interaction_graph.lock().unwrap();
+            graph.record_interaction(entity, c2_partner, 10.0);
+        }
+        // Also clear any existing assignment cache so entity starts fresh from C1.
+        {
+            let mut assignments_cache = engine.current_assignments.lock().unwrap();
+            assignments_cache.insert(entity, c1);
+        }
+
+        let assignments2 = engine.compute_entity_assignments(&view_threshold);
+        let entity_cluster_after_migration = assignments2.get(&entity).copied().unwrap_or(c1);
+        assert_eq!(
+            entity_cluster_after_migration, c2,
+            "entity should have migrated to C2 with overwhelming interaction"
+        );
+
+        // ── Part 2b: cooldown prevents immediate re-migration ─────────────────
+        // Entity is now in C2. Build a view that would spatially/interactionally
+        // suggest C1 (add heavy interaction with C1 partner, clear C2 interaction).
+        {
+            let mut graph = engine.interaction_graph.lock().unwrap();
+            // Replace weights: heavy C1 interaction, zero C2
+            graph.remove_entity(c2_partner);
+            graph.record_interaction(entity, c1_partner, 20.0);
+        }
+
+        let view_cooldown = make_view(
+            vec![
+                cluster(c1, vec![c1_partner], 0.0, 0.0),
+                cluster(c2, vec![entity], 0.0, 0.0),
+            ],
+            vec![
+                player(entity, c2, 0.0, 0.0),
+                player(c1_partner, c1, 0.0, 0.0),
+            ],
+        );
+
+        // Entity just migrated — must be on cooldown → stays in C2 despite C1 pull.
+        let assignments3 = engine.compute_entity_assignments(&view_cooldown);
+        assert_eq!(
+            assignments3.get(&entity).copied().unwrap_or(c2),
+            c2,
+            "cooldown guard failed: entity re-migrated within cooldown window"
+        );
+    }
+
+    /// An entity with no interaction history is assigned to the nearest cluster centroid
+    /// (spatial fallback), regardless of which cluster it was last in.
+    #[test]
+    fn isolated_entity_uses_spatial_fallback() {
+        let c1 = uuid(10);
+        let c2 = uuid(11);
+        let loner = uuid(1);
+        let anchor = uuid(2); // gives c1 a member so centroid is populated
+
+        let engine = AffinityEngine::default();
+
+        // Loner has no interactions. C1 centroid at x=-200, C2 centroid at x=+5.
+        // Loner is at x=0 — closer to C2.
+        let view = make_view(
+            vec![
+                cluster(c1, vec![anchor], -200.0, 0.0),
+                cluster(c2, vec![], 5.0, 0.0),
+            ],
+            vec![
+                player(loner, c1, 0.0, 0.0), // nominally in C1 but no history
+                player(anchor, c1, -200.0, 0.0),
+            ],
+        );
+
+        let assignments = engine.compute_entity_assignments(&view);
+        assert_eq!(
+            assignments.get(&loner).copied().unwrap_or(c1),
+            c2,
+            "loner should fall back to spatially nearest cluster C2"
+        );
+    }
 }

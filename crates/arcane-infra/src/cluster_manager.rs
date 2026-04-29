@@ -44,6 +44,17 @@ impl ClusterManager {
         )
     }
 
+    /// Create with a named clustering model. Supported values: "rules" (default), "affinity".
+    /// The "affinity" variant requires the `affinity-clustering` feature flag.
+    pub fn with_model(model_type: &str) -> Self {
+        let model: Arc<dyn IClusteringModel> = match model_type {
+            #[cfg(feature = "affinity-clustering")]
+            "affinity" => Arc::new(arcane_affinity::AffinityEngine::default()),
+            _ => Arc::new(RulesEngine::new()),
+        };
+        Self::new(model, Arc::new(LocalPool::default()), SpatialIndex::new())
+    }
+
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
     pub fn update_entity(
         &mut self,
