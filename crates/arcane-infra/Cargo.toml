@@ -20,6 +20,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"], optional = true }
 tokio-tungstenite = { version = "0.21", optional = true }
+tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 
 [features]
