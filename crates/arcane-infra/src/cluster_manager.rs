@@ -76,6 +76,12 @@ impl ClusterManager {
         )
     }
 
+    /// Override the execution config (for tests or custom deployments).
+    pub fn with_exec_config(mut self, config: ExecutionConfig) -> Self {
+        self.exec_config = config;
+        self
+    }
+
     /// Create with a named clustering model. Supported values: "rules" (default), "affinity".
     /// The "affinity" variant requires the `affinity-clustering` feature flag.
     pub fn with_model(model_type: &str) -> Self {
@@ -167,11 +173,19 @@ impl ClusterManager {
             clusters,
             players,
         };
-        // Bootstrap: allocate one server when clusters exist but none are tracked yet.
-        if self.servers.is_empty() {
+        // Bootstrap: allocate a server for each cluster that doesn't have one yet.
+        // Key = cluster_id so execute_merge/split can look up and release by cluster_id.
+        let unserved: Vec<Uuid> = self
+            .spatial_index
+            .snapshot_for_view()
+            .into_iter()
+            .map(|g| g.cluster_id)
+            .filter(|id| !self.servers.contains_key(id))
+            .collect();
+        for cluster_id in unserved {
             match self.pool.allocate() {
                 Ok(handle) => {
-                    self.servers.insert(handle.server_id, handle);
+                    self.servers.insert(cluster_id, handle);
                 }
                 Err(e) => {
                     return Err(format!(
@@ -225,8 +239,10 @@ impl ClusterManager {
             tracing::warn!("merge: pool.release({}) failed: {}", source, e.detail);
         }
         self.servers.remove(&source);
-        self.merge_cooldowns
-            .insert(target, self.exec_config.merge_cooldown_ticks);
+        if self.exec_config.merge_cooldown_ticks > 0 {
+            self.merge_cooldowns
+                .insert(target, self.exec_config.merge_cooldown_ticks);
+        }
         Ok(())
     }
 
@@ -285,8 +301,10 @@ impl ClusterManager {
         }
 
         let cooldown = self.exec_config.split_cooldown_ticks;
-        self.split_cooldowns.insert(cluster, cooldown);
-        self.split_cooldowns.insert(new_cluster_id, cooldown);
+        if cooldown > 0 {
+            self.split_cooldowns.insert(cluster, cooldown);
+            self.split_cooldowns.insert(new_cluster_id, cooldown);
+        }
         Ok(())
     }
 
