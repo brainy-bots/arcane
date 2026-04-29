@@ -1,7 +1,7 @@
 //! ClusterManager (IN-01) — central coordinator.
 
 use arcane_core::{
-    clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
+    clustering_model::{ClusterDecision, ClusterInfo, DecisionType, PlayerInfo, WorldStateView},
     types::Vec2,
     IClusteringModel, IServerPool, ServerHandle,
 };
@@ -182,6 +182,95 @@ impl ClusterManager {
                 e.code as u32, e.detail
             )),
         }
+    }
+
+    /// Execute a Merge decision: migrate all entities from source to target, release source server.
+    /// Returns Ok(()) for skipped decisions (confidence/cooldown) and Err only for malformed input.
+    fn execute_merge(&mut self, decision: &ClusterDecision) -> Result<(), String> {
+        let source = decision
+            .source_cluster_id
+            .ok_or("merge decision missing source_cluster_id")?;
+        let target = decision
+            .target_cluster_id
+            .ok_or("merge decision missing target_cluster_id")?;
+
+        if decision.confidence < self.exec_config.min_confidence {
+            return Ok(());
+        }
+        if self.merge_cooldowns.contains_key(&source)
+            || self.merge_cooldowns.contains_key(&target)
+        {
+            return Ok(());
+        }
+
+        self.spatial_index.reassign_cluster(source, target);
+        if let Err(e) = self.pool.release(source) {
+            tracing::warn!("merge: pool.release({}) failed: {}", source, e.detail);
+        }
+        self.servers.remove(&source);
+        self.merge_cooldowns
+            .insert(target, self.exec_config.merge_cooldown_ticks);
+        Ok(())
+    }
+
+    /// Execute a Split decision: allocate a new server, migrate group_b entities to it.
+    /// Returns Ok(()) for skipped decisions (confidence/cooldown/pool exhaustion) and Err only for
+    /// malformed input.
+    fn execute_split(&mut self, decision: &ClusterDecision) -> Result<(), String> {
+        let cluster = decision
+            .cluster_id
+            .ok_or("split decision missing cluster_id")?;
+        let group_b = decision
+            .split_group_b
+            .as_ref()
+            .ok_or("split decision missing split_group_b")?;
+
+        if group_b.is_empty() {
+            return Err("split_group_b is empty".to_string());
+        }
+        if decision
+            .split_group_a
+            .as_ref()
+            .map_or(true, |g| g.is_empty())
+        {
+            return Err("split_group_a is empty".to_string());
+        }
+        if decision.confidence < self.exec_config.min_confidence {
+            return Ok(());
+        }
+        if self.split_cooldowns.contains_key(&cluster) {
+            return Ok(());
+        }
+
+        let new_handle = match self.pool.allocate() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("split: pool exhausted, skipping: {}", e.detail);
+                return Ok(());
+            }
+        };
+        let new_cluster_id = new_handle.server_id;
+        self.servers.insert(new_cluster_id, new_handle);
+
+        // Snapshot current positions before mutating the index.
+        let positions: HashMap<Uuid, arcane_core::Vec3> = self
+            .spatial_index
+            .snapshot_entities()
+            .into_iter()
+            .map(|(eid, _, pos)| (eid, pos))
+            .collect();
+
+        for &entity_id in group_b {
+            if let Some(&pos) = positions.get(&entity_id) {
+                self.spatial_index
+                    .update_entity(entity_id, new_cluster_id, pos);
+            }
+        }
+
+        let cooldown = self.exec_config.split_cooldown_ticks;
+        self.split_cooldowns.insert(cluster, cooldown);
+        self.split_cooldowns.insert(new_cluster_id, cooldown);
+        Ok(())
     }
 
     /// Current number of active clusters (for tests / metrics).
