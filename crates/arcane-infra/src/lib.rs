@@ -34,7 +34,7 @@ pub mod ws_server;
 #[cfg(feature = "cluster-ws")]
 pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 
-pub use cluster_manager::ClusterManager;
+pub use cluster_manager::{ClusterManager, ExecutionConfig};
 pub use cluster_server::ClusterServer;
 pub use redis_channel::RedisReplicationChannel;
 pub use replication_channel_manager::ReplicationChannelManager;
