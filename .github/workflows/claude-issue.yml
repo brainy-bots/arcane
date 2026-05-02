@@ -1,0 +1,12 @@
+name: Claude on labeled issue
+# DISABLED: Local daemon handles worker dispatch. CI would burn Claude Code API quota.
+# Keeping the workflow definition for reference only.
+on:
+  workflow_dispatch:
+
+jobs:
+  claude:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Worker CI disabled — local daemon handles this."
