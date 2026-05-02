@@ -45,10 +45,13 @@ pub struct GameAction {
 /// remove it and include the id in the next delta's `removed` list. Deleting from `entities` alone
 /// would omit the entity from `updated` without a removal record.
 pub struct ClusterTickContext<'a> {
+    /// Unique identifier for this cluster.
     pub cluster_id: Uuid,
     /// Monotonic tick index that will be assigned to the upcoming replication delta's `tick` field.
     pub tick: u64,
+    /// Simulation time step (seconds) since the last tick.
     pub dt_seconds: f64,
+    /// Mutable reference to the cluster's entity storage.
     pub entities: &'a mut HashMap<Uuid, EntityStateEntry>,
     /// Processed after `on_tick` returns so the next delta lists these ids under `removed`.
     pub pending_removals: &'a mut Vec<Uuid>,
@@ -59,5 +62,7 @@ pub struct ClusterTickContext<'a> {
 
 /// Custom simulation step for entities owned by this cluster.
 pub trait ClusterSimulation: Send + Sync {
+    /// Advance simulation state by one tick. Called once per tick after client updates and injected
+    /// entities are applied, and before the replication delta is built.
     fn on_tick(&self, ctx: &mut ClusterTickContext<'_>);
 }
