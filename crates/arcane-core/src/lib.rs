@@ -1,4 +1,4 @@
-//! Arcane Engine — core traits and shared types.
+//! Core types and traits for the Arcane real-time multiplayer engine.
 //!
 //! Defines the stable, I/O-free contracts used by the rest of the workspace.
 //!
