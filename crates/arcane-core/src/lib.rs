@@ -34,3 +34,5 @@ pub use server_pool::{
 };
 pub use types::{ClusterGeometry, Vec2, Vec3};
 pub use world_simulator::{IWorldSimulator, LastKnownState, SimulatedState, WorldContext};
+
+// daemon-smoke-test: ok
