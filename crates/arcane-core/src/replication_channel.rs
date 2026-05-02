@@ -13,23 +13,33 @@
 use crate::types::Vec3;
 use uuid::Uuid;
 
-/// Configuration for a replication channel (one neighbor).
+/// Configuration for a replication channel to one neighbor.
 #[derive(Clone, Debug)]
 pub struct ChannelConfig {
+    /// Spatial radius (world units) within which entities are replicated to this neighbor.
     pub observation_radius: f64,
+    /// Maximum number of pending deltas before the channel starts dropping.
     pub max_queue_depth: usize,
+    /// Minimum interval (ms) between consecutive sends to this neighbor.
     pub send_interval_ms: u32,
+    /// Whether to compress delta payloads before transmission.
     pub compression_enabled: bool,
 }
 
 /// Entity state delta sent to a neighbor. Fire-and-forget; no ack.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EntityStateDelta {
+    /// Cluster that produced and sent this delta.
     pub source_cluster_id: Uuid,
+    /// Monotonic sequence number for ordering deltas from this source.
     pub seq: i64,
+    /// Simulation tick at which this delta was produced.
     pub tick: u64,
+    /// Monotonic timestamp (seconds since epoch) of the snapshot.
     pub timestamp: f64,
+    /// Entities that were created or updated since the last delta.
     pub updated: Vec<EntityStateEntry>,
+    /// Entity UUIDs that were removed since the last delta.
     pub removed: Vec<Uuid>,
 }
 
@@ -47,10 +57,13 @@ pub struct EntityStateDelta {
 /// `local_data` uses [`serde::Serialize`] with skip — it does not cross the replication mesh.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EntityStateEntry {
+    /// Unique identifier for this entity (bucket 1 — spine, routing).
     pub entity_id: Uuid,
     /// Cluster that owns this entity (for client colorization and ownership display).
     pub cluster_id: Uuid,
+    /// World-space position of the entity (bucket 1 — spine, pose).
     pub position: Vec3,
+    /// Velocity vector in world units per second (bucket 1 — spine, pose).
     pub velocity: Vec3,
     /// **Bucket 2** — replicated game JSON (neighbors, clients). Default `null`; omitted when null.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -64,6 +77,8 @@ pub struct EntityStateEntry {
 }
 
 impl EntityStateEntry {
+    /// Create a new entry with only bucket-1 spine fields. `user_data` and `local_data` start as
+    /// [`serde_json::Value::Null`]; callers set them after construction when needed.
     pub fn new(entity_id: Uuid, cluster_id: Uuid, position: Vec3, velocity: Vec3) -> Self {
         Self {
             entity_id,
@@ -76,20 +91,24 @@ impl EntityStateEntry {
     }
 }
 
-/// Reason for closing a channel.
+/// Reason a replication channel was closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseReason {
+    /// The neighbor cluster left the region or disconnected.
     NeighborDepartured,
+    /// The two clusters merged into one; the channel between them is no longer needed.
     ClustersMerged,
+    /// The local cluster or whole simulation is shutting down.
     Shutdown,
 }
 
-/// Contract for publishing/subscribing to a neighbor's state. One instance per neighbor.
+/// Contract for publishing/subscribing to a neighbor cluster's entity state. One instance per neighbor.
 pub trait IReplicationChannel: Send + Sync {
-    /// Enqueue a delta for transmission. Non-blocking; may drop if queue full.
+    /// Enqueue a delta for transmission. Non-blocking; may return a congestion signal or silently
+    /// drop when the queue is full.
     fn send(&self, delta: EntityStateDelta);
 
-    /// Close the channel and flush pending sends.
+    /// Close the channel, flush pending sends, and release transport resources.
     fn close(&self, reason: CloseReason);
 }
 
