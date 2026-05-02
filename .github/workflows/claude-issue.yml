@@ -5,7 +5,18 @@ on:
 
 jobs:
   claude:
-    if: github.event.label.name == 'claude-ready' && github.event.sender.login == 'martinjms'
+    # Fire on claude-ready label apply. GitHub's `triage+` permission already
+    # gates who can apply labels — random PR authors and outside contributors
+    # cannot. Trusting the label IS the trust gate; no per-repo allowlist needed.
+    # Forks inherit this naturally (the fork owner has admin → can label;
+    # outsiders cannot).
+    if: github.event.label.name == 'claude-ready'
+
+    # Serialize worker runs per issue. Prevents two simultaneous events on the
+    # same issue (e.g. the orchestrator's two-step dispatch) from racing.
+    concurrency:
+      group: worker-${{ github.event.issue.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,22 +28,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Worker instructions live in `.claude/skills/arcane-worker/`
+      # (progressive-disclosure skill). The skill auto-detects mode (fresh / continue / blocker)
+      # from issue body + PR existence and only loads the relevant mode file plus references
+      # as needed. Keeps per-invocation context cost low.
       - uses: anthropics/claude-code-action@v1
         with:
+          # `allowed_bots: '*'` lets bot-triggered runs through.
+          # The orchestrator (running as a bot) applies `claude-ready` to dispatch this worker;
+          # without this, claude-code-action's default bot-trigger refusal blocks every dispatch.
+          # Identity-level safety stays gated by the job `if:` above (sender == martinjms OR
+          # the issue carries `claude-working` — which only the orchestrator applies).
+          allowed_bots: '*'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: "--model haiku --dangerously-skip-permissions"
           settings: '{"advisorModel": "opus"}'
           prompt: |
-            Pick up GitHub issue #${{ github.event.issue.number }} in this repo: "${{ github.event.issue.title }}".
+            Issue: #${{ github.event.issue.number }} — "${{ github.event.issue.title }}"
+            Repo: ${{ github.repository }}
+            Sender that triggered this: ${{ github.event.sender.login }}
 
             Issue body:
             ${{ github.event.issue.body }}
 
-            Working rules (override any conflicting habits):
-            - Open a pull request with your changes. Do NOT merge it; Martin reviews every PR.
-            - When you finish, comment on the issue summarizing what was done and what still remains. Do NOT close the issue.
-            - If you introduce something to replace existing code or docs, remove the old version in the same PR — do not let both live in parallel.
-            - Do not frame work by release stage (no "MVP", "v1", "post-MVP", "future"). Describe work by merit and dependencies.
-            - Follow existing project conventions. If a CLAUDE.md exists in the repo, treat its rules as binding.
-
-            Begin.
+            Run /arcane-worker. Determine mode (fresh / continue / blocker) from the issue body and current PR state per the skill's mode router, then execute that mode's playbook from `.claude/skills/arcane-worker/modes/`. Read references in `.claude/skills/arcane-worker/references/` as needed.
