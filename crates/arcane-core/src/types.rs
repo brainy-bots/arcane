@@ -11,11 +11,14 @@ pub use uuid::Uuid as EntityId;
 /// 2D vector (e.g. centroid in 2D plane, or x/z).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Vec2 {
+    /// X-axis component.
     pub x: f64,
+    /// Y-axis component.
     pub y: f64,
 }
 
 impl Vec2 {
+    /// Create a new 2D vector from its x and y components.
     pub fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
@@ -24,12 +27,16 @@ impl Vec2 {
 /// 3D position (world position, centroid with height).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vec3 {
+    /// X-axis coordinate.
     pub x: f64,
+    /// Y-axis coordinate.
     pub y: f64,
+    /// Z-axis coordinate.
     pub z: f64,
 }
 
 impl Vec3 {
+    /// Create a new 3D vector from its x, y, and z components.
     pub fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
     }
@@ -46,9 +53,13 @@ impl Vec3 {
 /// Per-cluster geometry from SpatialIndex (IN-03). Used for neighbor lists and WorldStateView.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClusterGeometry {
+    /// Unique identifier for this cluster.
     pub cluster_id: Uuid,
+    /// Spatial centroid of the cluster.
     pub centroid: Vec3,
+    /// Maximum distance of any entity from the centroid.
     pub spread_radius: f64,
+    /// Number of entities assigned to this cluster.
     pub entity_count: u32,
 }
 
