@@ -95,26 +95,135 @@ This is the same kind of reasoning the manager already does for player movement 
 
 ---
 
-## 7. Terrain is NOT entities
+## 7. Terrain — game owns storage and authoring; Arcane owns the loading interface
 
-This is the only thing in the world that's *not* an entity:
+Terrain is the only thing in the world that's *not* an entity. Three terrain shapes need to work in Arcane, all through the same interface:
 
-| Aspect | Entity | Terrain |
-|---|---|---|
-| Identity | Stable UUID | None — terrain has no identity beyond chunk addressing |
-| State | SpacetimeDB durable + spine pose + replicated user_data + local_data | None — terrain is *content*, not *state* |
-| Storage | SpacetimeDB | Map asset on disk |
-| Replication | Per-tick deltas | Not replicated — clients have own copy of map assets |
-| Authority / ownership | A specific cluster at a given moment | Whichever cluster currently has chunks loaded; non-authoritative — every cluster reads the same map data |
-| Mutability at runtime | Fully mutable | Read-only |
+| Terrain shape | Storage | Mutability | Example games |
+|---|---|---|---|
+| **Static / mesh** | Object storage (S3, CDN, on-disk asset bundle) | Read-only at runtime | UE level, Unity scene, glTF import |
+| **Voxel** | **SpacetimeDB** (voxel grid is durable state — every block edit persists) | Mutable per-block, durable across sessions | Minecraft, Valheim, Astroneer |
+| **Procedural / hybrid** | Seed in SpacetimeDB; geometry generated on demand; modifications stored as durable diffs | Effectively mutable via overrides | No Man's Sky, procedural sandboxes |
 
-If a game has destructible terrain (a hole punched in a wall, dirt mined out), that destruction is modeled as **entities**, not as edits to the terrain. A wall that can be destroyed is an entity with `Fixed` body kind and durable HP state. Mining a tunnel is the despawn of a series of voxel-entities, leaving the underlying terrain mesh intact. The terrain layer is read-only; everything mutable is expressed at the entity layer.
+If a game has destructible terrain that's purely entity-flavored (a wall a player can knock down), that's still an entity, not a terrain edit. Voxel terrain is genuinely terrain — it has no per-block entity_id, no per-block durable rows for entity-style state. Voxel chunks ARE durable rows, just at chunk granularity, not block granularity.
 
-**Game developers do not insert terrain geometry into physics by hand.** The Arcane runtime is responsible for loading the right map collision into a cluster's physics world based on which entities the cluster currently owns and where they are. See [issue #119](https://github.com/brainy-bots/arcane/issues/119) for the terrain-loading epic.
+### Arcane provides — the MapProvider interface
+
+The cluster runtime owns chunk loading. The game implements a `MapProvider` (per-engine plugin name) that the runtime calls:
+
+```rust
+// Rapier-Rust shape; UE/Unity/Godot have parallel APIs in their native languages.
+pub trait RapierMapProvider: Send + Sync {
+    /// Compute which chunks need to be loaded given the cluster's currently
+    /// owned entity positions. Pure function of input; called per cluster
+    /// tick (or on entity arrival/departure events).
+    fn chunks_in_range(&self, entity_positions: &[Vec3]) -> Vec<ChunkId>;
+
+    /// Fetch the collision geometry for a chunk. Implementation reads from
+    /// wherever the game stores it (SpacetimeDB voxel chunks, object storage
+    /// mesh bundles, embedded assets, procedural generators) — game's choice.
+    fn load_chunk(&self, chunk_id: ChunkId) -> Result<ChunkCollision, MapError>;
+}
+
+pub enum ChunkCollision {
+    TriMesh { vertices: Vec<Vec3>, indices: Vec<[u32; 3]> },
+    HeightField { width: usize, height: usize, samples: Vec<f32> },
+    // Voxel games typically convert to TriMesh via greedy meshing
+    // before returning, or expose per-block boxes if blocks are sparse.
+}
+```
+
+Per the per-engine API discipline, this is one of many parallel APIs — the UE plugin defines `IArcaneUnrealMapProvider` returning UE-native collision data; Unity does the same with Unity-native types; etc. Different language, same conceptual contract.
+
+### Arcane does NOT provide
+
+- A map asset format. Game decides.
+- An authoring tool. Game uses its engine's editor (UE, Unity, Godot, Blender, custom) or generates procedurally.
+- A default storage backend. Game picks SpacetimeDB / object storage / on-disk / procedural / hybrid.
+- Voxel-specific or mesh-specific support. The interface is uniform; the implementation differs per game.
+
+### Where things live (typical layout)
+
+| Data | Storage |
+|---|---|
+| Static map content (mesh files, prebaked geometry) | Object storage / asset bundle / on-disk — game's choice |
+| Voxel terrain content | SpacetimeDB (durable, mutable, chunk granularity) |
+| Map manifest (chunk catalog, version pointers) | SpacetimeDB row(s) — small, always available, used by cluster startup |
+| Mutable per-chunk state (destruction events on a mesh chunk, voxel diffs) | SpacetimeDB rows tied to `chunk_id` |
+| Per-chunk **entities** (placed structures, drops) | SpacetimeDB — already entities, already durable |
+
+**Game developers never insert terrain geometry into physics by hand at runtime.** They author the map (in their engine's editor or as voxel data); they implement the `MapProvider`; the cluster runtime calls it. See [issue #119](https://github.com/brainy-bots/arcane/issues/119).
 
 ---
 
-## 8. Cross-references
+## 8. Conceptual contract vs. per-engine API
+
+This document defines **conceptual contracts**: what an entity is, the body-kind taxonomy, the affinity-vs-spatial binding distinction, the terrain-vs-entities split. These are vocabulary and mental model, not a code library.
+
+**The user-facing API for declaring entity properties is per-engine.** Arcane has multiple engine plugins (Rapier-Rust, UE, Unity, Godot — current and future). Each plugin exposes its own engine-native API for game developers, written in the engine's language and matching the engine's idioms.
+
+| Engine | User-facing API for entities | Body-kind expression |
+|---|---|---|
+| **Rapier (Rust)** | Implement the `RapierClusterSimulation` trait; per-entity hooks return Rust enums | `RapierBodyKind` enum |
+| **Unreal (C++)** | Subclass `AArcaneUnrealEntity` (extends `AActor`); plugin reads UE's native properties | `EComponentMobility` (UE-native) — **not** mirrored as a separate Arcane enum |
+| **Unity (C#)** | Add `ArcaneUnityEntity` `MonoBehaviour` to a `GameObject`; plugin reads Unity's native properties | `Rigidbody.bodyType` + `Rigidbody.isKinematic` (Unity-native) |
+| **Godot (GDScript / C#)** | Subclass `ArcaneGodotEntity` (Node3D base); plugin reads Godot's native node class | Choice of body class (`RigidBody3D` / `StaticBody3D` / `AnimatableBody3D` / `Area3D`) — Godot-native |
+
+**There is no shared Arcane `BodyKind` enum across engines.** The conceptual taxonomy (Dynamic / KinematicPositionBased / KinematicVelocityBased / Fixed) is documented here as vocabulary; each plugin uses its own engine-native equivalent.
+
+The same applies to colliders, materials, collision groups, sensor flags, joint specs, and contact events. **Each engine plugin has its own value types in its own language.** Rust plugins use Rust enums; UE plugins use UENUM / USTRUCT; Unity uses C# classes; Godot uses GDScript dictionaries or C# classes.
+
+### What IS engine-neutral and shared
+
+- **Wire format types** (`EntityStateEntry`, `EntityStateDelta`, postcard / arcane-wire bytes) — every cluster speaks the same protocol.
+- **Manager / replication protocols** — HTTP join, Redis pub/sub channel layout, neighbor delta semantics.
+- **Durable state schema invariant** — every entity has a SpacetimeDB row.
+- **Conceptual vocabulary** — this document.
+- **Industry-standard term cross-references** — to make cross-engine and cross-team conversations productive (§9 below).
+
+### Why per-engine, not shared
+
+- Different languages (C++, C#, GDScript, Rust). Code-level type sharing is impossible across language boundaries; "shared types" become four parallel re-implementations of the same enum.
+- Different idioms. UE devs hate writing un-UE-like code; same for every engine community.
+- Game devs already think in their engine's vocabulary. Layering a parallel Arcane vocabulary on top is friction without benefit.
+- Cross-engine consistency that *matters* (wire format, manager protocol, durable state) is enforced where it must be — at the protocol layer.
+
+---
+
+## 9. Engine plugin pattern
+
+The canonical shape of an Arcane engine plugin:
+
+1. **Engine-native base class or interface** for game-side entities, named with the `Arcane{Engine}Entity` convention. Extends or implements engine-native types so the dev's code looks engine-native.
+2. **Per-engine cluster runtime** that hosts the simulation tick and dispatches to the user's game logic. Listens to manager, publishes to Redis, broadcasts to WS clients — all in the engine's native language.
+3. **Per-engine `MapProvider`** that the game implements for terrain loading.
+4. **Per-engine in-tick imperative ops** (apply impulse, raycast, etc.) — engine-native types as inputs and outputs, but always **entity-keyed** never engine-handle-keyed (preserves the wire-format invariant).
+5. **Wire-format byte-compatibility** with every other engine plugin. Reads / writes the exact same `EntityStateDelta` bytes that Rust clusters do.
+
+For game devs targeting multiple engines (e.g., a UE-cluster premium tier and a Rapier-cluster mid tier of the same game), this means writing **N parallel game-logic codebases**, one per engine plugin. Each is engine-native, idiomatic, and uses that engine's full feature set. **Cross-engine consistency for game rules** (damage, drops, currency, anything that must be transactionally consistent) **lives in SpacetimeDB reducers** — called from every engine plugin's cluster binary, ensuring the rules are guaranteed identical.
+
+The platform doesn't try to auto-port code. Devs choose how many tiers to support and write logic appropriate to each.
+
+---
+
+## 10. Cross-engine entity migration
+
+Entities can migrate between cluster tiers running different engines (per the heterogeneous-tier vision in `#33` and the dynamic migration epic in `#34`). The migration mechanism is at cluster-process boundaries:
+
+1. Source cluster releases authority over the entity. Its engine-native game logic stops ticking it. Its physics body for the entity is destroyed.
+2. **Durable state in SpacetimeDB is the source of truth**, has been throughout. Source writes a final state on release.
+3. Target cluster takes authority. Reads durable state. **Target's engine-native game logic** (a different codebase, possibly a different language) starts ticking the entity. Target's physics body is spawned at the entity's current position.
+4. The entity's position / velocity / replicated user_data continue to flow through the wire format unchanged.
+
+There is **no in-process engine switching**. The "function that runs physics for this engine" is the entire cluster binary written in that engine's language. The platform's job at migration time is the ownership-transfer protocol; the dev's job is to make sure their per-engine logic implementations preserve the entity's gameplay state across the swap.
+
+Migration timing is `#34`'s scope (dynamic tier migration as a platform primitive). Static tier placement (an entity is born in a tier, stays there) is the simpler v1 case.
+
+---
+
+---
+
+## 11. Cross-references
 
 | Topic | Doc |
 |---|---|
@@ -125,7 +234,7 @@ If a game has destructible terrain (a hole punched in a wall, dirt mined out), t
 
 ---
 
-## 9. Industry-standard terminology cross-references
+## 12. Industry-standard terminology cross-references
 
 When discussing Arcane's entity model with people from other engines:
 
