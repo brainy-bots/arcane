@@ -68,14 +68,18 @@ Maintain a **bidirectional map** in the integration layer:
 | Concept | Responsibility |
 |---------|----------------|
 | `entity_id` (`Uuid`) | Stable Arcane / wire identity; store as FGuid or string in UE per project convention. |
-| Chaos actor / body | Spawn when a new owned entity appears in the authoritative set; destroy when removed or when `pending_removals`-style lifecycle fires. |
-| Neighbor entities | **Policy (v1):** treat as **kinematic** or **pose-only** proxies — do not double-simulate. Full cross-cluster coupling is game-specific. |
+| Chaos / Rapier actor / body | Spawn when a new owned entity appears in the authoritative set; destroy when removed or when `pending_removals`-style lifecycle fires. |
+| Neighbor entities | **Policy:** treat as **kinematic** or **pose-only** proxies — do not double-simulate. Full cross-cluster coupling is deferred work (see clustering-binding epic). |
 | `user_data` | Optional: stiffness, hitbox id, team — replicated; keep small. |
 | `local_data` | Solver scratch, cooldowns — **not** on Redis wire; see [four-bucket-state-model.md](four-bucket-state-model.md). |
+| **Body kind** | Per-entity, declared at first-sight via `body_kind_for` hook. `Dynamic` (players, projectiles, debris), `KinematicPositionBased` / `KinematicVelocityBased` (server-controlled motion), `Fixed` (walls, placed structures). Default `Dynamic`. See [entity-model.md §4](entity-model.md). |
+| **Terrain / world geometry** | **Not entities.** Loaded into the cluster's physics world automatically by the Arcane runtime based on entity positions. Game developers do not insert terrain colliders by hand. See [issue #119](https://github.com/brainy-bots/arcane/issues/119). |
 
-**Spawn sync:** On first sight of `entity_id`, create default Chaos representation (capsule/box) from game data or `user_data` schema version.
+**Spawn sync:** On first sight of `entity_id`, create the appropriate body via the `body_kind_for` + `collider_for` hooks. Default body kind is `Dynamic` with a sphere collider matching `RapierConfig::default_body_radius`.
 
-**Despawn:** On removal from cluster authority or `pending_removals`, destroy Chaos objects and clear handles.
+**Despawn:** On removal from cluster authority or `pending_removals`, destroy physics objects and clear handles.
+
+**Sleeping bodies:** stationary Dynamic / Kinematic bodies and all Fixed bodies are essentially free per tick — Rapier's sleep mechanism + Fixed-body solver-skip means a cluster with hundreds of stationary entities pays cost proportional only to active (awake) bodies. The "no entities → no simulation" intuition is preserved by this mechanism without needing a separate concept for stationary objects.
 
 ---
 
