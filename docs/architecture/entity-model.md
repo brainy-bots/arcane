@@ -147,10 +147,24 @@ Per the per-engine API discipline, this is one of many parallel APIs — the UE 
 | Data | Storage |
 |---|---|
 | Static map content (mesh files, prebaked geometry) | Object storage / asset bundle / on-disk — game's choice |
-| Voxel terrain content | SpacetimeDB (durable, mutable, chunk granularity) |
+| Voxel terrain content | **SpacetimeDB** (durable per-chunk row) |
 | Map manifest (chunk catalog, version pointers) | SpacetimeDB row(s) — small, always available, used by cluster startup |
-| Mutable per-chunk state (destruction events on a mesh chunk, voxel diffs) | SpacetimeDB rows tied to `chunk_id` |
+| Mutable per-chunk state (destruction events, voxel diffs, runtime modifications) | **SpacetimeDB** for durability **+** **Redis pub/sub** for real-time cross-cluster sync |
 | Per-chunk **entities** (placed structures, drops) | SpacetimeDB — already entities, already durable |
+
+### Cross-cluster coordination for mutable terrain
+
+Mutable terrain follows the same write-to-SpacetimeDB-and-publish-on-Redis pattern Arcane already uses for entity replication. Redis is the real-time replication channel between clusters; SpacetimeDB is the durable source of truth. Both are needed; they serve different purposes.
+
+When Cluster X modifies a chunk (player digs a tunnel, voxel block edit, destruction event on a mesh chunk):
+
+1. Cluster X writes the change to **SpacetimeDB** (durable).
+2. Cluster X publishes the modification on **Redis** (real-time, on the existing replication channel).
+3. Cluster Y has the same chunk loaded for its own owned entities — receives the Redis notification.
+4. Cluster Y's MapProvider invalidates its local cache and reloads the chunk's collision geometry.
+5. On any cluster restart: rehydrate from SpacetimeDB; Redis events from before the restart are already reflected in durable state.
+
+Voxel chunks are conceptually just another kind of cross-cluster game state that's both immediate (clusters need to see edits within a tick) and durable (edits persist across restarts). Same mechanism as `EntityStateDelta`. Don't propose "SpacetimeDB pub/sub" or "Redis as durable storage" — both are wrong by Arcane's design.
 
 **Game developers never insert terrain geometry into physics by hand at runtime.** They author the map (in their engine's editor or as voxel data); they implement the `MapProvider`; the cluster runtime calls it. See [issue #119](https://github.com/brainy-bots/arcane/issues/119).
 
