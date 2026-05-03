@@ -20,6 +20,47 @@
 //!   Shape is fixed at first-sight spawn; later `collider_for` returns are ignored
 //!   for already-spawned entities (despawn-and-respawn to change shape).
 //!
+//! # Per-entity spawn-time hooks
+//!
+//! Beyond `collider_for`, [`RapierClusterSimulation`] exposes four more hooks
+//! that customize the rigid body / collider attached at first-sight spawn:
+//!
+//! - [`RapierClusterSimulation::body_kind_for`] — Dynamic / KinematicPositionBased
+//!   / KinematicVelocityBased / Fixed. Default `Dynamic`.
+//! - [`RapierClusterSimulation::material_for`] — friction / restitution / density.
+//!   Default zero-friction, zero-restitution, unit-density.
+//! - [`RapierClusterSimulation::collision_groups_for`] — `memberships` + `filter`
+//!   bitsets following Rapier's `InteractionGroups` semantics. Default
+//!   "everything collides with everything."
+//! - [`RapierClusterSimulation::is_sensor`] — sensor colliders fire contact
+//!   events without producing physical pushback. Default `false`.
+//!
+//! All five hooks (these four plus `collider_for`) are called exactly once per
+//! entity, at first-sight spawn. Subsequent return-value changes are ignored
+//! for already-spawned bodies — despawn and respawn to change them.
+//!
+//! ## Subclass-style vs property-value-style
+//!
+//! Per [`docs/architecture/entity-model.md`](https://github.com/brainy-bots/arcane/blob/main/docs/architecture/entity-model.md)
+//! §5, two patterns are equally valid for organizing per-entity hook returns:
+//!
+//! - **Property-value-style** — one [`RapierClusterSimulation`] impl matches
+//!   on a kind field in `entry.user_data` (or the entity's SpacetimeDB row)
+//!   and returns the right body kind / shape / material / groups per entity.
+//!   Cleaner for games with many or runtime-configurable kinds.
+//! - **Subclass-style** — the game maintains its own per-entity routing (a
+//!   `HashMap<EntityKind, Box<dyn Strategy>>` etc.) and the
+//!   [`RapierClusterSimulation`] impl dispatches into it. More ergonomic for
+//!   games with a small fixed catalog of entity kinds.
+//!
+//! Both patterns work — the hook signatures take `&EntityStateEntry` so either
+//! style can read whatever the game stored to make the decision.
+//!
+//! **`Fixed` and clustering:** introducing `Fixed` here only changes
+//! physics-side behavior (solver-skipped, only AABB tracked). Until the
+//! clustering-binding epic lands, `Fixed` entities still migrate by PGP
+//! affinity — they are not yet pinned to chunk ownership.
+//!
 //! # Contact events
 //!
 //! [`RapierClusterSimulation::on_tick`] receives a [`RapierClusterTickContext`]
@@ -63,6 +104,61 @@
 //! // let physics = Arc::new(RapierClusterSim::with_rapier_sim(game, RapierConfig::default()));
 //!
 //! // Pass `Some(physics)` as the simulation arg to `run_cluster_loop`.
+//! ```
+//!
+//! Property-value-style impl that uses every spawn-time hook:
+//!
+//! ```no_run
+//! use arcane_core::replication_channel::EntityStateEntry;
+//! use arcane_infra::{
+//!     Group, RapierBodyKind, RapierClusterSimulation, RapierClusterTickContext,
+//!     RapierColliderShape, RapierCollisionGroups, RapierConfig, RapierMaterial,
+//! };
+//!
+//! struct MyGame;
+//! impl RapierClusterSimulation for MyGame {
+//!     fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+//!
+//!     fn body_kind_for(&self, entry: &EntityStateEntry, _c: &RapierConfig) -> RapierBodyKind {
+//!         match entry.user_data.get("kind").and_then(|v| v.as_str()) {
+//!             Some("wall") | Some("item") => RapierBodyKind::Fixed,
+//!             Some("platform") => RapierBodyKind::KinematicPositionBased,
+//!             _ => RapierBodyKind::Dynamic, // players, projectiles, etc.
+//!         }
+//!     }
+//!
+//!     fn collider_for(&self, entry: &EntityStateEntry, c: &RapierConfig) -> RapierColliderShape {
+//!         match entry.user_data.get("kind").and_then(|v| v.as_str()) {
+//!             Some("player") => RapierColliderShape::Capsule { half_height: 0.9, radius: 0.4 },
+//!             Some("wall") => RapierColliderShape::Cuboid([5.0, 2.0, 0.5]),
+//!             _ => RapierColliderShape::Ball(c.default_body_radius),
+//!         }
+//!     }
+//!
+//!     fn material_for(&self, entry: &EntityStateEntry, _c: &RapierConfig) -> RapierMaterial {
+//!         match entry.user_data.get("surface").and_then(|v| v.as_str()) {
+//!             Some("ice") => RapierMaterial::new(0.05, 0.0, 1.0),
+//!             Some("rubber") => RapierMaterial::new(0.9, 0.8, 1.0),
+//!             _ => RapierMaterial::default(),
+//!         }
+//!     }
+//!
+//!     fn collision_groups_for(
+//!         &self,
+//!         entry: &EntityStateEntry,
+//!         _c: &RapierConfig,
+//!     ) -> RapierCollisionGroups {
+//!         // Projectiles don't collide with the entity that fired them, etc.
+//!         match entry.user_data.get("kind").and_then(|v| v.as_str()) {
+//!             Some("projectile") => RapierCollisionGroups::new(Group::GROUP_2, Group::GROUP_1),
+//!             _ => RapierCollisionGroups::default(),
+//!         }
+//!     }
+//!
+//!     fn is_sensor(&self, entry: &EntityStateEntry, _c: &RapierConfig) -> bool {
+//!         entry.user_data.get("kind").and_then(|v| v.as_str()) == Some("trigger_zone")
+//!     }
+//! }
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -141,7 +237,112 @@ pub enum RapierColliderShape {
     Cuboid([f32; 3]),
 }
 
-fn build_collider(shape: RapierColliderShape) -> Collider {
+/// Physics body kind for an entity. Resolved at first-sight spawn via
+/// [`RapierClusterSimulation::body_kind_for`]; subsequent calls are ignored
+/// for already-spawned entities (despawn-and-respawn to change body kind).
+///
+/// See [`docs/architecture/entity-model.md`](https://github.com/brainy-bots/arcane/blob/main/docs/architecture/entity-model.md)
+/// §4 for the canonical taxonomy and per-kind use cases.
+///
+/// **Note on `Fixed` and clustering:** introducing `Fixed` here only changes
+/// physics-side behavior (solver-skipped, only AABB tracked in broadphase).
+/// Until the (unfiled) clustering-binding epic lands, `Fixed` entities still
+/// migrate by PGP affinity — they are not yet pinned to chunk ownership.
+///
+/// `#[non_exhaustive]` so adding kinds in future versions isn't a SemVer break.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RapierBodyKind {
+    /// Full physics simulation: forces, gravity, contacts all apply. Default.
+    #[default]
+    Dynamic,
+    /// Position is controlled by game logic; physics doesn't apply forces.
+    /// Used for moving platforms, elevators, custom-locomotion characters.
+    KinematicPositionBased,
+    /// Velocity is controlled by game logic; physics integrates that velocity
+    /// into position but doesn't add forces. Mid-ground between Dynamic and
+    /// KinematicPositionBased.
+    KinematicVelocityBased,
+    /// Solver-skipped; only AABB tracking in broadphase. Used for walls,
+    /// permanent fixtures, placed structures.
+    Fixed,
+}
+
+/// Per-entity physics material — friction, restitution (bounciness), density
+/// (drives mass derivation from collider volume). Resolved at first-sight
+/// spawn via [`RapierClusterSimulation::material_for`].
+///
+/// Defaults are zero-friction, zero-restitution, unit-density — matches the
+/// crate's "benchmark parity" stance (no surprising deceleration / bounce
+/// out of the box).
+///
+/// `#[non_exhaustive]` so adding fields (e.g. anisotropic friction) in future
+/// versions isn't a SemVer break.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RapierMaterial {
+    pub friction: f32,
+    pub restitution: f32,
+    pub density: f32,
+}
+
+impl RapierMaterial {
+    /// Build a material from explicit friction / restitution / density values.
+    pub const fn new(friction: f32, restitution: f32, density: f32) -> Self {
+        Self {
+            friction,
+            restitution,
+            density,
+        }
+    }
+}
+
+impl Default for RapierMaterial {
+    fn default() -> Self {
+        Self::new(0.0, 0.0, 1.0)
+    }
+}
+
+/// Collision filtering for an entity's collider — `memberships` declares
+/// which group bits this collider belongs to; `filter` declares which group
+/// bits it can collide with. Two colliders generate contacts iff
+/// `(a.memberships & b.filter) != 0 && (b.memberships & a.filter) != 0`,
+/// matching Rapier's `InteractionGroups` semantics.
+///
+/// Default is "everything collides with everything" — `memberships = Group::ALL`,
+/// `filter = Group::ALL`, equivalent to Rapier's `InteractionGroups::all()`.
+///
+/// `#[non_exhaustive]` so adding fields (e.g. solver-only flags) in future
+/// versions isn't a SemVer break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RapierCollisionGroups {
+    pub memberships: Group,
+    pub filter: Group,
+}
+
+impl RapierCollisionGroups {
+    /// Build a groups value from explicit memberships and filter bits.
+    pub const fn new(memberships: Group, filter: Group) -> Self {
+        Self {
+            memberships,
+            filter,
+        }
+    }
+}
+
+impl Default for RapierCollisionGroups {
+    fn default() -> Self {
+        Self::new(Group::ALL, Group::ALL)
+    }
+}
+
+fn build_collider(
+    shape: RapierColliderShape,
+    material: RapierMaterial,
+    groups: RapierCollisionGroups,
+    is_sensor: bool,
+) -> Collider {
     let builder = match shape {
         RapierColliderShape::Ball(radius) => ColliderBuilder::ball(radius),
         RapierColliderShape::Capsule {
@@ -151,6 +352,15 @@ fn build_collider(shape: RapierColliderShape) -> Collider {
         RapierColliderShape::Cuboid(he) => ColliderBuilder::cuboid(he[0], he[1], he[2]),
     };
     builder
+        .friction(material.friction)
+        .restitution(material.restitution)
+        .density(material.density)
+        .collision_groups(InteractionGroups::new(
+            groups.memberships,
+            groups.filter,
+            InteractionTestMode::And,
+        ))
+        .sensor(is_sensor)
         .active_events(ActiveEvents::COLLISION_EVENTS)
         .build()
 }
@@ -214,6 +424,55 @@ pub trait RapierClusterSimulation: Send + Sync {
     ) -> RapierColliderShape {
         RapierColliderShape::Ball(config.default_body_radius)
     }
+
+    /// Declare the rigid-body kind (Dynamic / KinematicPositionBased /
+    /// KinematicVelocityBased / Fixed) for an entity at first-sight spawn.
+    /// Default returns [`RapierBodyKind::Dynamic`]. Called exactly once per
+    /// entity; subsequent return-value changes are ignored for already-spawned
+    /// bodies.
+    fn body_kind_for(&self, _entry: &EntityStateEntry, _config: &RapierConfig) -> RapierBodyKind {
+        RapierBodyKind::Dynamic
+    }
+
+    /// Declare the physics material (friction / restitution / density) for an
+    /// entity at first-sight spawn. Default is zero-friction, zero-restitution,
+    /// unit-density. Called exactly once per entity; subsequent return-value
+    /// changes are ignored for already-spawned bodies.
+    fn material_for(&self, _entry: &EntityStateEntry, _config: &RapierConfig) -> RapierMaterial {
+        RapierMaterial::default()
+    }
+
+    /// Declare the collision-filter groups (memberships + filter) for an
+    /// entity's collider at first-sight spawn. Default is "everything collides
+    /// with everything" — `memberships = Group::ALL`, `filter = Group::ALL`.
+    /// Called exactly once per entity; subsequent return-value changes are
+    /// ignored for already-spawned bodies.
+    fn collision_groups_for(
+        &self,
+        _entry: &EntityStateEntry,
+        _config: &RapierConfig,
+    ) -> RapierCollisionGroups {
+        RapierCollisionGroups::default()
+    }
+
+    /// Declare whether the entity's collider is a sensor (fires contact events
+    /// without producing physical pushback). Default is `false`. Called
+    /// exactly once per entity; subsequent return-value changes are ignored
+    /// for already-spawned bodies.
+    fn is_sensor(&self, _entry: &EntityStateEntry, _config: &RapierConfig) -> bool {
+        false
+    }
+}
+
+/// Internal bundle of per-entity first-sight spawn parameters. Keeps
+/// [`RapierState::spawn`]'s signature small and gives us one place to extend
+/// when adding future spawn-time hooks.
+struct SpawnParams {
+    shape: RapierColliderShape,
+    body_kind: RapierBodyKind,
+    material: RapierMaterial,
+    groups: RapierCollisionGroups,
+    is_sensor: bool,
 }
 
 struct RapierState {
@@ -317,16 +576,29 @@ impl RapierState {
         &mut self,
         entity_id: Uuid,
         entry: &EntityStateEntry,
-        shape: RapierColliderShape,
+        params: SpawnParams,
     ) -> RigidBodyHandle {
-        let body = RigidBodyBuilder::dynamic()
+        let builder = match params.body_kind {
+            RapierBodyKind::Dynamic => RigidBodyBuilder::dynamic(),
+            RapierBodyKind::KinematicPositionBased => RigidBodyBuilder::kinematic_position_based(),
+            RapierBodyKind::KinematicVelocityBased => RigidBodyBuilder::kinematic_velocity_based(),
+            RapierBodyKind::Fixed => RigidBodyBuilder::fixed(),
+        };
+        let body = builder
             .translation(to_rapier(entry.position))
             .linvel(to_rapier(entry.velocity))
             .build();
         let body_handle = self.bodies.insert(body);
-        let collider_handle =
-            self.colliders
-                .insert_with_parent(build_collider(shape), body_handle, &mut self.bodies);
+        let collider_handle = self.colliders.insert_with_parent(
+            build_collider(
+                params.shape,
+                params.material,
+                params.groups,
+                params.is_sensor,
+            ),
+            body_handle,
+            &mut self.bodies,
+        );
         self.handles.insert(entity_id, body_handle);
         self.collider_to_entity.insert(collider_handle, entity_id);
         body_handle
@@ -507,6 +779,34 @@ impl RapierClusterSim {
             _ => RapierColliderShape::Ball(self.config.default_body_radius),
         }
     }
+
+    fn body_kind_for(&self, entry: &EntityStateEntry) -> RapierBodyKind {
+        match &self.backend {
+            Backend::Rapier(sim) => sim.body_kind_for(entry, &self.config),
+            _ => RapierBodyKind::Dynamic,
+        }
+    }
+
+    fn material_for(&self, entry: &EntityStateEntry) -> RapierMaterial {
+        match &self.backend {
+            Backend::Rapier(sim) => sim.material_for(entry, &self.config),
+            _ => RapierMaterial::default(),
+        }
+    }
+
+    fn collision_groups_for(&self, entry: &EntityStateEntry) -> RapierCollisionGroups {
+        match &self.backend {
+            Backend::Rapier(sim) => sim.collision_groups_for(entry, &self.config),
+            _ => RapierCollisionGroups::default(),
+        }
+    }
+
+    fn is_sensor_for(&self, entry: &EntityStateEntry) -> bool {
+        match &self.backend {
+            Backend::Rapier(sim) => sim.is_sensor(entry, &self.config),
+            _ => false,
+        }
+    }
 }
 
 impl ClusterSimulation for RapierClusterSim {
@@ -553,8 +853,14 @@ impl ClusterSimulation for RapierClusterSim {
             if state.handles.contains_key(id) {
                 state.set_linvel(*id, entry.velocity);
             } else {
-                let shape = self.shape_for(entry);
-                state.spawn(*id, entry, shape);
+                let params = SpawnParams {
+                    shape: self.shape_for(entry),
+                    body_kind: self.body_kind_for(entry),
+                    material: self.material_for(entry),
+                    groups: self.collision_groups_for(entry),
+                    is_sensor: self.is_sensor_for(entry),
+                };
+                state.spawn(*id, entry, params);
             }
         }
 
@@ -2096,5 +2402,501 @@ mod tests {
             "expected segment along Y of length 2·half_height = 3.0; got {}",
             y_extent
         );
+    }
+
+    // ─── per-entity hooks (#120): body kind / material / groups / sensor ───────
+
+    /// Per-entity overrides for the `HookSim` test fixture below. `None` means
+    /// "use the trait default for this hook on this entity."
+    #[derive(Clone, Default)]
+    struct EntitySpec {
+        shape: Option<RapierColliderShape>,
+        body_kind: Option<RapierBodyKind>,
+        material: Option<RapierMaterial>,
+        groups: Option<RapierCollisionGroups>,
+        is_sensor: Option<bool>,
+    }
+
+    /// Generic test fixture exercising all five spawn-time hooks. Records
+    /// per-(hook, entity) call counts so tests can assert exact-once invariants
+    /// directly. Records contact events from the previous tick.
+    struct HookSim {
+        per_entity: Mutex<HashMap<Uuid, EntitySpec>>,
+        contact_events: Mutex<Vec<ContactEvent>>,
+        counts: Mutex<HashMap<(&'static str, Uuid), u64>>,
+    }
+
+    impl HookSim {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                per_entity: Mutex::new(HashMap::new()),
+                contact_events: Mutex::new(Vec::new()),
+                counts: Mutex::new(HashMap::new()),
+            })
+        }
+
+        fn set(&self, id: Uuid, spec: EntitySpec) {
+            self.per_entity.lock().unwrap().insert(id, spec);
+        }
+
+        fn count(&self, hook: &'static str, id: Uuid) -> u64 {
+            *self.counts.lock().unwrap().get(&(hook, id)).unwrap_or(&0)
+        }
+
+        fn snapshot_events(&self) -> Vec<ContactEvent> {
+            self.contact_events.lock().unwrap().clone()
+        }
+
+        fn bump(&self, hook: &'static str, id: Uuid) {
+            *self.counts.lock().unwrap().entry((hook, id)).or_insert(0) += 1;
+        }
+
+        fn spec_for(&self, id: Uuid) -> EntitySpec {
+            self.per_entity
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl RapierClusterSimulation for HookSim {
+        fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+            self.contact_events
+                .lock()
+                .unwrap()
+                .extend_from_slice(ctx.contact_events);
+        }
+
+        fn collider_for(
+            &self,
+            entry: &EntityStateEntry,
+            config: &RapierConfig,
+        ) -> RapierColliderShape {
+            self.bump("collider_for", entry.entity_id);
+            self.spec_for(entry.entity_id)
+                .shape
+                .unwrap_or(RapierColliderShape::Ball(config.default_body_radius))
+        }
+
+        fn body_kind_for(&self, entry: &EntityStateEntry, _: &RapierConfig) -> RapierBodyKind {
+            self.bump("body_kind_for", entry.entity_id);
+            self.spec_for(entry.entity_id).body_kind.unwrap_or_default()
+        }
+
+        fn material_for(&self, entry: &EntityStateEntry, _: &RapierConfig) -> RapierMaterial {
+            self.bump("material_for", entry.entity_id);
+            self.spec_for(entry.entity_id).material.unwrap_or_default()
+        }
+
+        fn collision_groups_for(
+            &self,
+            entry: &EntityStateEntry,
+            _: &RapierConfig,
+        ) -> RapierCollisionGroups {
+            self.bump("collision_groups_for", entry.entity_id);
+            self.spec_for(entry.entity_id).groups.unwrap_or_default()
+        }
+
+        fn is_sensor(&self, entry: &EntityStateEntry, _: &RapierConfig) -> bool {
+            self.bump("is_sensor", entry.entity_id);
+            self.spec_for(entry.entity_id).is_sensor.unwrap_or(false)
+        }
+    }
+
+    /// **#120-T1**: a `Fixed` body must not move under gravity. Verifies
+    /// `body_kind_for` is honored: solver skips the body, position stays put.
+    #[test]
+    fn fixed_body_does_not_move_under_gravity() {
+        let sim_arc = HookSim::new();
+        let id = Uuid::from_u128(1);
+        sim_arc.set(
+            id,
+            EntitySpec {
+                body_kind: Some(RapierBodyKind::Fixed),
+                ..Default::default()
+            },
+        );
+        let config = RapierConfig {
+            gravity: [0.0, -9.81, 0.0],
+            ..Default::default()
+        };
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            config,
+        );
+
+        let start = Vec3::new(0.0, 5.0, 0.0);
+        let mut entities = HashMap::new();
+        entities.insert(id, mk_entry(id, start, Vec3::new(0.0, 0.0, 0.0)));
+
+        // 2 seconds under -9.81 — a Dynamic body would be at ~y = -14.6.
+        step_n(&sim, &mut entities, 40, CLUSTER_DT);
+
+        let p = entities.get(&id).unwrap().position;
+        assert!(
+            close(p.y, start.y, 1e-6),
+            "Fixed body moved under gravity: y = {} (expected {})",
+            p.y,
+            start.y
+        );
+    }
+
+    /// **#120-T2**: a `KinematicPositionBased` body ignores forces. Like Fixed
+    /// it doesn't fall under gravity, but unlike Fixed its position is meant
+    /// to be game-controlled (Rapier just doesn't apply forces to it).
+    #[test]
+    fn kinematic_position_based_ignores_gravity() {
+        let sim_arc = HookSim::new();
+        let id = Uuid::from_u128(1);
+        sim_arc.set(
+            id,
+            EntitySpec {
+                body_kind: Some(RapierBodyKind::KinematicPositionBased),
+                ..Default::default()
+            },
+        );
+        let config = RapierConfig {
+            gravity: [0.0, -9.81, 0.0],
+            ..Default::default()
+        };
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            config,
+        );
+
+        let start = Vec3::new(0.0, 5.0, 0.0);
+        let mut entities = HashMap::new();
+        entities.insert(id, mk_entry(id, start, Vec3::new(0.0, 0.0, 0.0)));
+
+        step_n(&sim, &mut entities, 40, CLUSTER_DT);
+
+        let p = entities.get(&id).unwrap().position;
+        assert!(
+            close(p.y, start.y, 1e-3),
+            "KinematicPositionBased body fell under gravity: y = {}",
+            p.y
+        );
+    }
+
+    /// **#120-T3**: `material_for` is honored — friction / restitution / density
+    /// land on the resulting collider. Structural test (direct collider read);
+    /// the dynamic effect is covered by the bounce test below.
+    #[test]
+    fn material_for_is_honored_on_collider() {
+        let sim_arc = HookSim::new();
+        let id = Uuid::from_u128(1);
+        sim_arc.set(
+            id,
+            EntitySpec {
+                material: Some(RapierMaterial::new(0.42, 0.73, 5.5)),
+                ..Default::default()
+            },
+        );
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+
+        let mut entities = HashMap::new();
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        step_once(&sim, &mut entities, 1, CLUSTER_DT);
+
+        let (friction, restitution, density) =
+            with_collider(&sim, id, |c| (c.friction(), c.restitution(), c.density()))
+                .expect("collider exists");
+        assert!((friction - 0.42).abs() < 1e-5, "friction = {}", friction);
+        assert!(
+            (restitution - 0.73).abs() < 1e-5,
+            "restitution = {}",
+            restitution
+        );
+        assert!((density - 5.5).abs() < 1e-5, "density = {}", density);
+    }
+
+    /// **#120-T4**: high restitution produces a noticeably bouncier collision
+    /// than zero restitution. Drops a Dynamic ball onto a Fixed floor with
+    /// restitution=1.0; vertical velocity at the apex of the rebound should be
+    /// substantially higher than the same setup with restitution=0.0.
+    #[test]
+    fn high_restitution_bounces_higher_than_zero_restitution() {
+        fn peak_y_after_bounce(restitution: f32) -> f64 {
+            let sim_arc = HookSim::new();
+            let ball = Uuid::from_u128(1);
+            let floor = Uuid::from_u128(2);
+            // Both bodies share the restitution; Rapier averages contact-pair
+            // material values (default `Average` rule), so setting it on both
+            // pins the effective contact restitution.
+            sim_arc.set(
+                ball,
+                EntitySpec {
+                    shape: Some(RapierColliderShape::Ball(0.3)),
+                    material: Some(RapierMaterial::new(0.0, restitution, 1.0)),
+                    ..Default::default()
+                },
+            );
+            sim_arc.set(
+                floor,
+                EntitySpec {
+                    shape: Some(RapierColliderShape::Cuboid([20.0, 0.25, 20.0])),
+                    body_kind: Some(RapierBodyKind::Fixed),
+                    material: Some(RapierMaterial::new(0.0, restitution, 1.0)),
+                    ..Default::default()
+                },
+            );
+            let config = RapierConfig {
+                gravity: [0.0, -9.81, 0.0],
+                ..Default::default()
+            };
+            let sim = RapierClusterSim::with_rapier_sim(
+                sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+                config,
+            );
+
+            let mut entities = HashMap::new();
+            entities.insert(
+                ball,
+                mk_entry(ball, Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            );
+            entities.insert(
+                floor,
+                mk_entry(floor, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            );
+
+            // Drop time ≈ √(2·3/9.81) ≈ 0.78 s ≈ 16 cluster ticks. After tick
+            // ~20 the ball has impacted; from there, track the rebound peak.
+            // Bouncy (r=1) rebounds toward y≈3; dead (r=0) plateaus at floor.
+            let mut peak_after_impact = f64::NEG_INFINITY;
+            for tick in 0..80 {
+                step_once(&sim, &mut entities, tick + 1, CLUSTER_DT);
+                if tick >= 20 {
+                    let y = entities.get(&ball).unwrap().position.y;
+                    if y > peak_after_impact {
+                        peak_after_impact = y;
+                    }
+                }
+            }
+            peak_after_impact
+        }
+
+        let bouncy = peak_y_after_bounce(1.0);
+        let dead = peak_y_after_bounce(0.0);
+        // Bouncy rebounds to a meaningful height above where the dead ball
+        // came to rest. Generous margin (1.0 m) for substep losses.
+        assert!(
+            bouncy > dead + 1.0,
+            "bouncy post-impact peak {} must exceed dead post-impact peak {} by > 1.0",
+            bouncy,
+            dead
+        );
+    }
+
+    /// **#120-T5**: density change affects mass-derived collision response.
+    /// Inspect the body's mass after spawn — for a unit-radius ball with the
+    /// default density formula, doubling density doubles mass.
+    #[test]
+    fn density_changes_body_mass() {
+        fn mass_for_density(density: f32) -> f32 {
+            let sim_arc = HookSim::new();
+            let id = Uuid::from_u128(1);
+            sim_arc.set(
+                id,
+                EntitySpec {
+                    shape: Some(RapierColliderShape::Ball(1.0)),
+                    material: Some(RapierMaterial::new(0.0, 0.0, density)),
+                    ..Default::default()
+                },
+            );
+            let sim = RapierClusterSim::with_rapier_sim(
+                sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+                RapierConfig::default(),
+            );
+            let mut entities = HashMap::new();
+            entities.insert(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            );
+            step_once(&sim, &mut entities, 1, CLUSTER_DT);
+            let state = sim.state.lock().unwrap();
+            let h = *state.handles.get(&id).unwrap();
+            state.bodies.get(h).unwrap().mass()
+        }
+        let m1 = mass_for_density(1.0);
+        let m2 = mass_for_density(2.0);
+        assert!(
+            (m2 / m1 - 2.0).abs() < 1e-3,
+            "doubling density should double mass: m1 = {}, m2 = {}",
+            m1,
+            m2
+        );
+    }
+
+    /// **#120-T6**: collision groups filter contacts. Two overlapping bodies
+    /// in non-overlapping groups must not generate any contact events. Same
+    /// pair with default groups produces contacts (sanity-check baseline).
+    #[test]
+    fn non_overlapping_collision_groups_filter_contacts() {
+        // Group setup: A is in GROUP_1, filters only GROUP_1 (i.e. won't see B).
+        //              B is in GROUP_2, filters only GROUP_2 (won't see A).
+        let sim_arc = HookSim::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        sim_arc.set(
+            a,
+            EntitySpec {
+                shape: Some(RapierColliderShape::Ball(0.5)),
+                groups: Some(RapierCollisionGroups::new(Group::GROUP_1, Group::GROUP_1)),
+                ..Default::default()
+            },
+        );
+        sim_arc.set(
+            b,
+            EntitySpec {
+                shape: Some(RapierColliderShape::Ball(0.5)),
+                groups: Some(RapierCollisionGroups::new(Group::GROUP_2, Group::GROUP_2)),
+                ..Default::default()
+            },
+        );
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+
+        let mut entities = HashMap::new();
+        // Significant overlap — without filtering this would produce contacts.
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+
+        step_n(&sim, &mut entities, 5, CLUSTER_DT);
+
+        let events = sim_arc.snapshot_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| (e.entity_a == a && e.entity_b == b)
+                    || (e.entity_a == b && e.entity_b == a)),
+            "non-overlapping groups should suppress contacts; got {:?}",
+            events
+        );
+    }
+
+    /// **#120-T7**: a sensor collider fires the contact event but does NOT
+    /// produce physical pushback on the partner body. Without filtering, two
+    /// overlapping balls would resolve apart; with one as a sensor, the
+    /// non-sensor ball stays at its starting position.
+    #[test]
+    fn sensor_fires_event_without_pushback() {
+        let sim_arc = HookSim::new();
+        let trigger = Uuid::from_u128(1);
+        let body = Uuid::from_u128(2);
+        sim_arc.set(
+            trigger,
+            EntitySpec {
+                shape: Some(RapierColliderShape::Ball(0.5)),
+                body_kind: Some(RapierBodyKind::Fixed),
+                is_sensor: Some(true),
+                ..Default::default()
+            },
+        );
+        sim_arc.set(
+            body,
+            EntitySpec {
+                shape: Some(RapierColliderShape::Ball(0.5)),
+                ..Default::default()
+            },
+        );
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+
+        let mut entities = HashMap::new();
+        let body_start = Vec3::new(0.4, 0.0, 0.0);
+        entities.insert(
+            trigger,
+            mk_entry(trigger, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(body, mk_entry(body, body_start, Vec3::new(0.0, 0.0, 0.0)));
+
+        step_n(&sim, &mut entities, 5, CLUSTER_DT);
+
+        // Contact event fired.
+        let events = sim_arc.snapshot_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| (e.entity_a == trigger && e.entity_b == body)
+                    || (e.entity_a == body && e.entity_b == trigger)),
+            "sensor must still surface contact event; got {:?}",
+            events
+        );
+
+        // No pushback — body stayed at its start.
+        let p = entities.get(&body).unwrap().position;
+        assert!(
+            close(p.x, body_start.x, 1e-3),
+            "sensor produced pushback: x moved from {} to {}",
+            body_start.x,
+            p.x
+        );
+    }
+
+    /// **#120-T8**: every spawn-time hook is called exactly once per entity
+    /// at first-sight. Subsequent ticks do not re-invoke the hooks.
+    #[test]
+    fn all_hooks_called_exactly_once_per_entity() {
+        let sim_arc = HookSim::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        // a spawns on tick 1; b spawns on tick 4 (later first-sight).
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        step_n(&sim, &mut entities, 3, CLUSTER_DT);
+
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(50.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        step_n(&sim, &mut entities, 4, CLUSTER_DT);
+
+        // Hook call counts: each of the five hooks must have been called
+        // exactly once for each of the two entities.
+        for hook in [
+            "collider_for",
+            "body_kind_for",
+            "material_for",
+            "collision_groups_for",
+            "is_sensor",
+        ] {
+            assert_eq!(
+                sim_arc.count(hook, a),
+                1,
+                "{hook} called {} times for entity a",
+                sim_arc.count(hook, a)
+            );
+            assert_eq!(
+                sim_arc.count(hook, b),
+                1,
+                "{hook} called {} times for entity b",
+                sim_arc.count(hook, b)
+            );
+        }
     }
 }
