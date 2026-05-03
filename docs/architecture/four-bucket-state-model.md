@@ -2,6 +2,14 @@
 
 This document is the **canonical reference** for where game data lives in Arcane + SpacetimeDB. Integrators, reviewers, and client authors should align with it.
 
+> **Companion doc:** [entity-model.md](entity-model.md) defines what an *entity* is and what kinds exist. This doc defines where an entity's *state* lives across the four buckets.
+
+## Universal invariant: every entity has bucket-4 durable state
+
+Every entity in Arcane has a row in SpacetimeDB. Bucket 4 is **not optional** — there is no class of persistent thing in the world that lives only in buckets 1–3 and can disappear when a cluster process crashes. This invariant is what makes recovery possible (rehydrate an entity from its durable row after a crash, restart, or migration) and what makes the unified-entity model work for both ephemeral game objects (projectiles that exist for milliseconds) and structural game objects (walls placed by a player years ago).
+
+Game-specific schemas extend bucket 4 with their own tables and reducers; the invariant is that *some* SpacetimeDB row exists for every `entity_id` the platform sees.
+
 ---
 
 ## 1. Why four buckets
