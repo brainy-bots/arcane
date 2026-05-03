@@ -31,6 +31,49 @@ const LOG_EVERY_TICKS: u64 = 100;
 /// Log parseable server stats every N ticks (for benchmark: entities, clusters, tick_ms).
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 
+/// Cluster-binary environment configuration (CLUSTER_ID, REDIS_URL,
+/// NEIGHBOR_IDS, CLUSTER_WS_PORT). Shared by every cluster-binary entry point
+/// so the env contract stays in one place.
+#[derive(Clone, Debug)]
+pub struct ClusterEnv {
+    pub cluster_id: Uuid,
+    pub redis_url: String,
+    pub neighbor_ids: Vec<Uuid>,
+    pub ws_port: u16,
+}
+
+impl ClusterEnv {
+    /// Read the standard cluster env vars. `CLUSTER_ID` is required; the rest
+    /// have defaults (Redis at `127.0.0.1:6379`, no neighbors, WS port `8080`).
+    pub fn from_env() -> Result<Self, String> {
+        let cluster_id = std::env::var("CLUSTER_ID")
+            .map_err(|_| "CLUSTER_ID env var required (UUID)".to_string())?;
+        let cluster_id = Uuid::parse_str(&cluster_id)
+            .map_err(|e| format!("invalid CLUSTER_ID: {}", e))?;
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let neighbor_ids = std::env::var("NEIGHBOR_IDS")
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim())
+                    .filter(|x| !x.is_empty())
+                    .filter_map(|x| Uuid::parse_str(x).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ws_port: u16 = std::env::var("CLUSTER_WS_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8080);
+        Ok(Self {
+            cluster_id,
+            redis_url,
+            neighbor_ids,
+            ws_port,
+        })
+    }
+}
+
 fn merge_with_neighbor_latest(
     our_delta: EntityStateDelta,
     neighbor_latest: &HashMap<Uuid, Vec<EntityStateEntry>>,
