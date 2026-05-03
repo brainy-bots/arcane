@@ -14,9 +14,20 @@
 //!   Subsequent user writes are overwritten by Rapier's post-step output.
 //! - Despawn is driven by `pending_removals` — when an entity leaves the map, its
 //!   rigid body and collider are removed from the Rapier world.
-//! - Every entity is spawned with a single uniform sphere collider
-//!   ([`RapierConfig::default_body_radius`]). Per-entity collider shapes via the
-//!   `user_data` schema are a v2 follow-up.
+//! - Default collider is a uniform sphere ([`RapierConfig::default_body_radius`]).
+//!   Implement [`RapierClusterSimulation`] and override `collider_for` to declare
+//!   per-entity shapes ([`RapierColliderShape::Ball`] / `Capsule` / `Cuboid`).
+//!   Shape is fixed at first-sight spawn; later `collider_for` returns are ignored
+//!   for already-spawned entities (despawn-and-respawn to change shape).
+//!
+//! # Contact events
+//!
+//! [`RapierClusterSimulation::on_tick`] receives a [`RapierClusterTickContext`]
+//! carrying `contact_events: &[ContactEvent]` — collisions detected during the
+//! **previous** tick's physics step, with both entity ids and a `started` flag.
+//! One-tick delay is by design: user logic runs first to set intent, then physics
+//! produces output for next tick. Same-tick post-physics reactivity is a future
+//! follow-up.
 //!
 //! # Substepping
 //!
@@ -46,6 +57,10 @@
 //! // Or: wrap your own ClusterSimulation so user logic runs first, then Rapier.
 //! // let user_sim: Arc<dyn ClusterSimulation> = Arc::new(MyGameLogic::new());
 //! // let physics = Arc::new(RapierClusterSim::new(Some(user_sim), RapierConfig::default()));
+//!
+//! // Or: implement RapierClusterSimulation for per-entity shapes + contact events:
+//! // let game: Arc<dyn arcane_infra::RapierClusterSimulation> = Arc::new(MyGame::new());
+//! // let physics = Arc::new(RapierClusterSim::with_rapier_sim(game, RapierConfig::default()));
 //!
 //! // Pass `Some(physics)` as the simulation arg to `run_cluster_loop`.
 //! ```
@@ -88,6 +103,95 @@ impl Default for RapierConfig {
     }
 }
 
+/// The collider shape used for an entity's rigid body. Resolved at first-sight
+/// spawn via [`RapierClusterSimulation::collider_for`]; subsequent calls are
+/// ignored for already-spawned entities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RapierColliderShape {
+    /// Sphere with the given radius.
+    Ball(f32),
+    /// Capsule oriented along Y, defined by the half-length of the cylindrical
+    /// section (excluding the hemispherical caps) and the radius.
+    Capsule {
+        /// Half-length of the cylindrical mid-section along Y.
+        half_height: f32,
+        /// Radius of the capsule (also the radius of the hemispherical caps).
+        radius: f32,
+    },
+    /// Axis-aligned box defined by half-extents along each axis (X, Y, Z).
+    Cuboid([f32; 3]),
+}
+
+impl Default for RapierColliderShape {
+    fn default() -> Self {
+        RapierColliderShape::Ball(DEFAULT_BODY_RADIUS)
+    }
+}
+
+fn build_collider(shape: RapierColliderShape) -> Collider {
+    let builder = match shape {
+        RapierColliderShape::Ball(radius) => ColliderBuilder::ball(radius),
+        RapierColliderShape::Capsule {
+            half_height,
+            radius,
+        } => ColliderBuilder::capsule_y(half_height, radius),
+        RapierColliderShape::Cuboid(he) => ColliderBuilder::cuboid(he[0], he[1], he[2]),
+    };
+    builder.active_events(ActiveEvents::COLLISION_EVENTS).build()
+}
+
+/// A collision detected during a Rapier step, mapped from Rapier's collider
+/// handles back to entity ids. Surfaced to [`RapierClusterSimulation::on_tick`]
+/// via [`RapierClusterTickContext::contact_events`].
+///
+/// `started == true` signals the contact started this tick; `false` signals it
+/// stopped. Stop events also fire when one of the colliders is destroyed (e.g.,
+/// despawn / pending_removal), in which case the corresponding entity_id is the
+/// one that was just removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ContactEvent {
+    pub entity_a: Uuid,
+    pub entity_b: Uuid,
+    pub started: bool,
+}
+
+/// Tick context delivered to [`RapierClusterSimulation::on_tick`]. Mirrors
+/// [`ClusterTickContext`] field-for-field plus Rapier-specific extensions.
+pub struct RapierClusterTickContext<'a> {
+    pub cluster_id: Uuid,
+    pub tick: u64,
+    pub dt_seconds: f64,
+    pub entities: &'a mut HashMap<Uuid, EntityStateEntry>,
+    pub pending_removals: &'a mut Vec<Uuid>,
+    pub game_actions: &'a [arcane_core::cluster_simulation::GameAction],
+    /// Contact events from the **previous** tick's physics step. One-tick delay
+    /// by design — see module-level "Contact events" docs.
+    pub contact_events: &'a [ContactEvent],
+}
+
+/// Rapier-aware sibling of [`ClusterSimulation`]. Implement this trait and pass
+/// the impl to [`RapierClusterSim::with_rapier_sim`] when you need per-entity
+/// collider shapes or contact events. For pure velocity-integration with no
+/// shape customization, the plain [`ClusterSimulation`] path remains valid.
+pub trait RapierClusterSimulation: Send + Sync {
+    /// Per-tick hook. Same lifecycle as [`ClusterSimulation::on_tick`] —
+    /// runs after client updates and before the Rapier physics step.
+    fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>);
+
+    /// Declare the collider shape for an entity at first-sight spawn. Default
+    /// returns `Ball(config.default_body_radius)` — same as the V1 path.
+    /// Override to vary shape per entity (read `entry.user_data` for class
+    /// info, etc.). Called exactly once per entity, when its body is first
+    /// created in the Rapier world.
+    fn collider_for(
+        &self,
+        _entry: &EntityStateEntry,
+        config: &RapierConfig,
+    ) -> RapierColliderShape {
+        RapierColliderShape::Ball(config.default_body_radius)
+    }
+}
+
 struct RapierState {
     bodies: RigidBodySet,
     colliders: ColliderSet,
@@ -100,13 +204,62 @@ struct RapierState {
     multibody_joints: MultibodyJointSet,
     ccd_solver: CCDSolver,
     handles: HashMap<Uuid, RigidBodyHandle>,
+    /// Reverse map for translating Rapier's `CollisionEvent` collider handles
+    /// back into entity ids. Maintained alongside `handles` on every spawn /
+    /// despawn.
+    collider_to_entity: HashMap<ColliderHandle, Uuid>,
     accumulator: f32,
     gravity: Vector,
-    default_body_radius: f32,
+    /// Contact events accumulated during the most recent `step_with_accumulator`
+    /// call. The wrapper drains these at the top of the next tick and surfaces
+    /// them to the user via [`RapierClusterTickContext::contact_events`].
+    pending_contact_events: Vec<ContactEvent>,
+}
+
+/// Internal `EventHandler` impl that records collisions into a `Mutex<Vec>`.
+/// We only use `handle_collision_event` in v2; force events are out of scope.
+struct CollisionRecorder {
+    events: Mutex<Vec<CollisionEvent>>,
+}
+
+impl CollisionRecorder {
+    fn new() -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn drain(self) -> Vec<CollisionEvent> {
+        self.events.into_inner().unwrap_or_default()
+    }
+}
+
+impl EventHandler for CollisionRecorder {
+    fn handle_collision_event(
+        &self,
+        _bodies: &RigidBodySet,
+        _colliders: &ColliderSet,
+        event: CollisionEvent,
+        _contact_pair: Option<&ContactPair>,
+    ) {
+        if let Ok(mut buf) = self.events.lock() {
+            buf.push(event);
+        }
+    }
+
+    fn handle_contact_force_event(
+        &self,
+        _dt: Real,
+        _bodies: &RigidBodySet,
+        _colliders: &ColliderSet,
+        _contact_pair: &ContactPair,
+        _total_force_magnitude: Real,
+    ) {
+    }
 }
 
 impl RapierState {
-    fn new(config: &RapierConfig) -> Self {
+    fn new(gravity: Vector) -> Self {
         Self {
             bodies: RigidBodySet::new(),
             colliders: ColliderSet::new(),
@@ -122,13 +275,19 @@ impl RapierState {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             handles: HashMap::new(),
+            collider_to_entity: HashMap::new(),
             accumulator: 0.0,
-            gravity: Vector::new(config.gravity[0], config.gravity[1], config.gravity[2]),
-            default_body_radius: config.default_body_radius,
+            gravity,
+            pending_contact_events: Vec::new(),
         }
     }
 
-    fn spawn(&mut self, entity_id: Uuid, entry: &EntityStateEntry) -> RigidBodyHandle {
+    fn spawn(
+        &mut self,
+        entity_id: Uuid,
+        entry: &EntityStateEntry,
+        shape: RapierColliderShape,
+    ) -> RigidBodyHandle {
         let body = RigidBodyBuilder::dynamic()
             .translation(Vector::new(
                 entry.position.x as f32,
@@ -141,54 +300,53 @@ impl RapierState {
                 entry.velocity.z as f32,
             ))
             .build();
-        let handle = self.bodies.insert(body);
-        let collider = ColliderBuilder::ball(self.default_body_radius).build();
-        self.colliders
-            .insert_with_parent(collider, handle, &mut self.bodies);
-        self.handles.insert(entity_id, handle);
-        handle
+        let body_handle = self.bodies.insert(body);
+        let collider = build_collider(shape);
+        let collider_handle =
+            self.colliders
+                .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.handles.insert(entity_id, body_handle);
+        self.collider_to_entity.insert(collider_handle, entity_id);
+        body_handle
+    }
+
+    fn set_linvel(&mut self, entity_id: Uuid, vel_x: f64, vel_y: f64, vel_z: f64) {
+        let Some(&handle) = self.handles.get(&entity_id) else {
+            return;
+        };
+        let Some(body) = self.bodies.get_mut(handle) else {
+            return;
+        };
+        body.set_linvel(Vector::new(vel_x as f32, vel_y as f32, vel_z as f32), true);
     }
 
     fn despawn(&mut self, entity_id: Uuid) {
-        if let Some(handle) = self.handles.remove(&entity_id) {
-            self.bodies.remove(
-                handle,
-                &mut self.islands,
-                &mut self.colliders,
-                &mut self.impulse_joints,
-                &mut self.multibody_joints,
-                true,
-            );
-        }
-    }
-
-    fn sync_inputs(&mut self, entities: &HashMap<Uuid, EntityStateEntry>, skip: &[Uuid]) {
-        for (id, entry) in entities.iter() {
-            if skip.contains(id) {
-                continue;
-            }
-            match self.handles.get(id).copied() {
-                None => {
-                    self.spawn(*id, entry);
-                }
-                Some(handle) => {
-                    if let Some(body) = self.bodies.get_mut(handle) {
-                        body.set_linvel(
-                            Vector::new(
-                                entry.velocity.x as f32,
-                                entry.velocity.y as f32,
-                                entry.velocity.z as f32,
-                            ),
-                            true,
-                        );
-                    }
-                }
+        let Some(body_handle) = self.handles.remove(&entity_id) else {
+            return;
+        };
+        // Drop reverse-map entries for any colliders attached to this body.
+        if let Some(body) = self.bodies.get(body_handle) {
+            let coll_handles: Vec<ColliderHandle> = body.colliders().to_vec();
+            for ch in coll_handles {
+                self.collider_to_entity.remove(&ch);
             }
         }
+        self.bodies.remove(
+            body_handle,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
     }
 
     fn step_with_accumulator(&mut self, dt_seconds: f32) {
         self.accumulator += dt_seconds;
+        if self.accumulator < FIXED_PHYSICS_DT {
+            return;
+        }
+        let recorder = CollisionRecorder::new();
         while self.accumulator >= FIXED_PHYSICS_DT {
             self.physics_pipeline.step(
                 self.gravity,
@@ -202,9 +360,32 @@ impl RapierState {
                 &mut self.multibody_joints,
                 &mut self.ccd_solver,
                 &(),
-                &(),
+                &recorder,
             );
             self.accumulator -= FIXED_PHYSICS_DT;
+        }
+        // Translate Rapier collision events into entity-keyed contact events.
+        // Skip events whose collider handles aren't in our map (e.g., colliders
+        // belonging to bodies despawned earlier this tick — Rapier may emit a
+        // Stopped event for such cases).
+        let raw = recorder.drain();
+        self.pending_contact_events.reserve(raw.len());
+        for event in raw {
+            let (h1, h2, started) = match event {
+                CollisionEvent::Started(a, b, _) => (a, b, true),
+                CollisionEvent::Stopped(a, b, _) => (a, b, false),
+            };
+            let (Some(&entity_a), Some(&entity_b)) = (
+                self.collider_to_entity.get(&h1),
+                self.collider_to_entity.get(&h2),
+            ) else {
+                continue;
+            };
+            self.pending_contact_events.push(ContactEvent {
+                entity_a,
+                entity_b,
+                started,
+            });
         }
     }
 
@@ -243,52 +424,138 @@ impl RapierState {
     }
 }
 
+/// User-logic backend wrapped by [`RapierClusterSim`].
+enum Backend {
+    /// No user-side logic — Rapier just integrates whatever `entity.velocity`
+    /// is on the wire. Useful for the "background simulator" use case where
+    /// clients seed velocity and the server just keeps entities moving.
+    None,
+    /// Standard `ClusterSimulation` user (V1 path). User mutates `entity.velocity`
+    /// in their `on_tick`; default sphere collider on every spawn.
+    Cluster(Arc<dyn ClusterSimulation>),
+    /// Rapier-aware user (V2 path). User gets contact events and per-entity
+    /// shape declarations.
+    Rapier(Arc<dyn RapierClusterSimulation>),
+}
+
 /// A [`ClusterSimulation`] that runs the user's logic, then a Rapier physics step.
 ///
-/// Wrap your `ClusterSimulation` in this and pass it to `run_cluster_loop`.
-/// The user's `on_tick` runs first (mutating velocities, processing actions,
-/// pushing to `pending_removals`); the Rapier step then advances poses and writes
-/// the results back into the entity map for replication.
+/// Three constructor flavors:
+///
+/// - [`RapierClusterSim::new`] — wraps an `Option<Arc<dyn ClusterSimulation>>`.
+///   `None` means pure Rapier integration with no game logic. Default sphere
+///   collider on every entity (radius from [`RapierConfig::default_body_radius`]).
+/// - [`RapierClusterSim::with_default_config`] — same as `new` with default config.
+/// - [`RapierClusterSim::with_rapier_sim`] — wraps an
+///   `Arc<dyn RapierClusterSimulation>`. Unlocks per-entity collider shapes
+///   (`collider_for`) and surfaces contact events to the user via
+///   [`RapierClusterTickContext`].
 pub struct RapierClusterSim {
-    user_sim: Option<Arc<dyn ClusterSimulation>>,
+    backend: Backend,
+    config: RapierConfig,
     state: Mutex<RapierState>,
 }
 
 impl RapierClusterSim {
     pub fn new(user_sim: Option<Arc<dyn ClusterSimulation>>, config: RapierConfig) -> Self {
+        let gravity = Vector::new(config.gravity[0], config.gravity[1], config.gravity[2]);
+        let backend = match user_sim {
+            Some(s) => Backend::Cluster(s),
+            None => Backend::None,
+        };
         Self {
-            user_sim,
-            state: Mutex::new(RapierState::new(&config)),
+            backend,
+            config,
+            state: Mutex::new(RapierState::new(gravity)),
         }
     }
 
     pub fn with_default_config(user_sim: Option<Arc<dyn ClusterSimulation>>) -> Self {
         Self::new(user_sim, RapierConfig::default())
     }
+
+    /// V2 constructor — accepts a [`RapierClusterSimulation`]. Use this when you
+    /// want per-entity collider shapes or contact events.
+    pub fn with_rapier_sim(
+        rapier_sim: Arc<dyn RapierClusterSimulation>,
+        config: RapierConfig,
+    ) -> Self {
+        let gravity = Vector::new(config.gravity[0], config.gravity[1], config.gravity[2]);
+        Self {
+            backend: Backend::Rapier(rapier_sim),
+            config,
+            state: Mutex::new(RapierState::new(gravity)),
+        }
+    }
+
+    fn shape_for(&self, entry: &EntityStateEntry) -> RapierColliderShape {
+        match &self.backend {
+            Backend::Rapier(sim) => sim.collider_for(entry, &self.config),
+            _ => RapierColliderShape::Ball(self.config.default_body_radius),
+        }
+    }
 }
 
 impl ClusterSimulation for RapierClusterSim {
     fn on_tick(&self, ctx: &mut ClusterTickContext<'_>) {
-        if let Some(user_sim) = &self.user_sim {
-            user_sim.on_tick(ctx);
+        // Pull contact events from the previous step. The Rapier-aware backend
+        // exposes them to the user via the extended context. (We take ownership
+        // here rather than borrow so the user's on_tick can run without holding
+        // the state lock.)
+        let prev_contacts = {
+            let mut state = self.state.lock().expect("rapier state lock");
+            std::mem::take(&mut state.pending_contact_events)
+        };
+
+        match &self.backend {
+            Backend::None => {}
+            Backend::Cluster(sim) => sim.on_tick(ctx),
+            Backend::Rapier(sim) => {
+                let mut rapier_ctx = RapierClusterTickContext {
+                    cluster_id: ctx.cluster_id,
+                    tick: ctx.tick,
+                    dt_seconds: ctx.dt_seconds,
+                    entities: ctx.entities,
+                    pending_removals: ctx.pending_removals,
+                    game_actions: ctx.game_actions,
+                    contact_events: &prev_contacts,
+                };
+                sim.on_tick(&mut rapier_ctx);
+            }
         }
 
         let mut state = self.state.lock().expect("rapier state lock");
 
         // Entities the user has flagged for removal this tick. The cluster runner
         // will drop them from the entity map *after* on_tick returns, but for our
-        // purposes they are already gone — no input sync, no output sync, no body.
-        // Pass the slice directly to avoid a per-tick HashSet allocation in the
-        // common (empty) case; n is small enough that linear scan beats hashing.
+        // purposes they are already gone — no spawn, no sync, no body. Linear
+        // scan over the slice; in steady state pending_removals is empty so the
+        // contains() calls are cheap.
         let removed: &[Uuid] = ctx.pending_removals.as_slice();
         for &id in removed {
             state.despawn(id);
         }
         state.despawn_missing(ctx.entities);
 
-        state.sync_inputs(ctx.entities, removed);
+        // Spawn new entities and sync velocity intent for existing ones.
+        // Done outside RapierState so the wrapper can call self.shape_for() to
+        // resolve per-entity collider shape via the active backend.
+        for (id, entry) in ctx.entities.iter() {
+            if removed.contains(id) {
+                continue;
+            }
+            if state.handles.contains_key(id) {
+                state.set_linvel(*id, entry.velocity.x, entry.velocity.y, entry.velocity.z);
+            } else {
+                let shape = self.shape_for(entry);
+                state.spawn(*id, entry, shape);
+            }
+        }
+
         state.step_with_accumulator(ctx.dt_seconds as f32);
         state.sync_outputs(ctx.entities, removed);
+        // Contact events from this step now live in state.pending_contact_events
+        // for next tick's user_sim to read.
     }
 }
 
@@ -858,5 +1125,275 @@ mod tests {
         );
         assert!((direct.y - via_handoff.y).abs() < 0.05);
         assert!((direct.z - via_handoff.z).abs() < 0.05);
+    }
+
+    // ─── V2: contact events + per-entity colliders ──────────────────────────────
+
+    /// Test helper: records every contact event the wrapper surfaces.
+    struct ContactRecorder {
+        events: Mutex<Vec<ContactEvent>>,
+        shape: RapierColliderShape,
+    }
+
+    impl ContactRecorder {
+        fn new(shape: RapierColliderShape) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                shape,
+            })
+        }
+        fn snapshot(&self) -> Vec<ContactEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl RapierClusterSimulation for ContactRecorder {
+        fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+            self.events
+                .lock()
+                .unwrap()
+                .extend_from_slice(ctx.contact_events);
+        }
+        fn collider_for(
+            &self,
+            _entry: &EntityStateEntry,
+            _config: &RapierConfig,
+        ) -> RapierColliderShape {
+            self.shape
+        }
+    }
+
+    /// Returns whether (a, b) appears in the recorded events as a Started
+    /// event in either ordering.
+    fn started_pair_present(events: &[ContactEvent], a: Uuid, b: Uuid) -> bool {
+        events.iter().any(|e| {
+            e.started
+                && ((e.entity_a == a && e.entity_b == b) || (e.entity_a == b && e.entity_b == a))
+        })
+    }
+
+    fn count_started_for_pair(events: &[ContactEvent], a: Uuid, b: Uuid) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                e.started
+                    && ((e.entity_a == a && e.entity_b == b)
+                        || (e.entity_a == b && e.entity_b == a))
+            })
+            .count()
+    }
+
+    #[test]
+    fn contact_event_surfaces_for_overlapping_spheres() {
+        let recorder = ContactRecorder::new(RapierColliderShape::Ball(0.5));
+        let sim = RapierClusterSim::with_rapier_sim(
+            recorder.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        // Centers 0.4 apart with radius 0.5 each → significant overlap.
+        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(b, mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+
+        // Tick 1 spawns and steps; contact emitted post-step. Tick 2 surfaces it.
+        step_n(&sim, &mut entities, 2, CLUSTER_DT);
+
+        let events = recorder.snapshot();
+        assert!(
+            started_pair_present(&events, a, b),
+            "expected Started event for ({a}, {b}); got {events:?}"
+        );
+    }
+
+    #[test]
+    fn distant_capsules_produce_no_contacts() {
+        let recorder = ContactRecorder::new(RapierColliderShape::Capsule {
+            half_height: 1.0,
+            radius: 0.4,
+        });
+        let sim = RapierClusterSim::with_rapier_sim(
+            recorder.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        // 100 units apart — well outside any collider radius.
+        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(b, mk_entry(b, Vec3::new(100.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+
+        step_n(&sim, &mut entities, 5, CLUSTER_DT);
+
+        let events = recorder.snapshot();
+        assert!(events.is_empty(), "expected no contacts; got {events:?}");
+    }
+
+    #[test]
+    fn collider_for_is_honored_at_first_sight() {
+        // Verify the collider attached to the spawned body matches the shape
+        // returned by collider_for, by directly inspecting the ColliderSet.
+        let recorder = ContactRecorder::new(RapierColliderShape::Cuboid([0.7, 0.3, 0.5]));
+        let sim = RapierClusterSim::with_rapier_sim(
+            recorder.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let id = Uuid::from_u128(1);
+        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        step_once(&sim, &mut entities, 1, CLUSTER_DT);
+
+        let state = sim.state.lock().unwrap();
+        let body_handle = *state.handles.get(&id).unwrap();
+        let body = state.bodies.get(body_handle).unwrap();
+        let coll_handle = body.colliders().first().copied().unwrap();
+        let collider = state.colliders.get(coll_handle).unwrap();
+        let cuboid = collider
+            .shape()
+            .as_cuboid()
+            .expect("collider should be a Cuboid");
+        let he = cuboid.half_extents;
+        assert!((he.x - 0.7).abs() < 1e-6, "half_extents.x = {}", he.x);
+        assert!((he.y - 0.3).abs() < 1e-6, "half_extents.y = {}", he.y);
+        assert!((he.z - 0.5).abs() < 1e-6, "half_extents.z = {}", he.z);
+    }
+
+    #[test]
+    fn shape_change_after_first_sight_is_ignored() {
+        // collider_for must be called exactly once per entity (at first-sight
+        // spawn); never again. Documented contract: changing the return value
+        // afterwards has no effect on already-spawned bodies. We verify two
+        // things: (a) collider_for gets exactly one call, and (b) the resulting
+        // collider matches the first call's shape, even though later calls
+        // would return a different shape.
+        struct ShiftingShape {
+            call_count: AtomicU64,
+        }
+        impl RapierClusterSimulation for ShiftingShape {
+            fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    RapierColliderShape::Ball(0.7)
+                } else {
+                    RapierColliderShape::Cuboid([1.0, 1.0, 1.0])
+                }
+            }
+        }
+        let sim_inner = Arc::new(ShiftingShape {
+            call_count: AtomicU64::new(0),
+        });
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_inner.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let id = Uuid::from_u128(1);
+        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        step_n(&sim, &mut entities, 5, CLUSTER_DT);
+
+        assert_eq!(
+            sim_inner.call_count.load(Ordering::SeqCst),
+            1,
+            "collider_for must be called exactly once per entity"
+        );
+
+        let state = sim.state.lock().unwrap();
+        let body_handle = *state.handles.get(&id).unwrap();
+        let body = state.bodies.get(body_handle).unwrap();
+        let coll_handle = body.colliders().first().copied().unwrap();
+        let collider = state.colliders.get(coll_handle).unwrap();
+        let ball = collider
+            .shape()
+            .as_ball()
+            .expect("collider should still be the original Ball from the first call");
+        assert!((ball.radius - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn contact_events_one_tick_delay_to_user() {
+        // Tick 1: spawn overlapping → Rapier step → contact recorded internally.
+        //          User on_tick during tick 1 sees `contact_events: &[]`.
+        // Tick 2: User on_tick sees the contact.
+        struct PerTickSnapshot {
+            per_tick: Mutex<Vec<(u64, usize)>>,
+            shape: RapierColliderShape,
+        }
+        impl RapierClusterSimulation for PerTickSnapshot {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                self.per_tick
+                    .lock()
+                    .unwrap()
+                    .push((ctx.tick, ctx.contact_events.len()));
+            }
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                self.shape
+            }
+        }
+        let recorder = Arc::new(PerTickSnapshot {
+            per_tick: Mutex::new(Vec::new()),
+            shape: RapierColliderShape::Ball(0.5),
+        });
+        let sim = RapierClusterSim::with_rapier_sim(
+            recorder.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(b, mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+
+        step_n(&sim, &mut entities, 3, CLUSTER_DT);
+
+        let snapshots = recorder.per_tick.lock().unwrap().clone();
+        // Tick 1 must see 0 contacts (nothing has stepped yet from this sim's
+        // perspective; pending_contact_events starts empty).
+        assert_eq!(snapshots[0].0, 1);
+        assert_eq!(snapshots[0].1, 0, "tick 1 should have no contact events yet");
+        // Tick 2 must see at least one contact (the Started from tick 1's step).
+        assert_eq!(snapshots[1].0, 2);
+        assert!(
+            snapshots[1].1 >= 1,
+            "tick 2 should surface the contact from tick 1's step; got {} events",
+            snapshots[1].1
+        );
+    }
+
+    #[test]
+    fn no_duplicate_started_event_for_persistent_overlap() {
+        // Started is edge-triggered: it should fire once per contact, not every
+        // tick the contact persists. Place two bodies overlapping with zero
+        // velocity and zero gravity; they remain in contact for many ticks but
+        // only one Started event surfaces.
+        let recorder = ContactRecorder::new(RapierColliderShape::Ball(0.5));
+        let sim = RapierClusterSim::with_rapier_sim(
+            recorder.clone() as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(b, mk_entry(b, Vec3::new(0.6, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+
+        step_n(&sim, &mut entities, 20, CLUSTER_DT);
+
+        let events = recorder.snapshot();
+        assert_eq!(
+            count_started_for_pair(&events, a, b),
+            1,
+            "Started should fire exactly once for a persistent contact; got events {:?}",
+            events
+        );
     }
 }

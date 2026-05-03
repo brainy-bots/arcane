@@ -46,4 +46,7 @@ pub use replication_channel_manager::ReplicationChannelManager;
 pub use rpc_handler::RpcHandler;
 
 #[cfg(feature = "rapier-cluster")]
-pub use rapier_cluster::{RapierClusterSim, RapierConfig};
+pub use rapier_cluster::{
+    ContactEvent, RapierClusterSim, RapierClusterSimulation, RapierClusterTickContext,
+    RapierColliderShape, RapierConfig,
+};
