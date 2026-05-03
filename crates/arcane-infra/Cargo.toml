@@ -13,6 +13,7 @@ arcane-wire = { path = "../arcane-wire" }
 axum = { version = "0.7", optional = true }
 futures-util = { version = "0.3", optional = true }
 rayon = { version = "1", optional = true }
+rapier3d = { version = "0.32", optional = true }
 redis = "0.27"
 reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -26,6 +27,7 @@ default = ["cluster-ws"]
 manager = ["dep:axum", "dep:tokio"]
 cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon"]
 spacetimedb-persist = ["dep:reqwest"]
+rapier-cluster = ["cluster-ws", "dep:rapier3d"]
 
 [[bin]]
 name = "arcane-cluster"
@@ -36,6 +38,11 @@ required-features = ["cluster-ws"]
 name = "arcane-manager"
 path = "src/bin/arcane_manager.rs"
 required-features = ["manager"]
+
+[[bin]]
+name = "arcane-rapier-cluster"
+path = "src/bin/arcane_rapier_cluster.rs"
+required-features = ["rapier-cluster"]
 
 [dev-dependencies]
 redis = "0.27"
