@@ -75,6 +75,16 @@ pub trait IClusteringModel: Send + Sync {
 
     /// Validate the view before evaluation. Caller may use this to skip invalid views.
     fn validate_view(&self, view: &WorldStateView) -> ValidationResult;
+
+    /// Return per-entity cluster assignments (entity_id → cluster_id).
+    /// Entities not in the map retain their current assignment.
+    /// Default returns empty map — models that reason per-entity override this.
+    fn compute_entity_assignments(
+        &self,
+        _view: &WorldStateView,
+    ) -> std::collections::HashMap<Uuid, Uuid> {
+        std::collections::HashMap::new()
+    }
 }
 
 #[derive(Clone, Debug)]
