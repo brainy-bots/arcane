@@ -19,6 +19,10 @@ pub struct ClusterManager {
     spatial_index: SpatialIndex,
     /// Allocated cluster servers. active_count = allocated_servers.len().
     allocated_servers: Vec<ServerHandle>,
+    /// entity_id → party_id. Empty by default; set via set_party_assignments().
+    /// Populated into PlayerInfo.party_id each evaluation cycle so AffinityEngine
+    /// Phase 1b receives party signals.
+    party_assignments: HashMap<Uuid, Uuid>,
 }
 
 impl ClusterManager {
@@ -32,6 +36,7 @@ impl ClusterManager {
             pool,
             spatial_index,
             allocated_servers: Vec::new(),
+            party_assignments: HashMap::new(),
         }
     }
 
@@ -42,6 +47,12 @@ impl ClusterManager {
             Arc::new(LocalPool::default()),
             SpatialIndex::new(),
         )
+    }
+
+    /// Register entity → party_id assignments. Called once at simulation setup.
+    /// Entities absent from this map continue to have party_id = None in PlayerInfo.
+    pub fn set_party_assignments(&mut self, assignments: HashMap<Uuid, Uuid>) {
+        self.party_assignments = assignments;
     }
 
     /// Create with a named clustering model. Supported values: "rules" (default), "affinity".
@@ -116,7 +127,7 @@ impl ClusterManager {
                 position: Vec2::new(pos.x, pos.z),
                 velocity: Vec2::new(0.0, 0.0),
                 guild_id: None,
-                party_id: None,
+                party_id: self.party_assignments.get(&entity_id).copied(),
             })
             .collect();
 
