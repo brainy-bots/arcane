@@ -132,8 +132,16 @@ impl AffinityEngine {
             .map(|(id, members)| (*id, members.len()))
             .collect();
 
-        // Phase 4: score each entity and decide migrations
+        // Phase 4: score each entity and decide migrations.
+        // Seed from cache first, then fill gaps from view.players (authoritative current
+        // assignment). This ensures entities that score below the migration threshold are
+        // already in new_assignments with their current cluster — Phase 5 must not override them.
         let mut new_assignments: HashMap<Uuid, Uuid> = assignments.clone();
+        for player in players {
+            new_assignments
+                .entry(player.player_id)
+                .or_insert(player.cluster_id);
+        }
 
         for player in players {
             let current_cluster = assignments
@@ -359,7 +367,7 @@ fn assignments_to_decisions(
 fn nearest_cluster(pos: Vec2, centroids: &HashMap<Uuid, Vec2>) -> Option<Uuid> {
     centroids
         .iter()
-        .min_by(|(_, ca), (_, cb)| {
+        .min_by(|(id_a, ca), (id_b, cb)| {
             let da = {
                 let dx = pos.x - ca.x;
                 let dy = pos.y - ca.y;
@@ -370,7 +378,9 @@ fn nearest_cluster(pos: Vec2, centroids: &HashMap<Uuid, Vec2>) -> Option<Uuid> {
                 let dy = pos.y - cb.y;
                 dx * dx + dy * dy
             };
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            da.partial_cmp(&db)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| id_a.cmp(id_b))
         })
         .map(|(&id, _)| id)
 }
@@ -668,8 +678,13 @@ mod tests {
         );
     }
 
-    /// An entity with no interaction history is assigned to the nearest cluster centroid
-    /// (spatial fallback), regardless of which cluster it was last in.
+    /// An entity with no interaction history migrates to the spatially nearest cluster when the
+    /// spatial improvement exceeds the migration threshold. migration_threshold=0.0 removes the
+    /// gate so any positive spatial improvement is sufficient — this is the correct way to test
+    /// that pure spatial scoring governs assignment when interaction history is absent.
+    ///
+    /// (Phase 5 spatial fallback only fires for entities with no cluster assignment at all;
+    /// for assigned entities Phase 4 must produce sufficient improvement to trigger migration.)
     #[test]
     fn isolated_entity_uses_spatial_fallback() {
         let c1 = uuid(10);
@@ -677,26 +692,26 @@ mod tests {
         let loner = uuid(1);
         let anchor = uuid(2); // gives c1 a member so centroid is populated
 
-        let engine = AffinityEngine::default();
+        let engine = AffinityEngine::new(AffinityConfig {
+            migration_threshold: 0.0, // any positive spatial improvement triggers migration
+            ..AffinityConfig::default()
+        });
 
         // Loner has no interactions. C1 centroid at x=-200, C2 centroid at x=+5.
-        // Loner is at x=0 — closer to C2.
+        // Loner is at x=0 — closer to C2. spatial improvement > 0 → migrates to C2.
         let view = make_view(
             vec![
                 cluster(c1, vec![anchor], -200.0, 0.0),
                 cluster(c2, vec![], 5.0, 0.0),
             ],
-            vec![
-                player(loner, c1, 0.0, 0.0), // nominally in C1 but no history
-                player(anchor, c1, -200.0, 0.0),
-            ],
+            vec![player(loner, c1, 0.0, 0.0), player(anchor, c1, -200.0, 0.0)],
         );
 
         let assignments = engine.compute_entity_assignments(&view);
         assert_eq!(
             assignments.get(&loner).copied().unwrap_or(c1),
             c2,
-            "loner should fall back to spatially nearest cluster C2"
+            "loner should migrate to spatially nearest cluster C2"
         );
     }
 }
