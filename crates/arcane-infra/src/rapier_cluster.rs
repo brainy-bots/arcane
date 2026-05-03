@@ -150,7 +150,9 @@ fn build_collider(shape: RapierColliderShape) -> Collider {
         } => ColliderBuilder::capsule_y(half_height, radius),
         RapierColliderShape::Cuboid(he) => ColliderBuilder::cuboid(he[0], he[1], he[2]),
     };
-    builder.active_events(ActiveEvents::COLLISION_EVENTS).build()
+    builder
+        .active_events(ActiveEvents::COLLISION_EVENTS)
+        .build()
 }
 
 /// A collision detected during a Rapier step, mapped from Rapier's collider
@@ -669,7 +671,11 @@ mod tests {
         // the body already exists and writes Rapier output (still 0,0,0) back.
         step_n(&sim, &mut entities, 3, CLUSTER_DT);
         let p = entities.get(&id).unwrap().position;
-        assert!(p.x.abs() < 1e-3 && p.y.abs() < 1e-3 && p.z.abs() < 1e-3, "{:?}", p);
+        assert!(
+            p.x.abs() < 1e-3 && p.y.abs() < 1e-3 && p.z.abs() < 1e-3,
+            "{:?}",
+            p
+        );
     }
 
     #[test]
@@ -706,7 +712,10 @@ mod tests {
         let mut entities = HashMap::new();
         for k in 0..5u128 {
             let id = Uuid::from_u128(k);
-            entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+            entities.insert(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            );
         }
         // First tick spawns 5 bodies, then the wrapper sees pending_removals with all
         // 5 ids and despawns them.
@@ -739,7 +748,11 @@ mod tests {
         );
         step_once(&sim, &mut entities, 6, CLUSTER_DT);
         let p = entities.get(&id).unwrap().position;
-        assert!(close(p.x, -100.0, 1e-3), "fresh body should start at -100, got {}", p.x);
+        assert!(
+            close(p.x, -100.0, 1e-3),
+            "fresh body should start at -100, got {}",
+            p.x
+        );
         assert!(close(p.y, 5.0, 1e-3), "fresh body y, got {}", p.y);
         assert_eq!(handle_count(&sim), 1);
     }
@@ -768,13 +781,25 @@ mod tests {
         let pb = entities.get(&b).unwrap().position;
         let pc = entities.get(&c).unwrap().position;
         // Each entity should have moved by its own velocity vector × elapsed time.
-        assert!(close(pa.x - a_start.x, 1.0, SUBSTEP_TOL), "Δa.x = {}", pa.x - a_start.x);
+        assert!(
+            close(pa.x - a_start.x, 1.0, SUBSTEP_TOL),
+            "Δa.x = {}",
+            pa.x - a_start.x
+        );
         assert!((pa.y - a_start.y).abs() < SUBSTEP_TOL);
         assert!((pa.z - a_start.z).abs() < SUBSTEP_TOL);
-        assert!(close(pb.y - b_start.y, 2.0, 2.0 * SUBSTEP_TOL), "Δb.y = {}", pb.y - b_start.y);
+        assert!(
+            close(pb.y - b_start.y, 2.0, 2.0 * SUBSTEP_TOL),
+            "Δb.y = {}",
+            pb.y - b_start.y
+        );
         assert!((pb.x - b_start.x).abs() < SUBSTEP_TOL);
         assert!((pb.z - b_start.z).abs() < SUBSTEP_TOL);
-        assert!(close(pc.z - c_start.z, -3.0, 3.0 * SUBSTEP_TOL), "Δc.z = {}", pc.z - c_start.z);
+        assert!(
+            close(pc.z - c_start.z, -3.0, 3.0 * SUBSTEP_TOL),
+            "Δc.z = {}",
+            pc.z - c_start.z
+        );
         assert!((pc.x - c_start.x).abs() < SUBSTEP_TOL);
         assert!((pc.y - c_start.y).abs() < SUBSTEP_TOL);
     }
@@ -791,7 +816,11 @@ mod tests {
             let col = (k % 25) as f64;
             entities.insert(
                 id,
-                mk_entry(id, Vec3::new(col * 5.0, 0.0, row * 5.0), Vec3::new(1.0, 0.0, 0.0)),
+                mk_entry(
+                    id,
+                    Vec3::new(col * 5.0, 0.0, row * 5.0),
+                    Vec3::new(1.0, 0.0, 0.0),
+                ),
             );
         }
         step_n(&sim, &mut entities, 20, CLUSTER_DT); // 1.0 s
@@ -928,7 +957,12 @@ mod tests {
             step_once(&sim, &mut entities, tick + 1, CLUSTER_DT);
             let vy = entities.get(&id).unwrap().velocity.y;
             if let Some(prev) = prev_vy {
-                assert!(vy < prev, "vy must monotonically decrease under -y gravity (was {}, now {})", prev, vy);
+                assert!(
+                    vy < prev,
+                    "vy must monotonically decrease under -y gravity (was {}, now {})",
+                    prev,
+                    vy
+                );
             }
             prev_vy = Some(vy);
         }
@@ -1013,7 +1047,11 @@ mod tests {
         assert_eq!(spy.last_action_count.load(Ordering::SeqCst), 1);
         // Rapier saw the velocity the spy wrote (5.0) → entity advances along x.
         let p = entities.get(&id).unwrap().position;
-        assert!(p.x > 0.0, "Rapier should have applied user-written velocity, x = {}", p.x);
+        assert!(
+            p.x > 0.0,
+            "Rapier should have applied user-written velocity, x = {}",
+            p.x
+        );
     }
 
     #[test]
@@ -1050,8 +1088,15 @@ mod tests {
         step_n(&sim2, &mut entities2, 3, CLUSTER_DT);
         let buffed_x = entities2.get(&id).unwrap().position.x;
         let buffed_vx = entities2.get(&id).unwrap().velocity.x;
-        assert!(buffed_x > baseline_x / 5.0, "buff should produce more motion per tick");
-        assert!(buffed_vx >= 8.0, "vx should have doubled 3× to ≥ 8, got {}", buffed_vx);
+        assert!(
+            buffed_x > baseline_x / 5.0,
+            "buff should produce more motion per tick"
+        );
+        assert!(
+            buffed_vx >= 8.0,
+            "vx should have doubled 3× to ≥ 8, got {}",
+            buffed_vx
+        );
     }
 
     // ─── determinism / hand-off ─────────────────────────────────────────────────
@@ -1106,7 +1151,7 @@ mod tests {
                 mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
             );
             step_n(&sim_a, &mut entities, 20, CLUSTER_DT); // 1 s on cluster A
-            // Hand-off: capture entry, drop sim_a, respawn on sim_b.
+                                                           // Hand-off: capture entry, drop sim_a, respawn on sim_b.
             let exported = entities.get(&id).unwrap().clone();
             drop(sim_a);
             let sim_b = RapierClusterSim::with_default_config(None);
@@ -1196,8 +1241,14 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
         // Centers 0.4 apart with radius 0.5 each → significant overlap.
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         // Tick 1 spawns and steps; contact emitted post-step. Tick 2 surfaces it.
         step_n(&sim, &mut entities, 2, CLUSTER_DT);
@@ -1223,8 +1274,14 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
         // 100 units apart — well outside any collider radius.
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(100.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(100.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         step_n(&sim, &mut entities, 5, CLUSTER_DT);
 
@@ -1243,7 +1300,10 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, CLUSTER_DT);
 
         let state = sim.state.lock().unwrap();
@@ -1296,7 +1356,10 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim, &mut entities, 5, CLUSTER_DT);
 
         assert_eq!(
@@ -1352,8 +1415,14 @@ mod tests {
         let mut entities = HashMap::new();
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.4, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         step_n(&sim, &mut entities, 3, CLUSTER_DT);
 
@@ -1361,7 +1430,10 @@ mod tests {
         // Tick 1 must see 0 contacts (nothing has stepped yet from this sim's
         // perspective; pending_contact_events starts empty).
         assert_eq!(snapshots[0].0, 1);
-        assert_eq!(snapshots[0].1, 0, "tick 1 should have no contact events yet");
+        assert_eq!(
+            snapshots[0].1, 0,
+            "tick 1 should have no contact events yet"
+        );
         // Tick 2 must see at least one contact (the Started from tick 1's step).
         assert_eq!(snapshots[1].0, 2);
         assert!(
@@ -1385,8 +1457,14 @@ mod tests {
         let mut entities = HashMap::new();
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.6, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.6, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         step_n(&sim, &mut entities, 20, CLUSTER_DT);
 
@@ -1437,8 +1515,14 @@ mod tests {
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
         // Start overlapping so Started fires immediately.
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.6, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.6, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim, &mut entities, 2, CLUSTER_DT);
         assert!(
             started_pair_present(&recorder.snapshot(), a, b),
@@ -1499,8 +1583,14 @@ mod tests {
             RapierConfig::default(),
         );
         let mut entities = HashMap::new();
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         step_n(&sim, &mut entities, 6, CLUSTER_DT);
 
@@ -1529,7 +1619,10 @@ mod tests {
         let sim = RapierClusterSim::new(None, config);
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, CLUSTER_DT);
 
         let radius = with_collider(&sim, id, |c| c.shape().as_ball().map(|b| b.radius))
@@ -1553,12 +1646,16 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, CLUSTER_DT);
 
-        let capsule_radius = with_collider(&sim, id, |c| c.shape().as_capsule().map(|cap| cap.radius))
-            .flatten()
-            .expect("collider should be a Capsule");
+        let capsule_radius =
+            with_collider(&sim, id, |c| c.shape().as_capsule().map(|cap| cap.radius))
+                .flatten()
+                .expect("collider should be a Capsule");
         assert!((capsule_radius - 0.4).abs() < 1e-6);
     }
 
@@ -1573,7 +1670,10 @@ mod tests {
         let sim = RapierClusterSim::with_default_config(None);
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, 0.1); // single tick, 100 ms wall-time
         let x = entities.get(&id).unwrap().position.x;
         // Six substeps × (1/60 s) × 1 m/s = 0.1 m exactly. Allow a tiny epsilon.
@@ -1593,7 +1693,10 @@ mod tests {
         let sim = RapierClusterSim::with_default_config(None);
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+        );
 
         // First tick: dt = 0.005 < FIXED_PHYSICS_DT (0.0167). Accumulator
         // shouldn't have drained, so position should still be 0.
@@ -1629,8 +1732,14 @@ mod tests {
         let b = Uuid::from_u128(2);
         // A heads at B (stationary). After collision, B must have non-zero
         // velocity in +x (got pushed) — that's contact response in action.
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(2.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim, &mut entities, 40, CLUSTER_DT); // 2 s — plenty for collision + post-collision
 
         let b_vel_x = entities.get(&b).unwrap().velocity.x;
@@ -1680,7 +1789,10 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(99);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, CLUSTER_DT);
         // First lifetime: Ball.
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
@@ -1691,7 +1803,10 @@ mod tests {
         step_once(&sim, &mut entities, 2, CLUSTER_DT);
 
         // Respawn same UUID → fresh first-sight → collider_for called again.
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 3, CLUSTER_DT);
         assert_eq!(
             inner.calls.load(Ordering::SeqCst),
@@ -1733,7 +1848,10 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
 
         let actions = vec![
             GameAction {
@@ -1832,8 +1950,14 @@ mod tests {
         let mut entities = HashMap::new();
         // Ball (radius 0.5) at origin; cuboid (half-extents 0.5) at (0.7, 0, 0)
         // → cuboid spans x ∈ [0.2, 1.2]; sphere extends to x = 0.5. Overlap.
-        entities.insert(ball_id, mk_entry(ball_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(box_id, mk_entry(box_id, Vec3::new(0.7, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            ball_id,
+            mk_entry(ball_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            box_id,
+            mk_entry(box_id, Vec3::new(0.7, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim, &mut entities, 2, CLUSTER_DT);
 
         let events = recorder.events.lock().unwrap().clone();
@@ -1857,14 +1981,21 @@ mod tests {
         let sim = RapierClusterSim::new(None, config);
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim, &mut entities, 20, CLUSTER_DT); // 1.0 s
 
         let p = entities.get(&id).unwrap().position;
         let v = entities.get(&id).unwrap().velocity;
         // Free-fall along +X: pos ≈ 0.5·g·t² ≈ 1.5; vx ≈ g·t = 3.
         // Wide tolerance for semi-implicit Euler at 1/60 substeps.
-        assert!(p.x > 1.3, "x should accelerate in +x under +x gravity; got {}", p.x);
+        assert!(
+            p.x > 1.3,
+            "x should accelerate in +x under +x gravity; got {}",
+            p.x
+        );
         assert!(v.x > 2.7, "vx should grow under +x gravity; got {}", v.x);
         // No motion on other axes.
         assert!(p.y.abs() < 1e-3 && p.z.abs() < 1e-3);
@@ -1885,8 +2016,14 @@ mod tests {
         let mut entities = HashMap::new();
         let a = Uuid::from_u128(1);
         let b = Uuid::from_u128(2);
-        entities.insert(a, mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
-        entities.insert(b, mk_entry(b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(0.5, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_n(&sim_a, &mut entities, 3, CLUSTER_DT);
         let events_a = recorder_a.snapshot();
         assert!(
@@ -1939,14 +2076,15 @@ mod tests {
         );
         let mut entities = HashMap::new();
         let id = Uuid::from_u128(1);
-        entities.insert(id, mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)));
+        entities.insert(
+            id,
+            mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
         step_once(&sim, &mut entities, 1, CLUSTER_DT);
 
-        let segment = with_collider(&sim, id, |c| {
-            c.shape().as_capsule().map(|cap| cap.segment)
-        })
-        .flatten()
-        .expect("collider should be a Capsule");
+        let segment = with_collider(&sim, id, |c| c.shape().as_capsule().map(|cap| cap.segment))
+            .flatten()
+            .expect("collider should be a Capsule");
         // capsule_y: endpoints at (0, ±half_height, 0).
         assert!((segment.a.x).abs() < 1e-6);
         assert!((segment.a.z).abs() < 1e-6);

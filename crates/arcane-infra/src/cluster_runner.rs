@@ -48,8 +48,8 @@ impl ClusterEnv {
     pub fn from_env() -> Result<Self, String> {
         let cluster_id = std::env::var("CLUSTER_ID")
             .map_err(|_| "CLUSTER_ID env var required (UUID)".to_string())?;
-        let cluster_id = Uuid::parse_str(&cluster_id)
-            .map_err(|e| format!("invalid CLUSTER_ID: {}", e))?;
+        let cluster_id =
+            Uuid::parse_str(&cluster_id).map_err(|e| format!("invalid CLUSTER_ID: {}", e))?;
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let neighbor_ids = std::env::var("NEIGHBOR_IDS")
