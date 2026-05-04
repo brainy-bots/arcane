@@ -61,6 +61,29 @@
 //! clustering-binding epic lands, `Fixed` entities still migrate by PGP
 //! affinity — they are not yet pinned to chunk ownership.
 //!
+//! # In-tick imperative ops
+//!
+//! [`RapierClusterTickContext::physics`] exposes a [`PhysicsHandle`] that lets
+//! `on_tick` mutate Rapier state and run synchronous queries. All operations
+//! are entity-keyed (take `Uuid`, never raw Rapier handles).
+//!
+//! - **Forces / impulses:** `apply_impulse`, `apply_force`, `apply_torque_impulse`.
+//! - **Direct overrides:** `set_translation` (teleport), `set_linvel`, `set_angvel`.
+//! - **Reads:** `linvel`, `angvel`.
+//! - **Sleep control:** `wake`, `sleep`.
+//! - **Spatial queries:** `raycast`, `intersections_with_shape`.
+//! - **Joints:** `create_joint` (Fixed / Revolute / Spherical / Prismatic) and
+//!   `remove_joint`. Joints are auto-removed when either connected entity
+//!   despawns.
+//!
+//! Per-op contracts (Fixed-body no-op, missing-id no-panic, set_linvel ↔
+//! per-tick velocity sync interaction) are documented on [`PhysicsHandle`].
+//!
+//! ⚠️ **Lock window.** For the Rapier-aware path (`with_rapier_sim`) the
+//! cluster's state lock is held for the duration of `on_tick`. The plain
+//! `ClusterSimulation` path keeps the legacy "lock released during user code"
+//! behavior — it has no `PhysicsHandle` to give it.
+//!
 //! # Contact events
 //!
 //! [`RapierClusterSimulation::on_tick`] receives a [`RapierClusterTickContext`]
@@ -157,6 +180,57 @@
 //!
 //!     fn is_sensor(&self, entry: &EntityStateEntry, _c: &RapierConfig) -> bool {
 //!         entry.user_data.get("kind").and_then(|v| v.as_str()) == Some("trigger_zone")
+//!     }
+//! }
+//! ```
+//!
+//! In-tick imperative ops (apply impulse on collision, hitscan raycast,
+//! teleport on respawn, joint creation):
+//!
+//! ```no_run
+//! use arcane_core::Vec3;
+//! use arcane_infra::{
+//!     JointSpec, RapierClusterSimulation, RapierClusterTickContext, RapierColliderShape,
+//! };
+//! use uuid::Uuid;
+//!
+//! struct ActionGame {
+//!     player: Uuid,
+//!     barrel: Uuid,
+//! }
+//! impl RapierClusterSimulation for ActionGame {
+//!     fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+//!         // Hitscan: raycast from player forward, knock the hit entity back.
+//!         if let Some(player_pos) = ctx.entities.get(&self.player).map(|e| e.position) {
+//!             let dir = Vec3::new(0.0, 0.0, 1.0);
+//!             if let Some(hit) = ctx.physics.raycast(player_pos, dir, 50.0) {
+//!                 ctx.physics.apply_impulse(hit.entity_id, Vec3::new(0.0, 0.0, 10.0));
+//!             }
+//!         }
+//!
+//!         // Explosion: every entity in 5m of the barrel takes a radial impulse.
+//!         if let Some(barrel_pos) = ctx.entities.get(&self.barrel).map(|e| e.position) {
+//!             let radius = RapierColliderShape::Ball(5.0);
+//!             for hit_id in ctx.physics.intersections_with_shape(&radius, barrel_pos) {
+//!                 if hit_id == self.barrel { continue; }
+//!                 if let Some(p) = ctx.entities.get(&hit_id).map(|e| e.position) {
+//!                     let strength = 5.0;
+//!                     let away = Vec3::new(
+//!                         (p.x - barrel_pos.x) * strength,
+//!                         (p.y - barrel_pos.y) * strength,
+//!                         (p.z - barrel_pos.z) * strength,
+//!                     );
+//!                     ctx.physics.apply_impulse(hit_id, away);
+//!                 }
+//!             }
+//!         }
+//!
+//!         // Teleport on contact-event: when player touches a "respawn pad", relocate.
+//!         for ev in ctx.contact_events.iter().filter(|e| e.started) {
+//!             if ev.entity_a == self.player {
+//!                 ctx.physics.set_translation(self.player, Vec3::new(0.0, 5.0, 0.0));
+//!             }
+//!         }
 //!     }
 //! }
 //! ```
@@ -386,11 +460,83 @@ pub struct ContactEvent {
     pub started: bool,
 }
 
-/// Tick context delivered to [`RapierClusterSimulation::on_tick`]. Mirrors
-/// [`ClusterTickContext`] field-for-field plus Rapier-specific extensions.
+/// A hit returned by [`PhysicsHandle::raycast`]. Maps Rapier's collider hit
+/// back to an entity id.
 ///
-/// `#[non_exhaustive]` so future fields (e.g. raycast/query handles, physics
-/// command queues) aren't a SemVer break for downstream impls.
+/// `#[non_exhaustive]` so adding fields (e.g. `feature` for sub-shape index)
+/// in future versions isn't a SemVer break.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct RaycastHit {
+    /// The entity whose collider was hit.
+    pub entity_id: Uuid,
+    /// Time of impact along the ray, in units of the ray's direction length.
+    /// For a unit-length direction this is the world-space distance.
+    pub time_of_impact: f32,
+    /// World-space hit point.
+    pub point: Vec3,
+    /// Surface normal at the hit point (world space).
+    pub normal: Vec3,
+}
+
+impl RaycastHit {
+    pub const fn new(entity_id: Uuid, time_of_impact: f32, point: Vec3, normal: Vec3) -> Self {
+        Self {
+            entity_id,
+            time_of_impact,
+            point,
+            normal,
+        }
+    }
+}
+
+/// Joint shape for [`PhysicsHandle::create_joint`]. Anchors are in each
+/// body's local space. Limits and motors are not exposed in this minimal
+/// surface — add via Rapier directly if needed (`out` of scope for `#121`).
+///
+/// `#[non_exhaustive]` so adding variants / fields in future versions isn't a
+/// SemVer break.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum JointSpec {
+    /// Rigidly attaches the two bodies — no relative motion.
+    Fixed {
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+    },
+    /// Allows rotation around `axis` only (1 DoF rotational).
+    Revolute {
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+        /// Axis of rotation, expressed in body A's local frame.
+        axis: Vec3,
+    },
+    /// Allows free rotation around the anchor (3 DoF rotational, ball-joint).
+    Spherical {
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+    },
+    /// Allows translation along `axis` only (1 DoF translational, slider).
+    Prismatic {
+        local_anchor_a: Vec3,
+        local_anchor_b: Vec3,
+        /// Axis of translation, expressed in body A's local frame.
+        axis: Vec3,
+    },
+}
+
+/// Opaque handle returned by [`PhysicsHandle::create_joint`]; pass back to
+/// [`PhysicsHandle::remove_joint`]. Joints are auto-removed when either of
+/// the connected entities despawns — calling `remove_joint` afterwards is a
+/// safe no-op (returns `false`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JointId(ImpulseJointHandle);
+
+/// Tick context delivered to [`RapierClusterSimulation::on_tick`]. Mirrors
+/// [`ClusterTickContext`] field-for-field plus Rapier-specific extensions
+/// (contact events, in-tick physics handle).
+///
+/// `#[non_exhaustive]` so future fields aren't a SemVer break for downstream impls.
 #[non_exhaustive]
 pub struct RapierClusterTickContext<'a> {
     pub cluster_id: Uuid,
@@ -402,6 +548,11 @@ pub struct RapierClusterTickContext<'a> {
     /// Contact events from the **previous** tick's physics step. One-tick delay
     /// by design — see module-level "Contact events" docs.
     pub contact_events: &'a [ContactEvent],
+    /// In-tick imperative physics ops — apply impulse/force/torque, teleport,
+    /// raycast, intersection queries, joint creation. See [`PhysicsHandle`] for
+    /// the full surface. Reads and mutations hit Rapier state synchronously
+    /// while the user's `on_tick` runs.
+    pub physics: PhysicsHandle<'a>,
 }
 
 /// Rapier-aware sibling of [`ClusterSimulation`]. Implement this trait and pass
@@ -497,6 +648,11 @@ struct RapierState {
     /// call. The wrapper drains these at the top of the next tick and surfaces
     /// them to the user via [`RapierClusterTickContext::contact_events`].
     pending_contact_events: Vec<ContactEvent>,
+    /// Entities whose `linvel` was set imperatively this tick (via
+    /// `PhysicsHandle::set_linvel` or `apply_impulse`). The per-tick
+    /// `entity.velocity` → `body.linvel` sync skips these so the imperative
+    /// override sticks. Cleared at the start of every tick.
+    pending_imperative_linvel: HashSet<Uuid>,
 }
 
 /// Internal `EventHandler` impl that records collisions into a `Mutex<Vec>`.
@@ -569,6 +725,7 @@ impl RapierState {
             accumulator: 0.0,
             gravity,
             pending_contact_events: Vec::new(),
+            pending_imperative_linvel: HashSet::new(),
         }
     }
 
@@ -708,6 +865,273 @@ impl RapierState {
     }
 }
 
+/// In-tick imperative physics ops, exposed via [`RapierClusterTickContext::physics`].
+///
+/// Holds a mutable borrow of the Rapier state for the duration of the user's
+/// `on_tick`; the cluster's state lock is held alongside. All operations are
+/// **entity-keyed** — they take `Uuid`, never raw Rapier handles, preserving
+/// Arcane's invariant that the entity map is the user's view into physics state.
+///
+/// **Operations on missing entity ids** return `false` / `None` without panicking.
+///
+/// **Operations on `Fixed` bodies** (`apply_impulse` / `apply_force` /
+/// `apply_torque_impulse` / `set_linvel` / `set_angvel`) silently no-op and
+/// return `false`. Gameplay code shouldn't have to query body kind before
+/// applying force; the no-op is the contract.
+///
+/// **`set_translation` for Dynamic bodies** teleports immediately. Can violate
+/// contact constraints (a body landing inside another body); Rapier resolves
+/// any new contacts at the next step. Documented behavior, not a bug.
+///
+/// **`set_linvel` / `apply_impulse` and the per-tick velocity sync.** After
+/// `on_tick`, the wrapper syncs `entity.velocity` → `body.linvel` for every
+/// existing body so the declarative path keeps working. Calls that mutate
+/// linvel imperatively (`set_linvel`, `apply_impulse`) mark the entity as
+/// "imperatively touched" — the per-tick sync skips those entities so the
+/// imperative override stays in effect for the upcoming physics step.
+pub struct PhysicsHandle<'a> {
+    state: &'a mut RapierState,
+}
+
+impl<'a> PhysicsHandle<'a> {
+    fn new(state: &'a mut RapierState) -> Self {
+        Self { state }
+    }
+
+    fn body_mut(&mut self, entity_id: Uuid) -> Option<&mut RigidBody> {
+        let handle = *self.state.handles.get(&entity_id)?;
+        self.state.bodies.get_mut(handle)
+    }
+
+    fn body(&self, entity_id: Uuid) -> Option<&RigidBody> {
+        let handle = *self.state.handles.get(&entity_id)?;
+        self.state.bodies.get(handle)
+    }
+
+    /// Apply an instantaneous linear impulse to the entity's body. Updates
+    /// `body.linvel` by `impulse / mass` immediately. Marks the entity as
+    /// imperatively touched so the per-tick `entity.velocity` sync doesn't
+    /// clobber the change.
+    ///
+    /// Returns `false` if the entity has no body, or the body is `Fixed`.
+    pub fn apply_impulse(&mut self, entity_id: Uuid, impulse: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        if body.body_type() == RigidBodyType::Fixed {
+            return false;
+        }
+        body.apply_impulse(to_rapier(impulse), true);
+        self.state.pending_imperative_linvel.insert(entity_id);
+        true
+    }
+
+    /// Add a continuous force, applied during the upcoming physics step.
+    /// Cleared by Rapier at the start of each step.
+    ///
+    /// Returns `false` if the entity has no body, or the body is `Fixed`.
+    pub fn apply_force(&mut self, entity_id: Uuid, force: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        if body.body_type() == RigidBodyType::Fixed {
+            return false;
+        }
+        body.add_force(to_rapier(force), true);
+        true
+    }
+
+    /// Apply an instantaneous angular impulse (torque impulse).
+    ///
+    /// Returns `false` if the entity has no body, or the body is `Fixed`.
+    pub fn apply_torque_impulse(&mut self, entity_id: Uuid, torque: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        if body.body_type() == RigidBodyType::Fixed {
+            return false;
+        }
+        body.apply_torque_impulse(to_rapier(torque), true);
+        true
+    }
+
+    /// Teleport the entity's body to `position`. The new translation is
+    /// reflected in `entity.position` after the tick (via `sync_outputs`).
+    /// May violate contact constraints; Rapier resolves at the next step.
+    ///
+    /// Returns `false` if the entity has no body. Allowed on `Fixed` bodies
+    /// (you can move walls), though clustering may not yet pin the new
+    /// chunk ownership (see clustering-binding epic).
+    pub fn set_translation(&mut self, entity_id: Uuid, position: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        body.set_translation(to_rapier(position), true);
+        true
+    }
+
+    /// Override the entity's linear velocity directly, bypassing the per-tick
+    /// `entity.velocity` declarative path. Marks the entity as imperatively
+    /// touched so the override sticks.
+    ///
+    /// Returns `false` if the entity has no body, or the body is `Fixed`.
+    pub fn set_linvel(&mut self, entity_id: Uuid, linvel: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        if body.body_type() == RigidBodyType::Fixed {
+            return false;
+        }
+        body.set_linvel(to_rapier(linvel), true);
+        self.state.pending_imperative_linvel.insert(entity_id);
+        true
+    }
+
+    /// Override the entity's angular velocity directly.
+    ///
+    /// Returns `false` if the entity has no body, or the body is `Fixed`.
+    pub fn set_angvel(&mut self, entity_id: Uuid, angvel: Vec3) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        if body.body_type() == RigidBodyType::Fixed {
+            return false;
+        }
+        body.set_angvel(to_rapier(angvel), true);
+        true
+    }
+
+    /// Read the entity's current linear velocity. Returns `None` if no body.
+    pub fn linvel(&self, entity_id: Uuid) -> Option<Vec3> {
+        self.body(entity_id).map(|b| from_rapier(b.linvel()))
+    }
+
+    /// Read the entity's current angular velocity. Returns `None` if no body.
+    pub fn angvel(&self, entity_id: Uuid) -> Option<Vec3> {
+        self.body(entity_id).map(|b| from_rapier(b.angvel()))
+    }
+
+    /// Wake a sleeping body so it rejoins simulation. Returns `false` if no body.
+    pub fn wake(&mut self, entity_id: Uuid) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        body.wake_up(true);
+        true
+    }
+
+    /// Force a body to sleep. Returns `false` if no body.
+    pub fn sleep(&mut self, entity_id: Uuid) -> bool {
+        let Some(body) = self.body_mut(entity_id) else {
+            return false;
+        };
+        body.sleep();
+        true
+    }
+
+    /// Cast a ray and return the closest entity-collider hit, if any.
+    /// `direction` should be a non-zero vector — its length scales
+    /// `time_of_impact` (use a unit vector if you want `time_of_impact` to
+    /// equal world-space distance). Misses return `None`.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<RaycastHit> {
+        let ray = Ray::new(to_rapier(origin), to_rapier(direction));
+        let qp = self.state.broad_phase.as_query_pipeline(
+            self.state.narrow_phase.query_dispatcher(),
+            &self.state.bodies,
+            &self.state.colliders,
+            QueryFilter::default(),
+        );
+        let (handle, hit) = qp.cast_ray_and_get_normal(&ray, max_dist, true)?;
+        let entity_id = *self.state.collider_to_entity.get(&handle)?;
+        let hit_point = ray.origin + ray.dir * hit.time_of_impact;
+        Some(RaycastHit::new(
+            entity_id,
+            hit.time_of_impact,
+            from_rapier(hit_point),
+            from_rapier(hit.normal),
+        ))
+    }
+
+    /// Return the entity ids whose colliders overlap a query shape positioned
+    /// at `position`. The shape is constructed transiently for the query and
+    /// is not added to the world.
+    pub fn intersections_with_shape(
+        &self,
+        shape: &RapierColliderShape,
+        position: Vec3,
+    ) -> Vec<Uuid> {
+        let collider = build_collider(
+            *shape,
+            RapierMaterial::default(),
+            RapierCollisionGroups::default(),
+            true, // sensor=true: query only, no contact resolution
+        );
+        let shape_pos = Pose::from_translation(to_rapier(position));
+        let qp = self.state.broad_phase.as_query_pipeline(
+            self.state.narrow_phase.query_dispatcher(),
+            &self.state.bodies,
+            &self.state.colliders,
+            QueryFilter::default(),
+        );
+        qp.intersect_shape(shape_pos, collider.shape())
+            .filter_map(|(handle, _co)| self.state.collider_to_entity.get(&handle).copied())
+            .collect()
+    }
+
+    /// Create a joint between two entities in this cluster. Returns the
+    /// resulting [`JointId`], or `None` if either entity has no body.
+    /// Joints are auto-removed when either entity despawns.
+    pub fn create_joint(&mut self, a: Uuid, b: Uuid, joint: JointSpec) -> Option<JointId> {
+        let h_a = *self.state.handles.get(&a)?;
+        let h_b = *self.state.handles.get(&b)?;
+        let joint_data: GenericJoint = match joint {
+            JointSpec::Fixed {
+                local_anchor_a,
+                local_anchor_b,
+            } => FixedJointBuilder::new()
+                .local_anchor1(to_rapier(local_anchor_a))
+                .local_anchor2(to_rapier(local_anchor_b))
+                .build()
+                .into(),
+            JointSpec::Revolute {
+                local_anchor_a,
+                local_anchor_b,
+                axis,
+            } => RevoluteJointBuilder::new(to_rapier(axis).normalize())
+                .local_anchor1(to_rapier(local_anchor_a))
+                .local_anchor2(to_rapier(local_anchor_b))
+                .build()
+                .into(),
+            JointSpec::Spherical {
+                local_anchor_a,
+                local_anchor_b,
+            } => SphericalJointBuilder::new()
+                .local_anchor1(to_rapier(local_anchor_a))
+                .local_anchor2(to_rapier(local_anchor_b))
+                .build()
+                .into(),
+            JointSpec::Prismatic {
+                local_anchor_a,
+                local_anchor_b,
+                axis,
+            } => PrismaticJointBuilder::new(to_rapier(axis).normalize())
+                .local_anchor1(to_rapier(local_anchor_a))
+                .local_anchor2(to_rapier(local_anchor_b))
+                .build()
+                .into(),
+        };
+        let handle = self.state.impulse_joints.insert(h_a, h_b, joint_data, true);
+        Some(JointId(handle))
+    }
+
+    /// Remove a joint previously created by [`Self::create_joint`]. Returns
+    /// `false` if the joint id is unknown (already removed via despawn or
+    /// removed by an earlier call).
+    pub fn remove_joint(&mut self, joint: JointId) -> bool {
+        self.state.impulse_joints.remove(joint.0, true).is_some()
+    }
+}
+
 /// User-logic backend wrapped by [`RapierClusterSim`].
 enum Backend {
     /// No user-side logic — Rapier just integrates whatever `entity.velocity`
@@ -811,32 +1235,61 @@ impl RapierClusterSim {
 
 impl ClusterSimulation for RapierClusterSim {
     fn on_tick(&self, ctx: &mut ClusterTickContext<'_>) {
-        // Take ownership of the previous step's contacts so the user's on_tick
-        // can run without holding the state lock.
-        let prev_contacts = {
-            let mut state = self.state.lock().expect("rapier state lock");
-            std::mem::take(&mut state.pending_contact_events)
-        };
-
         match &self.backend {
-            Backend::None => {}
-            Backend::Cluster(sim) => sim.on_tick(ctx),
+            Backend::None => {
+                // No user code; lock once and run the physics phase.
+                let mut state = self.state.lock().expect("rapier state lock");
+                // Discard any prior contacts — there is no listener.
+                state.pending_contact_events.clear();
+                state.pending_imperative_linvel.clear();
+                self.run_physics_phase(&mut state, ctx);
+            }
+            Backend::Cluster(sim) => {
+                // Plain ClusterSimulation: lock released during user code
+                // (legacy behavior — plain ClusterSimulation has no PhysicsHandle).
+                {
+                    let mut state = self.state.lock().expect("rapier state lock");
+                    // Drop prior contacts — plain ClusterSimulation can't read them.
+                    state.pending_contact_events.clear();
+                    state.pending_imperative_linvel.clear();
+                }
+                sim.on_tick(ctx);
+                let mut state = self.state.lock().expect("rapier state lock");
+                self.run_physics_phase(&mut state, ctx);
+            }
             Backend::Rapier(sim) => {
-                let mut rapier_ctx = RapierClusterTickContext {
-                    cluster_id: ctx.cluster_id,
-                    tick: ctx.tick,
-                    dt_seconds: ctx.dt_seconds,
-                    entities: ctx.entities,
-                    pending_removals: ctx.pending_removals,
-                    game_actions: ctx.game_actions,
-                    contact_events: &prev_contacts,
-                };
-                sim.on_tick(&mut rapier_ctx);
+                // Lock held through user `on_tick` so PhysicsHandle can mutate
+                // Rapier state synchronously (impulses, raycasts, joints, etc.).
+                let mut state = self.state.lock().expect("rapier state lock");
+                let prev_contacts = std::mem::take(&mut state.pending_contact_events);
+                state.pending_imperative_linvel.clear();
+                {
+                    let physics = PhysicsHandle::new(&mut state);
+                    let mut rapier_ctx = RapierClusterTickContext {
+                        cluster_id: ctx.cluster_id,
+                        tick: ctx.tick,
+                        dt_seconds: ctx.dt_seconds,
+                        entities: ctx.entities,
+                        pending_removals: ctx.pending_removals,
+                        game_actions: ctx.game_actions,
+                        contact_events: &prev_contacts,
+                        physics,
+                    };
+                    sim.on_tick(&mut rapier_ctx);
+                    // rapier_ctx (and physics) drop here; state is freely usable again.
+                }
+                self.run_physics_phase(&mut state, ctx);
             }
         }
+    }
+}
 
-        let mut state = self.state.lock().expect("rapier state lock");
-
+impl RapierClusterSim {
+    /// Despawn / spawn / per-tick velocity sync / step / sync_outputs. Runs
+    /// after the user's `on_tick`. Honors `state.pending_imperative_linvel`
+    /// — entities whose linvel was set imperatively this tick skip the
+    /// declarative `entity.velocity` → `body.linvel` sync.
+    fn run_physics_phase(&self, state: &mut RapierState, ctx: &mut ClusterTickContext<'_>) {
         // The cluster runner drains pending_removals from the entity map AFTER
         // on_tick returns; from our perspective those entities are already gone
         // (no spawn, no sync, no body).
@@ -851,7 +1304,12 @@ impl ClusterSimulation for RapierClusterSim {
                 continue;
             }
             if state.handles.contains_key(id) {
-                state.set_linvel(*id, entry.velocity);
+                // Skip the declarative linvel sync for entities whose linvel
+                // was set imperatively this tick (via PhysicsHandle::set_linvel
+                // or apply_impulse) — the imperative override wins.
+                if !state.pending_imperative_linvel.contains(id) {
+                    state.set_linvel(*id, entry.velocity);
+                }
             } else {
                 let params = SpawnParams {
                     shape: self.shape_for(entry),
@@ -2898,5 +3356,495 @@ mod tests {
                 sim_arc.count(hook, b)
             );
         }
+    }
+
+    // ─── in-tick imperative ops (#121): impulses / forces / set_* / queries / joints ──
+
+    /// Generic test fixture: each tick, run the user-provided closure against
+    /// the [`PhysicsHandle`] and the current tick number. The closure may use
+    /// interior mutability (e.g. `Mutex<Vec<RaycastHit>>`) to record results.
+    struct ScriptedSim<F>
+    where
+        F: Fn(&mut PhysicsHandle, u64) + Send + Sync,
+    {
+        action: F,
+    }
+
+    impl<F> RapierClusterSimulation for ScriptedSim<F>
+    where
+        F: Fn(&mut PhysicsHandle, u64) + Send + Sync,
+    {
+        fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+            (self.action)(&mut ctx.physics, ctx.tick);
+        }
+    }
+
+    fn run_with_action<F>(
+        config: RapierConfig,
+        action: F,
+        seed_entities: Vec<(Uuid, EntityStateEntry)>,
+        ticks: u64,
+    ) -> (
+        Arc<ScriptedSim<F>>,
+        RapierClusterSim,
+        HashMap<Uuid, EntityStateEntry>,
+    )
+    where
+        F: Fn(&mut PhysicsHandle, u64) + Send + Sync + 'static,
+    {
+        let sim_arc = Arc::new(ScriptedSim { action });
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc.clone() as Arc<dyn RapierClusterSimulation>,
+            config,
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = seed_entities.into_iter().collect();
+        step_n(&sim, &mut entities, ticks, CLUSTER_DT);
+        (sim_arc, sim, entities)
+    }
+
+    /// **#121-T1**: `apply_impulse` produces a linvel change of `impulse / mass`.
+    /// With unit-density ball of radius 0.5 (mass ≈ 0.524), an impulse of
+    /// (10, 0, 0) should yield a positive linvel along x. Applied at tick 2
+    /// because the entity is spawned during tick 1's spawn loop, after on_tick.
+    #[test]
+    fn apply_impulse_changes_linvel_proportional_to_impulse_over_mass() {
+        let id = Uuid::from_u128(1);
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                physics.apply_impulse(id, Vec3::new(10.0, 0.0, 0.0));
+            }
+        };
+        let (_sim_arc, _sim, entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            )],
+            2,
+        );
+        // After tick 2, body.linvel reflects the impulse (touched_linvel skip
+        // prevents the per-tick set_linvel sync from clobbering it). For unit-
+        // density ball (mass ≈ 0.524), 10 N·s impulse yields vx ≈ 19.
+        let v = entities.get(&id).unwrap().velocity;
+        assert!(
+            v.x > 5.0,
+            "expected positive x velocity from impulse; got {:?}",
+            v
+        );
+    }
+
+    /// **#121-T2**: `apply_force` sustained over multiple ticks produces
+    /// approximately linear velocity growth (constant acceleration).
+    #[test]
+    fn apply_force_over_multiple_ticks_produces_acceleration() {
+        let id = Uuid::from_u128(1);
+        let action = move |physics: &mut PhysicsHandle, _tick: u64| {
+            physics.apply_force(id, Vec3::new(5.0, 0.0, 0.0));
+        };
+        let (_sim_arc, _sim, entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            )],
+            20,
+        );
+        // After 20 cluster ticks (1 s), constant force should have produced
+        // significant positive velocity along x.
+        let v = entities.get(&id).unwrap().velocity;
+        assert!(
+            v.x > 1.0,
+            "expected positive x velocity from sustained force; got {:?}",
+            v
+        );
+    }
+
+    /// **#121-T3**: `set_translation` teleports the body; the new position
+    /// propagates to `entity.position` via `sync_outputs`.
+    #[test]
+    fn set_translation_teleports_and_propagates_to_entity_position() {
+        let id = Uuid::from_u128(1);
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                physics.set_translation(id, Vec3::new(100.0, 50.0, -25.0));
+            }
+        };
+        let (_sim_arc, _sim, entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            )],
+            3,
+        );
+        let p = entities.get(&id).unwrap().position;
+        assert!(close(p.x, 100.0, 0.5), "x = {}", p.x);
+        assert!(close(p.y, 50.0, 0.5), "y = {}", p.y);
+        assert!(close(p.z, -25.0, 0.5), "z = {}", p.z);
+    }
+
+    /// **#121-T4**: imperative `set_linvel` is NOT clobbered by the per-tick
+    /// `entity.velocity` → `body.linvel` sync. The user wrote `entity.velocity = (1,0,0)`
+    /// before this tick (seeded), but the imperative call overrides to (5,0,0).
+    /// After the step, body's velocity must be the imperative value.
+    #[test]
+    fn set_linvel_imperative_overrides_per_tick_sync() {
+        let id = Uuid::from_u128(1);
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                // entity.velocity is (1,0,0); imperatively force it to (5,0,0).
+                physics.set_linvel(id, Vec3::new(5.0, 0.0, 0.0));
+            }
+        };
+        let (_sim_arc, sim, entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                id,
+                mk_entry(id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+            )],
+            2,
+        );
+        // The body should reflect the imperative linvel post-tick. Sync_outputs
+        // writes body.linvel to entity.velocity at end of tick.
+        let v = entities.get(&id).unwrap().velocity;
+        assert!(
+            close(v.x, 5.0, 0.1),
+            "imperative set_linvel was clobbered; expected vx ≈ 5.0, got {}",
+            v.x
+        );
+        let _ = sim;
+    }
+
+    /// **#121-T5**: `raycast` finds the entity collider in the ray's path and
+    /// returns its `entity_id` plus the time-of-impact / hit point.
+    #[test]
+    fn raycast_hits_collider_in_line() {
+        let target = Uuid::from_u128(7);
+        let result: Arc<Mutex<Option<RaycastHit>>> = Arc::new(Mutex::new(None));
+        let result_clone = result.clone();
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                // Ray from origin shooting +X. Target ball at (10,0,0) radius 0.5.
+                let hit = physics.raycast(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), 20.0);
+                *result_clone.lock().unwrap() = hit;
+            }
+        };
+        let (_sim_arc, _sim, _entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                target,
+                mk_entry(target, Vec3::new(10.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            )],
+            2,
+        );
+        let hit = result
+            .lock()
+            .unwrap()
+            .expect("ray should hit the target collider");
+        assert_eq!(hit.entity_id, target);
+        // Target at x=10, ball radius 0.5 → first hit at x≈9.5.
+        assert!(
+            (hit.time_of_impact - 9.5).abs() < 0.5,
+            "expected toi≈9.5, got {}",
+            hit.time_of_impact
+        );
+    }
+
+    /// **#121-T6**: `raycast` returns `None` when no collider is in the ray's path.
+    #[test]
+    fn raycast_misses_when_no_collider_in_line() {
+        let target = Uuid::from_u128(7);
+        let result: Arc<Mutex<Option<RaycastHit>>> = Arc::new(Mutex::new(None));
+        let recorded: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let result_clone = result.clone();
+        let recorded_clone = recorded.clone();
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                // Target is at +X (10,0,0); ray shoots straight up — should miss.
+                *result_clone.lock().unwrap() =
+                    physics.raycast(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 50.0);
+                *recorded_clone.lock().unwrap() = true;
+            }
+        };
+        let (_sim_arc, _sim, _entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![(
+                target,
+                mk_entry(target, Vec3::new(10.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            )],
+            2,
+        );
+        assert!(*recorded.lock().unwrap(), "raycast call did not happen");
+        assert!(
+            result.lock().unwrap().is_none(),
+            "raycast should miss; got {:?}",
+            result.lock().unwrap()
+        );
+    }
+
+    /// **#121-T7**: `intersections_with_shape` returns the entity ids whose
+    /// colliders overlap a query shape positioned in the world.
+    #[test]
+    fn intersections_with_shape_returns_overlapping_entities() {
+        let near = Uuid::from_u128(1);
+        let far = Uuid::from_u128(2);
+        let result: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
+        let result_clone = result.clone();
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 {
+                // Sphere of radius 5 at origin should hit `near` (at 2,0,0)
+                // and miss `far` (at 100,0,0).
+                let hits = physics.intersections_with_shape(
+                    &RapierColliderShape::Ball(5.0),
+                    Vec3::new(0.0, 0.0, 0.0),
+                );
+                *result_clone.lock().unwrap() = hits;
+            }
+        };
+        let (_sim_arc, _sim, _entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![
+                (
+                    near,
+                    mk_entry(near, Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+                ),
+                (
+                    far,
+                    mk_entry(far, Vec3::new(100.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+                ),
+            ],
+            2,
+        );
+        let hits = result.lock().unwrap();
+        assert!(hits.contains(&near), "near should be hit; got {:?}", hits);
+        assert!(
+            !hits.contains(&far),
+            "far should NOT be hit; got {:?}",
+            hits
+        );
+    }
+
+    /// **#121-T8**: a Fixed joint between two entities holds them at fixed
+    /// relative positions. After many ticks of the second entity having a
+    /// non-zero velocity, the relative offset should be roughly constant.
+    #[test]
+    fn fixed_joint_holds_entities_at_fixed_offset() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let joint_created: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let joint_created_clone = joint_created.clone();
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 2 && !*joint_created_clone.lock().unwrap() {
+                // Anchor at the midpoint between the two bodies (bodies at
+                // distance 2 along x, anchor at +1 in A's frame, -1 in B's frame).
+                let result = physics.create_joint(
+                    a,
+                    b,
+                    JointSpec::Fixed {
+                        local_anchor_a: Vec3::new(1.0, 0.0, 0.0),
+                        local_anchor_b: Vec3::new(-1.0, 0.0, 0.0),
+                    },
+                );
+                assert!(result.is_some(), "create_joint should succeed");
+                *joint_created_clone.lock().unwrap() = true;
+            }
+        };
+        let (_sim_arc, _sim, entities) = run_with_action(
+            RapierConfig::default(),
+            action,
+            vec![
+                (
+                    a,
+                    mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+                ),
+                (
+                    b,
+                    mk_entry(b, Vec3::new(2.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0)),
+                ),
+            ],
+            30,
+        );
+        // Without a joint, b would drift to ~x=3.5 by tick 30 (~1.5s × 1 unit/s, minus
+        // collision contributions). With the joint, a and b should still be ~2 apart.
+        let pa = entities.get(&a).unwrap().position;
+        let pb = entities.get(&b).unwrap().position;
+        let dx = (pb.x - pa.x).abs();
+        assert!(
+            (dx - 2.0).abs() < 0.5,
+            "fixed joint failed: |b.x - a.x| = {} (expected ~2.0)",
+            dx
+        );
+    }
+
+    /// **#121-T9**: when an entity in a joint is despawned, the joint is
+    /// cleaned up automatically. Subsequent `remove_joint` returns `false`.
+    #[test]
+    fn despawn_cleans_up_attached_joints() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let joint_id_holder: Arc<Mutex<Option<JointId>>> = Arc::new(Mutex::new(None));
+        let joint_id_clone = joint_id_holder.clone();
+        let despawn_signal: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let despawn_signal_clone = despawn_signal.clone();
+        let remove_after_despawn_result: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let remove_clone = remove_after_despawn_result.clone();
+
+        struct DespawnSim {
+            a: Uuid,
+            joint_id_holder: Arc<Mutex<Option<JointId>>>,
+            despawn_signal: Arc<Mutex<bool>>,
+            remove_after_despawn_result: Arc<Mutex<Option<bool>>>,
+            other: Uuid,
+        }
+        impl RapierClusterSimulation for DespawnSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                if ctx.tick == 2 {
+                    let id = ctx.physics.create_joint(
+                        self.a,
+                        self.other,
+                        JointSpec::Fixed {
+                            local_anchor_a: Vec3::new(0.5, 0.0, 0.0),
+                            local_anchor_b: Vec3::new(-0.5, 0.0, 0.0),
+                        },
+                    );
+                    *self.joint_id_holder.lock().unwrap() = id;
+                }
+                if ctx.tick == 3 {
+                    ctx.pending_removals.push(self.a);
+                    *self.despawn_signal.lock().unwrap() = true;
+                }
+                if ctx.tick == 5 {
+                    if let Some(j) = *self.joint_id_holder.lock().unwrap() {
+                        let r = ctx.physics.remove_joint(j);
+                        *self.remove_after_despawn_result.lock().unwrap() = Some(r);
+                    }
+                }
+            }
+        }
+
+        let sim_arc = Arc::new(DespawnSim {
+            a,
+            other: b,
+            joint_id_holder: joint_id_clone,
+            despawn_signal: despawn_signal_clone,
+            remove_after_despawn_result: remove_clone,
+        });
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        entities.insert(
+            a,
+            mk_entry(a, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        entities.insert(
+            b,
+            mk_entry(b, Vec3::new(2.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        step_n(&sim, &mut entities, 5, CLUSTER_DT);
+
+        assert!(
+            *despawn_signal.lock().unwrap(),
+            "despawn signal should have fired"
+        );
+        let id = joint_id_holder.lock().unwrap();
+        assert!(id.is_some(), "joint should have been created");
+        let r = remove_after_despawn_result.lock().unwrap();
+        assert_eq!(
+            *r,
+            Some(false),
+            "remove_joint after despawn should return false (joint already gone)"
+        );
+    }
+
+    /// **#121-T10**: operations on a missing `entity_id` return `false` /
+    /// `None` without panicking.
+    #[test]
+    fn operations_on_missing_entity_id_no_panic() {
+        let unknown = Uuid::from_u128(999);
+        let action = move |physics: &mut PhysicsHandle, tick: u64| {
+            if tick == 1 {
+                assert!(!physics.apply_impulse(unknown, Vec3::new(1.0, 0.0, 0.0)));
+                assert!(!physics.apply_force(unknown, Vec3::new(1.0, 0.0, 0.0)));
+                assert!(!physics.apply_torque_impulse(unknown, Vec3::new(1.0, 0.0, 0.0)));
+                assert!(!physics.set_translation(unknown, Vec3::new(0.0, 0.0, 0.0)));
+                assert!(!physics.set_linvel(unknown, Vec3::new(0.0, 0.0, 0.0)));
+                assert!(!physics.set_angvel(unknown, Vec3::new(0.0, 0.0, 0.0)));
+                assert!(physics.linvel(unknown).is_none());
+                assert!(physics.angvel(unknown).is_none());
+                assert!(!physics.wake(unknown));
+                assert!(!physics.sleep(unknown));
+                let joint = physics.create_joint(
+                    unknown,
+                    unknown,
+                    JointSpec::Fixed {
+                        local_anchor_a: Vec3::new(0.0, 0.0, 0.0),
+                        local_anchor_b: Vec3::new(0.0, 0.0, 0.0),
+                    },
+                );
+                assert!(joint.is_none());
+            }
+        };
+        let (_sim_arc, _sim, _entities) =
+            run_with_action(RapierConfig::default(), action, vec![], 1);
+    }
+
+    /// **#121-T11**: imperative ops on a `Fixed` body silently no-op and
+    /// return `false`; the body's state is unchanged.
+    #[test]
+    fn imperative_ops_on_fixed_body_are_no_ops() {
+        let id = Uuid::from_u128(1);
+        let result: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let result_clone = result.clone();
+        struct FixedSim {
+            id: Uuid,
+            result: Arc<Mutex<Vec<bool>>>,
+        }
+        impl RapierClusterSimulation for FixedSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                if ctx.tick == 2 {
+                    let r1 = ctx
+                        .physics
+                        .apply_impulse(self.id, Vec3::new(100.0, 0.0, 0.0));
+                    let r2 = ctx.physics.apply_force(self.id, Vec3::new(100.0, 0.0, 0.0));
+                    let r3 = ctx.physics.set_linvel(self.id, Vec3::new(50.0, 0.0, 0.0));
+                    self.result.lock().unwrap().extend([r1, r2, r3]);
+                }
+            }
+            fn body_kind_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierBodyKind {
+                RapierBodyKind::Fixed
+            }
+        }
+        let sim_arc = Arc::new(FixedSim {
+            id,
+            result: result_clone,
+        });
+        let sim = RapierClusterSim::with_rapier_sim(
+            sim_arc as Arc<dyn RapierClusterSimulation>,
+            RapierConfig::default(),
+        );
+        let mut entities = HashMap::new();
+        let start = Vec3::new(5.0, 5.0, 5.0);
+        entities.insert(id, mk_entry(id, start, Vec3::new(0.0, 0.0, 0.0)));
+        step_n(&sim, &mut entities, 4, CLUSTER_DT);
+
+        // All three imperative ops should have returned false.
+        let results = result.lock().unwrap();
+        assert_eq!(*results, vec![false, false, false]);
+        // Body should not have moved.
+        let p = entities.get(&id).unwrap().position;
+        assert!(close(p.x, start.x, 1e-6) && close(p.y, start.y, 1e-6));
     }
 }

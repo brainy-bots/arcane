@@ -47,9 +47,9 @@ pub use rpc_handler::RpcHandler;
 
 #[cfg(feature = "rapier-cluster")]
 pub use rapier_cluster::{
-    ContactEvent, RapierBodyKind, RapierClusterSim, RapierClusterSimulation,
-    RapierClusterTickContext, RapierColliderShape, RapierCollisionGroups, RapierConfig,
-    RapierMaterial,
+    ContactEvent, JointId, JointSpec, PhysicsHandle, RapierBodyKind, RapierClusterSim,
+    RapierClusterSimulation, RapierClusterTickContext, RapierColliderShape, RapierCollisionGroups,
+    RapierConfig, RapierMaterial, RaycastHit,
 };
 
 // Re-export Rapier's `Group` so users of `RapierCollisionGroups` can construct
