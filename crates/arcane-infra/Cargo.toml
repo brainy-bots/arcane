@@ -8,6 +8,7 @@ description = "Arcane Engine — ClusterManager, ClusterServer, ReplicationChann
 arcane-core = { path = "../arcane-core" }
 arcane-spatial = { path = "../arcane-spatial" }
 arcane-rules = { path = "../arcane-rules" }
+arcane-affinity = { path = "../arcane-affinity", optional = true }
 arcane-pool = { path = "../arcane-pool" }
 arcane-wire = { path = "../arcane-wire" }
 axum = { version = "0.7", optional = true }
@@ -27,6 +28,7 @@ default = ["cluster-ws"]
 manager = ["dep:axum", "dep:tokio"]
 cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon"]
 spacetimedb-persist = ["dep:reqwest"]
+affinity-clustering = ["dep:arcane-affinity"]
 rapier-cluster = ["cluster-ws", "dep:rapier3d"]
 
 [[bin]]
