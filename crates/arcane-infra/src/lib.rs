@@ -47,6 +47,12 @@ pub use rpc_handler::RpcHandler;
 
 #[cfg(feature = "rapier-cluster")]
 pub use rapier_cluster::{
-    ContactEvent, RapierClusterSim, RapierClusterSimulation, RapierClusterTickContext,
-    RapierColliderShape, RapierConfig,
+    ContactEvent, RapierBodyKind, RapierClusterSim, RapierClusterSimulation,
+    RapierClusterTickContext, RapierColliderShape, RapierCollisionGroups, RapierConfig,
+    RapierMaterial,
 };
+
+// Re-export Rapier's `Group` so users of `RapierCollisionGroups` can construct
+// memberships/filter values without depending on rapier3d directly.
+#[cfg(feature = "rapier-cluster")]
+pub use rapier3d::geometry::Group;
