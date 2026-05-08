@@ -72,6 +72,16 @@ python arcane-vault-builder.py --confirm  # full build (~$10, ~20 min)
 
 Intermediate results are cached in `.vault-build/` (gitignored). Re-runs skip already-processed files.
 
+## Star History
+
+<a href="https://www.star-history.com/#brainy-bots/arcane&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=brainy-bots/arcane&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=brainy-bots/arcane&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=brainy-bots/arcane&type=Date" width="600" />
+ </picture>
+</a>
+
 ## License
 
 Arcane is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](LICENSE) for the full text.
