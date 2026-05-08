@@ -1,0 +1,39 @@
+name: Claude on labeled issue
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  claude:
+    if: github.event.label.name == 'claude-ready'
+
+    concurrency:
+      group: worker-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          allowed_bots: '*'
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--model haiku --dangerously-skip-permissions"
+          settings: '{"advisorModel": "opus"}'
+          prompt: |
+            Issue: #${{ github.event.issue.number }} — "${{ github.event.issue.title }}"
+            Repo: ${{ github.repository }}
+            Sender that triggered this: ${{ github.event.sender.login }}
+
+            Issue body:
+            ${{ github.event.issue.body }}
+
+            Run /arcane-worker. Determine mode (fresh / continue / blocker) from the issue body and current PR state per the skill's mode router, then execute that mode's playbook from `.claude/skills/arcane-worker/modes/`. Read references in `.claude/skills/arcane-worker/references/` as needed.

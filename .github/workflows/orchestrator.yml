@@ -1,0 +1,61 @@
+name: Orchestrator
+on:
+  issues:
+    types: [labeled, unlabeled]
+  pull_request:
+    types: [opened, ready_for_review, closed, synchronize]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+jobs:
+  orchestrate:
+    if: |
+      (
+        github.event.pull_request != null
+        && startsWith(github.event.pull_request.base.ref, 'epic/')
+      )
+      || (
+        github.event.label != null
+        && contains(fromJSON('["orchestration-active","claude-working","claude-ready","action-required","unblock","awaiting-founder-review","failed-attempt","restart-epic"]'), github.event.label.name)
+      )
+      || (
+        github.event.comment != null
+        && (
+          startsWith(github.event.comment.body, 'BLOCKER from sub-issue #')
+          || contains(github.event.issue.labels.*.name, 'orchestration-active')
+          || contains(github.event.pull_request.labels.*.name, 'orchestration-active')
+        )
+      )
+
+    concurrency:
+      group: orchestrator-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          allowed_bots: '*'
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: "--model sonnet --dangerously-skip-permissions"
+          settings: '{"advisorModel": "opus"}'
+          prompt: |
+            Event: ${{ github.event_name }} / ${{ github.event.action }}
+            Repo: ${{ github.repository }}
+            Issue: #${{ github.event.issue.number }}
+            PR: #${{ github.event.pull_request.number }}
+            Base ref: ${{ github.event.pull_request.base.ref }}
+            Sender: ${{ github.event.sender.login }}
+
+            Run /arcane-orchestrator to route this event. Walk the decision tree top-to-bottom, execute the first matching situation's playbook from `.claude/skills/arcane-orchestrator/situations/`, and stop after one action. Read the references in `.claude/skills/arcane-orchestrator/references/` as needed.
