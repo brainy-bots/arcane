@@ -7,7 +7,7 @@ This is the standard "implement the issue, open a PR" path. **Two branches matte
 - `$TARGET_BRANCH` — what your PR's `--base` is (epic branch for sub-issues; `main` for standalone). Resolved by SKILL.md mode router; do not alter.
 - `$WORKER_BRANCH` — what your PR's `--head` is. A new branch you create off `$TARGET_BRANCH` to do this issue's work. The worker convention is `feat/issue-<N>-<short-slug>` (or `fix/issue-<N>-<slug>` if it's a bug). The orchestrator's stuck-worker detection (`Situation 6`) and merge logic recognize this naming.
 
-The workflow's `actions/checkout@v4` step has already cloned the repo at the default branch HEAD; you have a working tree.
+You have an active working tree (either a GitHub Actions checkout or a local git worktree created by the orchestrator daemon). The repo is cloned, git is configured, and `gh` is authenticated — commit, push, and open PRs as normal.
 
 ## Steps
 
