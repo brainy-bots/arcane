@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 
 use arcane_core::cluster_simulation::{ClusterSimulation, GameAction};
+use arcane_core::physics_events::PhysicsEventBatch;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -23,6 +24,8 @@ use uuid::Uuid;
 use crate::cluster_stats::{serve_stats_http, ClusterStats};
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
+#[cfg(feature = "cluster-ws")]
+use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 #[cfg(feature = "spacetimedb-persist")]
 use crate::spacetimedb_persist::SpacetimeDbPersist;
 use crate::{ClusterServer, ReplicationChannelManager};
@@ -152,6 +155,11 @@ where
     let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
     let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
 
+    let (physics_events_tx, physics_events_rx) = std::sync::mpsc::channel::<PhysicsEventBatch>();
+    spawn_physics_events_subscriber(redis_url.clone(), cluster_id, physics_events_tx);
+    let physics_publisher = PhysicsEventsPublisher::new(&redis_url)
+        .map_err(|e| format!("physics events publisher: {}", e))?;
+
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     eprintln!(
         "arcane-cluster started cluster_id={} neighbors={} tick_rate={}Hz",
@@ -201,6 +209,17 @@ where
         while let Ok(action) = game_actions_rx.try_recv() {
             tick_actions.push(action);
         }
+        // Drain inbound physics events and deliver to the simulation.
+        let mut inbound_physics: Vec<PhysicsEventBatch> = Vec::new();
+        while let Ok(batch) = physics_events_rx.try_recv() {
+            inbound_physics.push(batch);
+        }
+        if let Some(ref sim) = simulation {
+            if !inbound_physics.is_empty() {
+                sim.apply_inbound_physics_events(inbound_physics);
+            }
+        }
+
         let tick_start = Instant::now();
         let upcoming_tick = server.current_tick() + 1;
         server.simulate_before_tick(
@@ -210,6 +229,17 @@ where
             &tick_actions,
             &neighbor_entities,
         );
+
+        // Drain routed physics ops and publish to neighbor clusters.
+        if let Some(ref sim) = simulation {
+            let routed = sim.drain_routed_physics_ops();
+            if !routed.is_empty() {
+                if let Err(e) = physics_publisher.publish(cluster_id, routed) {
+                    eprintln!("physics events publish error: {}", e);
+                }
+            }
+        }
+
         let our_delta = server.tick();
         let tick_elapsed = tick_start.elapsed();
         let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
