@@ -169,7 +169,7 @@ where
             for entity in bootstrap_entities {
                 neighbor_latest
                     .entry(entity.cluster_id)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(entity);
             }
             if entity_count > 0 {

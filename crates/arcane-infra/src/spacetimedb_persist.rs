@@ -252,8 +252,8 @@ impl SpacetimeDbPersist {
         if cluster_ids.is_empty() {
             return Vec::new();
         }
-        let uri = uri.unwrap_or_else(|| "http://127.0.0.1:3000");
-        let db = db.unwrap_or_else(|| "arcane");
+        let uri = uri.unwrap_or("http://127.0.0.1:3000");
+        let db = db.unwrap_or("arcane");
         let url = format!(
             "{}/v1/database/{}/tables/Entity",
             uri.trim_end_matches('/'),
