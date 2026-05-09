@@ -31,6 +31,8 @@ pub mod cluster_runner;
 #[cfg(feature = "cluster-ws")]
 pub mod cluster_stats;
 #[cfg(feature = "cluster-ws")]
+pub mod physics_events_channel;
+#[cfg(feature = "cluster-ws")]
 pub mod ws_server;
 
 #[cfg(feature = "rapier-cluster")]
@@ -38,6 +40,10 @@ pub mod rapier_cluster;
 
 #[cfg(feature = "cluster-ws")]
 pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
+#[cfg(feature = "cluster-ws")]
+pub use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp};
+#[cfg(feature = "cluster-ws")]
+pub use physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 
 pub use cluster_manager::ClusterManager;
 pub use cluster_server::ClusterServer;

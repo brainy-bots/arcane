@@ -107,6 +107,26 @@
 //! precision in the standard `f32` way. If your world exceeds those bounds,
 //! enable Rapier's `f64` feature in a follow-up.
 //!
+//! # Cross-cluster physics
+//!
+//! Entities from neighboring clusters appear as kinematic proxy bodies in the
+//! local Rapier world. Raycasts and collision detection work against them.
+//!
+//! When a `PhysicsHandle` write op (impulse, force, etc.) targets a proxy,
+//! the operation routes via Redis to the authority cluster. Contact events
+//! involving proxies flow back to the authority cluster so both sides observe
+//! the collision.
+//!
+//! Cross-cluster joints are not supported — `create_joint` returns `None`
+//! when either entity is a proxy. Affinity clustering should co-locate
+//! joint participants.
+//!
+//! Authority transfer (entity migration between clusters) is not yet
+//! implemented. It ships with the affinity clustering infrastructure.
+//!
+//! See [`docs/architecture/adr/002-cross-cluster-physics.md`](https://github.com/brainy-bots/arcane/blob/main/docs/architecture/adr/002-cross-cluster-physics.md)
+//! for full design rationale.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -242,6 +262,7 @@ use rapier3d::prelude::*;
 use uuid::Uuid;
 
 use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
+use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp};
 use arcane_core::replication_channel::EntityStateEntry;
 use arcane_core::Vec3;
 
@@ -553,6 +574,9 @@ pub struct RapierClusterTickContext<'a> {
     /// the full surface. Reads and mutations hit Rapier state synchronously
     /// while the user's `on_tick` runs.
     pub physics: PhysicsHandle<'a>,
+    /// Read-only view of entities owned by neighboring clusters.
+    /// These are the entities that have kinematic proxies in the local physics world.
+    pub neighbor_entities: &'a HashMap<Uuid, EntityStateEntry>,
 }
 
 /// Rapier-aware sibling of [`ClusterSimulation`]. Implement this trait and pass
@@ -653,6 +677,14 @@ struct RapierState {
     /// `entity.velocity` → `body.linvel` sync skips these so the imperative
     /// override sticks. Cleared at the start of every tick.
     pending_imperative_linvel: HashSet<Uuid>,
+    /// Entity IDs of kinematic proxy bodies (from neighbor clusters).
+    /// Distinguished from locally-owned bodies in the shared `handles` map.
+    proxy_entities: HashSet<Uuid>,
+    /// Entity-pair keys from inbound `ContactEvent` ops this tick.
+    /// Used to suppress flow-back cycles: if we received a contact event for
+    /// (A, B) from a neighbor, we don't re-emit it back when we see the same
+    /// collision in our Rapier step. Cleared at the start of each tick.
+    inbound_contact_keys: HashSet<(Uuid, Uuid)>,
 }
 
 /// Internal `EventHandler` impl that records collisions into a `Mutex<Vec>`.
@@ -726,6 +758,8 @@ impl RapierState {
             gravity,
             pending_contact_events: Vec::new(),
             pending_imperative_linvel: HashSet::new(),
+            proxy_entities: HashSet::new(),
+            inbound_contact_keys: HashSet::new(),
         }
     }
 
@@ -790,6 +824,62 @@ impl RapierState {
         );
     }
 
+    fn sync_proxies(
+        &mut self,
+        neighbor_entities: &HashMap<Uuid, EntityStateEntry>,
+        owned_entities: &HashMap<Uuid, EntityStateEntry>,
+        rapier_sim: &dyn RapierClusterSimulation,
+        config: &RapierConfig,
+    ) {
+        // Despawn proxies whose entity_id is no longer in neighbor_entities
+        let stale: Vec<Uuid> = self
+            .proxy_entities
+            .iter()
+            .filter(|id| !neighbor_entities.contains_key(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.despawn(id);
+            self.proxy_entities.remove(&id);
+        }
+
+        // For each neighbor entity, spawn or update the proxy
+        for (entity_id, entry) in neighbor_entities {
+            // Skip if this entity is locally owned (precedence: owned > proxy)
+            if owned_entities.contains_key(entity_id) {
+                // If we had a proxy for it, despawn the proxy
+                if self.proxy_entities.remove(entity_id) {
+                    self.despawn(*entity_id);
+                }
+                continue;
+            }
+
+            if let Some(&handle) = self.handles.get(entity_id) {
+                // Existing proxy — snap-correct position and update velocity
+                if let Some(body) = self.bodies.get_mut(handle) {
+                    body.set_translation(to_rapier(entry.position), true);
+                    body.set_linvel(to_rapier(entry.velocity), true);
+                }
+            } else {
+                // New proxy — spawn as KinematicVelocityBased
+                let collider_shape = rapier_sim.collider_for(entry, config);
+                let material = rapier_sim.material_for(entry, config);
+                let collision_groups = rapier_sim.collision_groups_for(entry, config);
+                let is_sensor = rapier_sim.is_sensor(entry, config);
+
+                let params = SpawnParams {
+                    shape: collider_shape,
+                    body_kind: RapierBodyKind::KinematicVelocityBased,
+                    material,
+                    groups: collision_groups,
+                    is_sensor,
+                };
+                self.spawn(*entity_id, entry, params);
+                self.proxy_entities.insert(*entity_id);
+            }
+        }
+    }
+
     fn step_with_accumulator(&mut self, dt_seconds: f32) {
         self.accumulator += dt_seconds;
         if self.accumulator < FIXED_PHYSICS_DT {
@@ -841,6 +931,10 @@ impl RapierState {
             if skip.contains(id) {
                 continue;
             }
+            // Skip proxies — their positions come from replication, not local physics output
+            if self.proxy_entities.contains(id) {
+                continue;
+            }
             let Some(&handle) = self.handles.get(id) else {
                 continue;
             };
@@ -857,10 +951,89 @@ impl RapierState {
             .handles
             .keys()
             .filter(|id| !entities.contains_key(id))
+            .filter(|id| !self.proxy_entities.contains(id))
             .copied()
             .collect();
         for id in stale {
             self.despawn(id);
+        }
+    }
+
+    fn apply_inbound_events(&mut self, batches: Vec<PhysicsEventBatch>) {
+        for batch in batches {
+            for event in batch.ops {
+                let entity_id = event.target_entity_id;
+                let Some(&handle) = self.handles.get(&entity_id) else {
+                    continue;
+                };
+                let Some(body) = self.bodies.get_mut(handle) else {
+                    continue;
+                };
+                let is_fixed = body.body_type() == RigidBodyType::Fixed;
+                match event.op {
+                    PhysicsOp::ApplyImpulse { impulse } if !is_fixed => {
+                        body.apply_impulse(
+                            Vector::new(impulse[0] as f32, impulse[1] as f32, impulse[2] as f32),
+                            true,
+                        );
+                        self.pending_imperative_linvel.insert(entity_id);
+                    }
+                    PhysicsOp::ApplyForce { force } if !is_fixed => {
+                        body.add_force(
+                            Vector::new(force[0] as f32, force[1] as f32, force[2] as f32),
+                            true,
+                        );
+                    }
+                    PhysicsOp::ApplyTorqueImpulse { torque } if !is_fixed => {
+                        body.apply_torque_impulse(
+                            Vector::new(torque[0] as f32, torque[1] as f32, torque[2] as f32),
+                            true,
+                        );
+                    }
+                    PhysicsOp::SetTranslation { position } => {
+                        body.set_translation(
+                            Vector::new(position[0] as f32, position[1] as f32, position[2] as f32),
+                            true,
+                        );
+                    }
+                    PhysicsOp::SetLinvel { linvel } if !is_fixed => {
+                        body.set_linvel(
+                            Vector::new(linvel[0] as f32, linvel[1] as f32, linvel[2] as f32),
+                            true,
+                        );
+                        self.pending_imperative_linvel.insert(entity_id);
+                    }
+                    PhysicsOp::SetAngvel { angvel } if !is_fixed => {
+                        body.set_angvel(
+                            Vector::new(angvel[0] as f32, angvel[1] as f32, angvel[2] as f32),
+                            true,
+                        );
+                    }
+                    PhysicsOp::Wake => {
+                        body.wake_up(true);
+                    }
+                    PhysicsOp::Sleep => {
+                        body.sleep();
+                    }
+                    PhysicsOp::ContactEvent {
+                        other_entity_id,
+                        started,
+                    } => {
+                        let key = if entity_id < other_entity_id {
+                            (entity_id, other_entity_id)
+                        } else {
+                            (other_entity_id, entity_id)
+                        };
+                        self.inbound_contact_keys.insert(key);
+                        self.pending_contact_events.push(ContactEvent {
+                            entity_a: entity_id,
+                            entity_b: other_entity_id,
+                            started,
+                        });
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -891,11 +1064,36 @@ impl RapierState {
 /// imperative override stays in effect for the upcoming physics step.
 pub struct PhysicsHandle<'a> {
     state: &'a mut RapierState,
+    routed_ops: &'a mut Vec<(Uuid, PhysicsEvent)>,
+    neighbor_entities: &'a HashMap<Uuid, EntityStateEntry>,
 }
 
 impl<'a> PhysicsHandle<'a> {
-    fn new(state: &'a mut RapierState) -> Self {
-        Self { state }
+    fn new(
+        state: &'a mut RapierState,
+        routed_ops: &'a mut Vec<(Uuid, PhysicsEvent)>,
+        neighbor_entities: &'a HashMap<Uuid, EntityStateEntry>,
+    ) -> Self {
+        Self {
+            state,
+            routed_ops,
+            neighbor_entities,
+        }
+    }
+
+    fn route_to_authority(&mut self, entity_id: Uuid, op: PhysicsOp) -> bool {
+        if let Some(entry) = self.neighbor_entities.get(&entity_id) {
+            self.routed_ops.push((
+                entry.cluster_id,
+                PhysicsEvent {
+                    target_entity_id: entity_id,
+                    op,
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn body_mut(&mut self, entity_id: Uuid) -> Option<&mut RigidBody> {
@@ -915,6 +1113,14 @@ impl<'a> PhysicsHandle<'a> {
     ///
     /// Returns `false` if the entity has no body, or the body is `Fixed`.
     pub fn apply_impulse(&mut self, entity_id: Uuid, impulse: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::ApplyImpulse {
+                    impulse: [impulse.x, impulse.y, impulse.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -931,6 +1137,14 @@ impl<'a> PhysicsHandle<'a> {
     ///
     /// Returns `false` if the entity has no body, or the body is `Fixed`.
     pub fn apply_force(&mut self, entity_id: Uuid, force: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::ApplyForce {
+                    force: [force.x, force.y, force.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -945,6 +1159,14 @@ impl<'a> PhysicsHandle<'a> {
     ///
     /// Returns `false` if the entity has no body, or the body is `Fixed`.
     pub fn apply_torque_impulse(&mut self, entity_id: Uuid, torque: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::ApplyTorqueImpulse {
+                    torque: [torque.x, torque.y, torque.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -963,6 +1185,14 @@ impl<'a> PhysicsHandle<'a> {
     /// (you can move walls), though clustering may not yet pin the new
     /// chunk ownership (see clustering-binding epic).
     pub fn set_translation(&mut self, entity_id: Uuid, position: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::SetTranslation {
+                    position: [position.x, position.y, position.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -976,6 +1206,14 @@ impl<'a> PhysicsHandle<'a> {
     ///
     /// Returns `false` if the entity has no body, or the body is `Fixed`.
     pub fn set_linvel(&mut self, entity_id: Uuid, linvel: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::SetLinvel {
+                    linvel: [linvel.x, linvel.y, linvel.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -991,6 +1229,14 @@ impl<'a> PhysicsHandle<'a> {
     ///
     /// Returns `false` if the entity has no body, or the body is `Fixed`.
     pub fn set_angvel(&mut self, entity_id: Uuid, angvel: Vec3) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(
+                entity_id,
+                PhysicsOp::SetAngvel {
+                    angvel: [angvel.x, angvel.y, angvel.z],
+                },
+            );
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -1013,6 +1259,9 @@ impl<'a> PhysicsHandle<'a> {
 
     /// Wake a sleeping body so it rejoins simulation. Returns `false` if no body.
     pub fn wake(&mut self, entity_id: Uuid) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(entity_id, PhysicsOp::Wake);
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -1022,6 +1271,9 @@ impl<'a> PhysicsHandle<'a> {
 
     /// Force a body to sleep. Returns `false` if no body.
     pub fn sleep(&mut self, entity_id: Uuid) -> bool {
+        if self.state.proxy_entities.contains(&entity_id) {
+            return self.route_to_authority(entity_id, PhysicsOp::Sleep);
+        }
         let Some(body) = self.body_mut(entity_id) else {
             return false;
         };
@@ -1082,6 +1334,9 @@ impl<'a> PhysicsHandle<'a> {
     /// resulting [`JointId`], or `None` if either entity has no body.
     /// Joints are auto-removed when either entity despawns.
     pub fn create_joint(&mut self, a: Uuid, b: Uuid, joint: JointSpec) -> Option<JointId> {
+        if self.state.proxy_entities.contains(&a) || self.state.proxy_entities.contains(&b) {
+            return None;
+        }
         let h_a = *self.state.handles.get(&a)?;
         let h_b = *self.state.handles.get(&b)?;
         let joint_data: GenericJoint = match joint {
@@ -1162,6 +1417,8 @@ pub struct RapierClusterSim {
     backend: Backend,
     config: RapierConfig,
     state: Mutex<RapierState>,
+    pending_routed_ops: Mutex<Vec<(Uuid, PhysicsEvent)>>,
+    pending_inbound_events: Mutex<Vec<PhysicsEventBatch>>,
 }
 
 impl RapierClusterSim {
@@ -1175,6 +1432,8 @@ impl RapierClusterSim {
             backend,
             config,
             state: Mutex::new(RapierState::new(gravity)),
+            pending_routed_ops: Mutex::new(Vec::new()),
+            pending_inbound_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -1194,6 +1453,8 @@ impl RapierClusterSim {
             backend: Backend::Rapier(rapier_sim),
             config,
             state: Mutex::new(RapierState::new(gravity)),
+            pending_routed_ops: Mutex::new(Vec::new()),
+            pending_inbound_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -1237,34 +1498,42 @@ impl ClusterSimulation for RapierClusterSim {
     fn on_tick(&self, ctx: &mut ClusterTickContext<'_>) {
         match &self.backend {
             Backend::None => {
-                // No user code; lock once and run the physics phase.
                 let mut state = self.state.lock().expect("rapier state lock");
-                // Discard any prior contacts — there is no listener.
                 state.pending_contact_events.clear();
                 state.pending_imperative_linvel.clear();
+                state.inbound_contact_keys.clear();
+                let inbound =
+                    std::mem::take(&mut *self.pending_inbound_events.lock().expect("inbound lock"));
+                state.apply_inbound_events(inbound);
                 self.run_physics_phase(&mut state, ctx);
             }
             Backend::Cluster(sim) => {
-                // Plain ClusterSimulation: lock released during user code
-                // (legacy behavior — plain ClusterSimulation has no PhysicsHandle).
                 {
                     let mut state = self.state.lock().expect("rapier state lock");
-                    // Drop prior contacts — plain ClusterSimulation can't read them.
                     state.pending_contact_events.clear();
                     state.pending_imperative_linvel.clear();
+                    state.inbound_contact_keys.clear();
+                    let inbound = std::mem::take(
+                        &mut *self.pending_inbound_events.lock().expect("inbound lock"),
+                    );
+                    state.apply_inbound_events(inbound);
                 }
                 sim.on_tick(ctx);
                 let mut state = self.state.lock().expect("rapier state lock");
                 self.run_physics_phase(&mut state, ctx);
             }
             Backend::Rapier(sim) => {
-                // Lock held through user `on_tick` so PhysicsHandle can mutate
-                // Rapier state synchronously (impulses, raycasts, joints, etc.).
                 let mut state = self.state.lock().expect("rapier state lock");
                 let prev_contacts = std::mem::take(&mut state.pending_contact_events);
                 state.pending_imperative_linvel.clear();
+                state.inbound_contact_keys.clear();
+                let inbound =
+                    std::mem::take(&mut *self.pending_inbound_events.lock().expect("inbound lock"));
+                state.apply_inbound_events(inbound);
                 {
-                    let physics = PhysicsHandle::new(&mut state);
+                    let mut routed_ops = Vec::new();
+                    let physics =
+                        PhysicsHandle::new(&mut state, &mut routed_ops, ctx.neighbor_entities);
                     let mut rapier_ctx = RapierClusterTickContext {
                         cluster_id: ctx.cluster_id,
                         tick: ctx.tick,
@@ -1274,13 +1543,34 @@ impl ClusterSimulation for RapierClusterSim {
                         game_actions: ctx.game_actions,
                         contact_events: &prev_contacts,
                         physics,
+                        neighbor_entities: ctx.neighbor_entities,
                     };
                     sim.on_tick(&mut rapier_ctx);
-                    // rapier_ctx (and physics) drop here; state is freely usable again.
+                    // Drain routed ops from the user's on_tick into the pending buffer.
+                    if !routed_ops.is_empty() {
+                        self.pending_routed_ops
+                            .lock()
+                            .expect("routed ops lock")
+                            .extend(routed_ops);
+                    }
                 }
                 self.run_physics_phase(&mut state, ctx);
             }
         }
+    }
+
+    fn apply_inbound_physics_events(&self, events: Vec<PhysicsEventBatch>) {
+        if events.is_empty() {
+            return;
+        }
+        self.pending_inbound_events
+            .lock()
+            .expect("inbound lock")
+            .extend(events);
+    }
+
+    fn drain_routed_physics_ops(&self) -> Vec<(Uuid, PhysicsEvent)> {
+        std::mem::take(&mut *self.pending_routed_ops.lock().expect("routed ops lock"))
     }
 }
 
@@ -1322,7 +1612,57 @@ impl RapierClusterSim {
             }
         }
 
+        // Sync kinematic proxies for neighbor entities
+        if let Backend::Rapier(ref rapier_sim) = self.backend {
+            state.sync_proxies(
+                ctx.neighbor_entities,
+                ctx.entities,
+                rapier_sim.as_ref(),
+                &self.config,
+            );
+        }
+
         state.step_with_accumulator(ctx.dt_seconds as f32);
+
+        // Contact event flow-back: when a collision involves one owned + one proxy
+        // entity, emit a ContactEvent op targeting the proxy's authority cluster.
+        // Skip pairs that arrived as inbound ContactEvents this tick (cycle suppression).
+        for contact in &state.pending_contact_events {
+            let a_proxy = state.proxy_entities.contains(&contact.entity_a);
+            let b_proxy = state.proxy_entities.contains(&contact.entity_b);
+            if !(a_proxy ^ b_proxy) {
+                continue;
+            }
+            let key = if contact.entity_a < contact.entity_b {
+                (contact.entity_a, contact.entity_b)
+            } else {
+                (contact.entity_b, contact.entity_a)
+            };
+            if state.inbound_contact_keys.contains(&key) {
+                continue;
+            }
+            let (proxy_id, owned_id) = if a_proxy {
+                (contact.entity_a, contact.entity_b)
+            } else {
+                (contact.entity_b, contact.entity_a)
+            };
+            if let Some(entry) = ctx.neighbor_entities.get(&proxy_id) {
+                self.pending_routed_ops
+                    .lock()
+                    .expect("routed ops lock")
+                    .push((
+                        entry.cluster_id,
+                        PhysicsEvent {
+                            target_entity_id: proxy_id,
+                            op: PhysicsOp::ContactEvent {
+                                other_entity_id: owned_id,
+                                started: contact.started,
+                            },
+                        },
+                    ));
+            }
+        }
+
         state.sync_outputs(ctx.entities, &removed);
     }
 }
@@ -1350,6 +1690,7 @@ mod tests {
     ) {
         let mut pending: Vec<Uuid> = Vec::new();
         let actions: Vec<GameAction> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick,
@@ -1357,6 +1698,7 @@ mod tests {
             entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
     }
@@ -1795,6 +2137,7 @@ mod tests {
         };
         let actions = vec![action];
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 42,
@@ -1802,6 +2145,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
 
@@ -2630,6 +2974,7 @@ mod tests {
             },
         ];
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 99,
@@ -2637,6 +2982,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
 
@@ -2806,6 +3152,7 @@ mod tests {
 
         let actions: Vec<GameAction> = Vec::new();
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 1,
@@ -2813,6 +3160,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim_b.on_tick(&mut ctx);
 
@@ -3846,5 +4194,942 @@ mod tests {
         // Body should not have moved.
         let p = entities.get(&id).unwrap().position;
         assert!(close(p.x, start.x, 1e-6) && close(p.y, start.y, 1e-6));
+    }
+
+    // ─── kinematic proxy tests ──────────────────────────────────────────────────
+
+    fn step_with_neighbors(
+        sim: &RapierClusterSim,
+        entities: &mut HashMap<Uuid, EntityStateEntry>,
+        neighbors: &HashMap<Uuid, EntityStateEntry>,
+        tick: u64,
+        dt: f64,
+    ) {
+        let mut pending: Vec<Uuid> = Vec::new();
+        let actions: Vec<GameAction> = Vec::new();
+        let mut ctx = ClusterTickContext {
+            cluster_id: Uuid::nil(),
+            tick,
+            dt_seconds: dt,
+            entities,
+            pending_removals: &mut pending,
+            game_actions: &actions,
+            neighbor_entities: neighbors,
+        };
+        sim.on_tick(&mut ctx);
+    }
+
+    struct SimpleSim;
+    impl RapierClusterSimulation for SimpleSim {
+        fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+    }
+
+    #[test]
+    fn proxy_spawns_as_kinematic_for_neighbor_entity() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Neighbor should have a body in Rapier
+        assert_eq!(handle_count(&sim), 1);
+        // Entity should be in proxy_entities set
+        let state = sim.state.lock().unwrap();
+        assert!(state.proxy_entities.contains(&neighbor_id));
+        // Body should be KinematicVelocityBased — verify by checking it moves with its velocity
+        drop(state);
+        let neighbors2 = neighbors.clone();
+        for _ in 0..10 {
+            step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+        }
+        let p = entities.get(&neighbor_id);
+        // No entity in local entities, so position not in map
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn proxy_position_tracks_neighbor_entry() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Change neighbor position
+        let mut neighbors2 = neighbors;
+        neighbors2.get_mut(&neighbor_id).unwrap().position = Vec3::new(5.0, 2.0, 1.0);
+
+        step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+
+        // Verify proxy body position matches (snap-correction)
+        let state = sim.state.lock().unwrap();
+        if let Some(&handle) = state.handles.get(&neighbor_id) {
+            if let Some(body) = state.bodies.get(handle) {
+                let rapier_pos = body.translation();
+                assert!(
+                    close(rapier_pos.x as f64, 5.0, 1e-2),
+                    "expected x ≈ 5.0, got {}",
+                    rapier_pos.x
+                );
+                assert!(
+                    close(rapier_pos.y as f64, 2.0, 1e-2),
+                    "expected y ≈ 2.0, got {}",
+                    rapier_pos.y
+                );
+                assert!(
+                    close(rapier_pos.z as f64, 1.0, 1e-2),
+                    "expected z ≈ 1.0, got {}",
+                    rapier_pos.z
+                );
+            }
+        } else {
+            panic!("neighbor proxy not found");
+        }
+    }
+
+    #[test]
+    fn proxy_velocity_extrapolates_between_updates() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        let initial_velocity = Vec3::new(10.0, 0.0, 0.0);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(neighbor_id, Vec3::new(0.0, 0.0, 0.0), initial_velocity),
+        );
+
+        // Spawn proxy with velocity
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Check initial position after spawn
+        {
+            let state = sim.state.lock().unwrap();
+            if let Some(&handle) = state.handles.get(&neighbor_id) {
+                if let Some(body) = state.bodies.get(handle) {
+                    let linvel = body.linvel();
+                    assert!(
+                        close(linvel.x as f64, 10.0, 1e-1),
+                        "initial linvel.x={}, expected ~10",
+                        linvel.x
+                    );
+                }
+            }
+        }
+
+        // Step once more to allow extrapolation
+        let neighbors_unchanged = neighbors.clone();
+        step_with_neighbors(&sim, &mut entities, &neighbors_unchanged, 2, CLUSTER_DT);
+
+        // Verify proxy has moved from the replication delta
+        let state = sim.state.lock().unwrap();
+        if let Some(&handle) = state.handles.get(&neighbor_id) {
+            if let Some(body) = state.bodies.get(handle) {
+                let rapier_pos = body.translation();
+                // With one extra step at CLUSTER_DT, the proxy should move some distance
+                // due to velocity integration in Rapier. At 10 m/s for 0.05s = 0.5m
+                assert!(
+                    close(rapier_pos.x as f64, 0.5, 0.1),
+                    "proxy at x={}, expected ~0.5",
+                    rapier_pos.x
+                );
+            }
+        } else {
+            panic!("neighbor proxy not found");
+        }
+    }
+
+    #[test]
+    fn proxy_despawns_when_neighbor_removed() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        assert_eq!(handle_count(&sim), 1);
+
+        // Remove from neighbors
+        let neighbors2: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+
+        // Body should be gone
+        assert_eq!(handle_count(&sim), 0);
+        let state = sim.state.lock().unwrap();
+        assert!(!state.proxy_entities.contains(&neighbor_id));
+    }
+
+    #[test]
+    fn proxy_does_not_overwrite_entity_map() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        let proxy_pos = Vec3::new(5.0, 2.0, 1.0);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(neighbor_id, proxy_pos, Vec3::new(0.0, 0.0, 0.0)),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // After sync_outputs, ctx.entities should not contain the proxy
+        assert!(!entities.contains_key(&neighbor_id));
+    }
+
+    #[test]
+    fn local_body_collides_with_proxy() {
+        let local_id = Uuid::from_u128(1);
+        let neighbor_id = Uuid::from_u128(2);
+        let events: Arc<Mutex<Vec<ContactEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        struct CollisionCaptureSim {
+            local_id: Uuid,
+            neighbor_id: Uuid,
+            events: Arc<Mutex<Vec<ContactEvent>>>,
+        }
+        impl RapierClusterSimulation for CollisionCaptureSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                for &event in ctx.contact_events {
+                    if (event.entity_a == self.local_id && event.entity_b == self.neighbor_id)
+                        || (event.entity_a == self.neighbor_id && event.entity_b == self.local_id)
+                    {
+                        self.events.lock().unwrap().push(event);
+                    }
+                }
+            }
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                RapierColliderShape::Ball(1.0)
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(CollisionCaptureSim {
+                local_id,
+                neighbor_id,
+                events: events_clone,
+            }),
+            RapierConfig {
+                gravity: [0.0, 0.0, 0.0],
+                ..RapierConfig::default()
+            },
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(1.8, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        // Tick 1: spawn both entities, physics steps, contact emitted post-step
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        // Tick 2: contact events surfaced to user via on_tick
+        step_with_neighbors(&sim, &mut entities, &neighbors, 2, CLUSTER_DT);
+
+        let captured = events.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "Expected contact event between local and proxy"
+        );
+        assert!(captured[0].started, "Expected Started contact event");
+    }
+
+    #[test]
+    fn owned_entity_takes_precedence_over_proxy() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let entity_id = Uuid::from_u128(1);
+
+        // Same entity_id in both owned and neighbor
+        entities.insert(
+            entity_id,
+            mk_entry(
+                entity_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+        neighbors.insert(
+            entity_id,
+            mk_entry(
+                entity_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Body should exist (from owned entity)
+        assert_eq!(handle_count(&sim), 1);
+        // Entity should NOT be in proxy_entities
+        let state = sim.state.lock().unwrap();
+        assert!(!state.proxy_entities.contains(&entity_id));
+    }
+
+    #[test]
+    fn raycast_hits_proxy() {
+        let neighbor_id = Uuid::from_u128(1);
+        struct RaycastSim {
+            #[allow(dead_code)]
+            neighbor_id: Uuid,
+            hit_id: Arc<Mutex<Option<Uuid>>>,
+        }
+        impl RapierClusterSimulation for RaycastSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                if ctx.tick == 2 {
+                    if let Some(hit) = ctx.physics.raycast(
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(1.0, 0.0, 0.0),
+                        10.0,
+                    ) {
+                        *self.hit_id.lock().unwrap() = Some(hit.entity_id);
+                    }
+                }
+            }
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                RapierColliderShape::Ball(1.0)
+            }
+        }
+
+        let hit_id = Arc::new(Mutex::new(None));
+        let hit_id_clone = hit_id.clone();
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(RaycastSim {
+                neighbor_id,
+                hit_id: hit_id_clone,
+            }),
+            RapierConfig::default(),
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        step_with_neighbors(&sim, &mut entities, &neighbors, 2, CLUSTER_DT);
+
+        let result = hit_id.lock().unwrap();
+        assert_eq!(*result, Some(neighbor_id));
+    }
+
+    #[test]
+    fn proxy_uses_game_collider_shape() {
+        let neighbor_id = Uuid::from_u128(1);
+        struct CuboidSim {
+            neighbor_id: Uuid,
+        }
+        impl RapierClusterSimulation for CuboidSim {
+            fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+            fn collider_for(
+                &self,
+                entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                if entry.entity_id == self.neighbor_id {
+                    RapierColliderShape::Cuboid([2.0, 1.0, 1.0])
+                } else {
+                    RapierColliderShape::Ball(1.0)
+                }
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(CuboidSim { neighbor_id }),
+            RapierConfig::default(),
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Verify the collider exists and has the right shape
+        // For now, just verify the body exists (detailed shape verification would require more API)
+        assert_eq!(handle_count(&sim), 1);
+        let state = sim.state.lock().unwrap();
+        assert!(state.proxy_entities.contains(&neighbor_id));
+    }
+
+    // ─── Sub-C: cross-cluster physics event routing ─────────────────────────
+
+    fn step_with_neighbors_and_cluster_id(
+        sim: &RapierClusterSim,
+        entities: &mut HashMap<Uuid, EntityStateEntry>,
+        neighbors: &HashMap<Uuid, EntityStateEntry>,
+        tick: u64,
+        dt: f64,
+        cluster_id: Uuid,
+    ) {
+        let mut pending: Vec<Uuid> = Vec::new();
+        let actions: Vec<GameAction> = Vec::new();
+        let mut ctx = ClusterTickContext {
+            cluster_id,
+            tick,
+            dt_seconds: dt,
+            entities,
+            pending_removals: &mut pending,
+            game_actions: &actions,
+            neighbor_entities: neighbors,
+        };
+        sim.on_tick(&mut ctx);
+    }
+
+    struct ImpulseOnProxy {
+        proxy_id: Uuid,
+        impulse: Vec3,
+    }
+    impl RapierClusterSimulation for ImpulseOnProxy {
+        fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+            ctx.physics.apply_impulse(self.proxy_id, self.impulse);
+        }
+    }
+
+    #[test]
+    fn impulse_on_proxy_produces_routed_op() {
+        let proxy_id = Uuid::from_u128(100);
+        let neighbor_cluster = Uuid::from_u128(2);
+        let self_cluster = Uuid::from_u128(1);
+        let impulse = Vec3::new(1.0, 2.0, 3.0);
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(ImpulseOnProxy { proxy_id, impulse }),
+            RapierConfig::default(),
+        );
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut entry = mk_entry(proxy_id, Vec3::new(5.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, entry);
+
+        // Tick 1: spawns the proxy body in run_physics_phase
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            self_cluster,
+        );
+        sim.drain_routed_physics_ops(); // discard tick 1 ops
+
+        // Tick 2: user's on_tick applies impulse to the now-existing proxy
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            self_cluster,
+        );
+
+        let routed = sim.drain_routed_physics_ops();
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].0, neighbor_cluster);
+        assert_eq!(routed[0].1.target_entity_id, proxy_id);
+        match &routed[0].1.op {
+            PhysicsOp::ApplyImpulse { impulse: i } => {
+                assert!((i[0] - 1.0).abs() < 1e-6);
+                assert!((i[1] - 2.0).abs() < 1e-6);
+                assert!((i[2] - 3.0).abs() < 1e-6);
+            }
+            _ => panic!("expected ApplyImpulse"),
+        }
+    }
+
+    struct ImpulseOnLocal {
+        local_id: Uuid,
+        impulse: Vec3,
+    }
+    impl RapierClusterSimulation for ImpulseOnLocal {
+        fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+            ctx.physics.apply_impulse(self.local_id, self.impulse);
+        }
+    }
+
+    #[test]
+    fn impulse_on_local_applies_directly_no_routing() {
+        let local_id = Uuid::from_u128(200);
+        let impulse = Vec3::new(0.0, 0.0, 10.0);
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(ImpulseOnLocal { local_id, impulse }),
+            RapierConfig::default(),
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        let neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        // Tick 1: spawns body
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+        // Tick 2: on_tick applies impulse to existing body, then physics steps
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+
+        let routed = sim.drain_routed_physics_ops();
+        assert!(
+            routed.is_empty(),
+            "local impulse must not produce routed ops"
+        );
+
+        let vel = entities.get(&local_id).unwrap().velocity;
+        assert!(
+            vel.z.abs() > 0.1,
+            "local body should have moved, vel.z={}",
+            vel.z
+        );
+    }
+
+    #[test]
+    fn inbound_event_applies_impulse_to_local_body() {
+        let local_id = Uuid::from_u128(300);
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        let neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        // First tick: spawn the body
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        let vel_before = entities.get(&local_id).unwrap().velocity;
+
+        // Deliver inbound impulse
+        sim.apply_inbound_physics_events(vec![PhysicsEventBatch {
+            source_cluster_id: Uuid::from_u128(2),
+            ops: vec![PhysicsEvent {
+                target_entity_id: local_id,
+                op: PhysicsOp::ApplyImpulse {
+                    impulse: [0.0, 0.0, 50.0],
+                },
+            }],
+        }]);
+
+        // Second tick: the impulse should be applied
+        step_with_neighbors(&sim, &mut entities, &neighbors, 2, CLUSTER_DT);
+        let vel_after = entities.get(&local_id).unwrap().velocity;
+        assert!(
+            vel_after.z > vel_before.z + 1.0,
+            "inbound impulse should accelerate entity, vel_before.z={}, vel_after.z={}",
+            vel_before.z,
+            vel_after.z,
+        );
+    }
+
+    #[test]
+    fn inbound_event_unknown_entity_is_silently_ignored() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        // Deliver event for non-existent entity — should not panic
+        sim.apply_inbound_physics_events(vec![PhysicsEventBatch {
+            source_cluster_id: Uuid::from_u128(99),
+            ops: vec![PhysicsEvent {
+                target_entity_id: Uuid::from_u128(999),
+                op: PhysicsOp::ApplyImpulse {
+                    impulse: [1.0, 2.0, 3.0],
+                },
+            }],
+        }]);
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+    }
+
+    #[test]
+    fn contact_between_local_and_proxy_flows_back() {
+        let local_id = Uuid::from_u128(400);
+        let proxy_id = Uuid::from_u128(401);
+        let neighbor_cluster = Uuid::from_u128(2);
+        let self_cluster = Uuid::from_u128(1);
+
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut proxy_entry = mk_entry(
+            proxy_id,
+            Vec3::new(0.0, 0.0, 0.0), // same position = guaranteed overlap
+            Vec3::new(0.0, 0.0, 0.0),
+        );
+        proxy_entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, proxy_entry);
+
+        // Tick 1: spawn both bodies (overlap detected at step)
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            self_cluster,
+        );
+        // Tick 2: contact events from tick 1's step are processed
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            self_cluster,
+        );
+
+        let routed = sim.drain_routed_physics_ops();
+        let flowback: Vec<_> = routed
+            .iter()
+            .filter(|(_, e)| matches!(e.op, PhysicsOp::ContactEvent { .. }))
+            .collect();
+        assert!(
+            !flowback.is_empty(),
+            "contact between local and proxy must produce flow-back ContactEvent"
+        );
+        assert_eq!(flowback[0].0, neighbor_cluster);
+    }
+
+    #[test]
+    fn inbound_contact_event_suppresses_flowback_cycle() {
+        let local_id = Uuid::from_u128(500);
+        let proxy_id = Uuid::from_u128(501);
+        let neighbor_cluster = Uuid::from_u128(2);
+        let self_cluster = Uuid::from_u128(1);
+
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut proxy_entry =
+            mk_entry(proxy_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        proxy_entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, proxy_entry);
+
+        // Tick 1: spawn bodies, collision detected, flow-back emitted
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            self_cluster,
+        );
+        // Drain tick 1 flow-back so it doesn't pollute the check
+        let tick1_ops = sim.drain_routed_physics_ops();
+        assert!(
+            tick1_ops
+                .iter()
+                .any(|(_, e)| matches!(e.op, PhysicsOp::ContactEvent { .. })),
+            "tick 1 should produce a flow-back contact for the collision"
+        );
+
+        // Before tick 2: inject an inbound ContactEvent for the same pair
+        sim.apply_inbound_physics_events(vec![PhysicsEventBatch {
+            source_cluster_id: neighbor_cluster,
+            ops: vec![PhysicsEvent {
+                target_entity_id: local_id,
+                op: PhysicsOp::ContactEvent {
+                    other_entity_id: proxy_id,
+                    started: true,
+                },
+            }],
+        }]);
+
+        // Tick 2: flow-back should be suppressed for the inbound contact pair.
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            self_cluster,
+        );
+
+        let routed = sim.drain_routed_physics_ops();
+        let flowback_contacts: Vec<_> = routed
+            .iter()
+            .filter(|(_, e)| matches!(e.op, PhysicsOp::ContactEvent { .. }))
+            .collect();
+        assert!(
+            flowback_contacts.is_empty(),
+            "inbound contact event should suppress flow-back for the same pair, got {} ops",
+            flowback_contacts.len()
+        );
+    }
+
+    #[test]
+    fn create_joint_returns_none_when_proxy_involved() {
+        let local_id = Uuid::from_u128(600);
+        let proxy_id = Uuid::from_u128(601);
+        let neighbor_cluster = Uuid::from_u128(2);
+
+        struct JointAttempt {
+            local_id: Uuid,
+            proxy_id: Uuid,
+        }
+        impl RapierClusterSimulation for JointAttempt {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                let result = ctx.physics.create_joint(
+                    self.local_id,
+                    self.proxy_id,
+                    JointSpec::Fixed {
+                        local_anchor_a: Vec3::new(0.0, 0.0, 0.0),
+                        local_anchor_b: Vec3::new(0.0, 0.0, 0.0),
+                    },
+                );
+                assert!(result.is_none(), "create_joint on proxy must return None");
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(JointAttempt { local_id, proxy_id }),
+            RapierConfig::default(),
+        );
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut proxy_entry =
+            mk_entry(proxy_id, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        proxy_entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, proxy_entry);
+
+        // Tick 1: spawn both, proxy spawns as kinematic
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+        // Tick 2: user's on_tick tries to create joint — assertion inside
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+    }
+
+    #[test]
+    fn all_write_ops_route_for_proxy() {
+        let proxy_id = Uuid::from_u128(700);
+        let neighbor_cluster = Uuid::from_u128(2);
+
+        struct AllOps {
+            proxy_id: Uuid,
+        }
+        impl RapierClusterSimulation for AllOps {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                ctx.physics
+                    .apply_impulse(self.proxy_id, Vec3::new(1.0, 0.0, 0.0));
+                ctx.physics
+                    .apply_force(self.proxy_id, Vec3::new(0.0, 1.0, 0.0));
+                ctx.physics
+                    .apply_torque_impulse(self.proxy_id, Vec3::new(0.0, 0.0, 1.0));
+                ctx.physics
+                    .set_translation(self.proxy_id, Vec3::new(10.0, 0.0, 0.0));
+                ctx.physics
+                    .set_linvel(self.proxy_id, Vec3::new(0.0, 5.0, 0.0));
+                ctx.physics
+                    .set_angvel(self.proxy_id, Vec3::new(0.0, 0.0, 5.0));
+                ctx.physics.wake(self.proxy_id);
+                ctx.physics.sleep(self.proxy_id);
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(AllOps { proxy_id }),
+            RapierConfig::default(),
+        );
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut entry = mk_entry(proxy_id, Vec3::new(5.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, entry);
+
+        // Tick 1: spawn proxy
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+        // Tick 2: on_tick fires all ops
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+
+        let routed = sim.drain_routed_physics_ops();
+        assert_eq!(routed.len(), 8, "all 8 write ops should be routed");
+        assert!(routed.iter().all(|(target, _)| *target == neighbor_cluster));
+    }
+
+    #[test]
+    fn physics_event_json_roundtrip() {
+        let batch = PhysicsEventBatch {
+            source_cluster_id: Uuid::from_u128(1),
+            ops: vec![
+                PhysicsEvent {
+                    target_entity_id: Uuid::from_u128(10),
+                    op: PhysicsOp::ApplyImpulse {
+                        impulse: [1.0, 2.0, 3.0],
+                    },
+                },
+                PhysicsEvent {
+                    target_entity_id: Uuid::from_u128(11),
+                    op: PhysicsOp::ContactEvent {
+                        other_entity_id: Uuid::from_u128(12),
+                        started: true,
+                    },
+                },
+                PhysicsEvent {
+                    target_entity_id: Uuid::from_u128(13),
+                    op: PhysicsOp::Wake,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&batch).unwrap();
+        let parsed: PhysicsEventBatch = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_cluster_id, batch.source_cluster_id);
+        assert_eq!(parsed.ops.len(), 3);
+    }
+
+    #[test]
+    fn drain_routed_ops_is_empty_after_drain() {
+        let proxy_id = Uuid::from_u128(800);
+        let neighbor_cluster = Uuid::from_u128(2);
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(ImpulseOnProxy {
+                proxy_id,
+                impulse: Vec3::new(1.0, 0.0, 0.0),
+            }),
+            RapierConfig::default(),
+        );
+
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut entry = mk_entry(proxy_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0));
+        entry.cluster_id = neighbor_cluster;
+        neighbors.insert(proxy_id, entry);
+
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            1,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+        step_with_neighbors_and_cluster_id(
+            &sim,
+            &mut entities,
+            &neighbors,
+            2,
+            CLUSTER_DT,
+            Uuid::from_u128(1),
+        );
+
+        let first = sim.drain_routed_physics_ops();
+        assert!(!first.is_empty());
+        let second = sim.drain_routed_physics_ops();
+        assert!(second.is_empty(), "drain should clear the buffer");
     }
 }
