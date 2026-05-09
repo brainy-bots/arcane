@@ -855,12 +855,13 @@ impl RapierState {
             }
 
             if let Some(&handle) = self.handles.get(entity_id) {
-                // Existing proxy — update position
+                // Existing proxy — snap-correct position and update velocity
                 if let Some(body) = self.bodies.get_mut(handle) {
-                    body.set_next_kinematic_translation(to_rapier(entry.position));
+                    body.set_translation(to_rapier(entry.position), true);
+                    body.set_linvel(to_rapier(entry.velocity), true);
                 }
             } else {
-                // New proxy — spawn as KinematicPositionBased
+                // New proxy — spawn as KinematicVelocityBased
                 let collider_shape = rapier_sim.collider_for(entry, config);
                 let material = rapier_sim.material_for(entry, config);
                 let collision_groups = rapier_sim.collision_groups_for(entry, config);
@@ -868,7 +869,7 @@ impl RapierState {
 
                 let params = SpawnParams {
                     shape: collider_shape,
-                    body_kind: RapierBodyKind::KinematicPositionBased,
+                    body_kind: RapierBodyKind::KinematicVelocityBased,
                     material,
                     groups: collision_groups,
                     is_sensor,
@@ -4245,7 +4246,7 @@ mod tests {
         // Entity should be in proxy_entities set
         let state = sim.state.lock().unwrap();
         assert!(state.proxy_entities.contains(&neighbor_id));
-        // Body should be KinematicPositionBased — verify by checking it doesn't move under gravity
+        // Body should be KinematicVelocityBased — verify by checking it moves with its velocity
         drop(state);
         let neighbors2 = neighbors.clone();
         for _ in 0..10 {
@@ -4279,14 +4280,78 @@ mod tests {
 
         step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
 
-        // Verify proxy body position matches
+        // Verify proxy body position matches (snap-correction)
         let state = sim.state.lock().unwrap();
         if let Some(&handle) = state.handles.get(&neighbor_id) {
             if let Some(body) = state.bodies.get(handle) {
                 let rapier_pos = body.translation();
-                assert!(close(rapier_pos.x as f64, 5.0, 1e-2));
-                assert!(close(rapier_pos.y as f64, 2.0, 1e-2));
-                assert!(close(rapier_pos.z as f64, 1.0, 1e-2));
+                assert!(
+                    close(rapier_pos.x as f64, 5.0, 1e-2),
+                    "expected x ≈ 5.0, got {}",
+                    rapier_pos.x
+                );
+                assert!(
+                    close(rapier_pos.y as f64, 2.0, 1e-2),
+                    "expected y ≈ 2.0, got {}",
+                    rapier_pos.y
+                );
+                assert!(
+                    close(rapier_pos.z as f64, 1.0, 1e-2),
+                    "expected z ≈ 1.0, got {}",
+                    rapier_pos.z
+                );
+            }
+        } else {
+            panic!("neighbor proxy not found");
+        }
+    }
+
+    #[test]
+    fn proxy_velocity_extrapolates_between_updates() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        let initial_velocity = Vec3::new(10.0, 0.0, 0.0);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(neighbor_id, Vec3::new(0.0, 0.0, 0.0), initial_velocity),
+        );
+
+        // Spawn proxy with velocity
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Check initial position after spawn
+        {
+            let state = sim.state.lock().unwrap();
+            if let Some(&handle) = state.handles.get(&neighbor_id) {
+                if let Some(body) = state.bodies.get(handle) {
+                    let linvel = body.linvel();
+                    assert!(
+                        close(linvel.x as f64, 10.0, 1e-1),
+                        "initial linvel.x={}, expected ~10",
+                        linvel.x
+                    );
+                }
+            }
+        }
+
+        // Step once more to allow extrapolation
+        let neighbors_unchanged = neighbors.clone();
+        step_with_neighbors(&sim, &mut entities, &neighbors_unchanged, 2, CLUSTER_DT);
+
+        // Verify proxy has moved from the replication delta
+        let state = sim.state.lock().unwrap();
+        if let Some(&handle) = state.handles.get(&neighbor_id) {
+            if let Some(body) = state.bodies.get(handle) {
+                let rapier_pos = body.translation();
+                // With one extra step at CLUSTER_DT, the proxy should move some distance
+                // due to velocity integration in Rapier. At 10 m/s for 0.05s = 0.5m
+                assert!(
+                    close(rapier_pos.x as f64, 0.5, 0.1),
+                    "proxy at x={}, expected ~0.5",
+                    rapier_pos.x
+                );
             }
         } else {
             panic!("neighbor proxy not found");
