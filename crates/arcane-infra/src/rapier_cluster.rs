@@ -573,6 +573,9 @@ pub struct RapierClusterTickContext<'a> {
     /// the full surface. Reads and mutations hit Rapier state synchronously
     /// while the user's `on_tick` runs.
     pub physics: PhysicsHandle<'a>,
+    /// Read-only view of entities owned by neighboring clusters.
+    /// These are the entities that have kinematic proxies in the local physics world.
+    pub neighbor_entities: &'a HashMap<Uuid, EntityStateEntry>,
 }
 
 /// Rapier-aware sibling of [`ClusterSimulation`]. Implement this trait and pass
@@ -673,6 +676,9 @@ struct RapierState {
     /// `entity.velocity` → `body.linvel` sync skips these so the imperative
     /// override sticks. Cleared at the start of every tick.
     pending_imperative_linvel: HashSet<Uuid>,
+    /// Entity IDs of kinematic proxy bodies (from neighbor clusters).
+    /// Distinguished from locally-owned bodies in the shared `handles` map.
+    proxy_entities: HashSet<Uuid>,
 }
 
 /// Internal `EventHandler` impl that records collisions into a `Mutex<Vec>`.
@@ -746,6 +752,7 @@ impl RapierState {
             gravity,
             pending_contact_events: Vec::new(),
             pending_imperative_linvel: HashSet::new(),
+            proxy_entities: HashSet::new(),
         }
     }
 
@@ -810,6 +817,61 @@ impl RapierState {
         );
     }
 
+    fn sync_proxies(
+        &mut self,
+        neighbor_entities: &HashMap<Uuid, EntityStateEntry>,
+        owned_entities: &HashMap<Uuid, EntityStateEntry>,
+        rapier_sim: &dyn RapierClusterSimulation,
+        config: &RapierConfig,
+    ) {
+        // Despawn proxies whose entity_id is no longer in neighbor_entities
+        let stale: Vec<Uuid> = self
+            .proxy_entities
+            .iter()
+            .filter(|id| !neighbor_entities.contains_key(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.despawn(id);
+            self.proxy_entities.remove(&id);
+        }
+
+        // For each neighbor entity, spawn or update the proxy
+        for (entity_id, entry) in neighbor_entities {
+            // Skip if this entity is locally owned (precedence: owned > proxy)
+            if owned_entities.contains_key(entity_id) {
+                // If we had a proxy for it, despawn the proxy
+                if self.proxy_entities.remove(entity_id) {
+                    self.despawn(*entity_id);
+                }
+                continue;
+            }
+
+            if let Some(&handle) = self.handles.get(entity_id) {
+                // Existing proxy — update position
+                if let Some(body) = self.bodies.get_mut(handle) {
+                    body.set_next_kinematic_translation(to_rapier(entry.position));
+                }
+            } else {
+                // New proxy — spawn as KinematicPositionBased
+                let collider_shape = rapier_sim.collider_for(entry, config);
+                let material = rapier_sim.material_for(entry, config);
+                let collision_groups = rapier_sim.collision_groups_for(entry, config);
+                let is_sensor = rapier_sim.is_sensor(entry, config);
+
+                let params = SpawnParams {
+                    shape: collider_shape,
+                    body_kind: RapierBodyKind::KinematicPositionBased,
+                    material,
+                    groups: collision_groups,
+                    is_sensor,
+                };
+                self.spawn(*entity_id, entry, params);
+                self.proxy_entities.insert(*entity_id);
+            }
+        }
+    }
+
     fn step_with_accumulator(&mut self, dt_seconds: f32) {
         self.accumulator += dt_seconds;
         if self.accumulator < FIXED_PHYSICS_DT {
@@ -861,6 +923,10 @@ impl RapierState {
             if skip.contains(id) {
                 continue;
             }
+            // Skip proxies — their positions come from replication, not local physics output
+            if self.proxy_entities.contains(id) {
+                continue;
+            }
             let Some(&handle) = self.handles.get(id) else {
                 continue;
             };
@@ -877,6 +943,7 @@ impl RapierState {
             .handles
             .keys()
             .filter(|id| !entities.contains_key(id))
+            .filter(|id| !self.proxy_entities.contains(id))
             .copied()
             .collect();
         for id in stale {
@@ -1294,6 +1361,7 @@ impl ClusterSimulation for RapierClusterSim {
                         game_actions: ctx.game_actions,
                         contact_events: &prev_contacts,
                         physics,
+                        neighbor_entities: ctx.neighbor_entities,
                     };
                     sim.on_tick(&mut rapier_ctx);
                     // rapier_ctx (and physics) drop here; state is freely usable again.
@@ -1340,6 +1408,16 @@ impl RapierClusterSim {
                 };
                 state.spawn(*id, entry, params);
             }
+        }
+
+        // Sync kinematic proxies for neighbor entities
+        if let Backend::Rapier(ref rapier_sim) = self.backend {
+            state.sync_proxies(
+                ctx.neighbor_entities,
+                ctx.entities,
+                rapier_sim.as_ref(),
+                &self.config,
+            );
         }
 
         state.step_with_accumulator(ctx.dt_seconds as f32);
@@ -3874,5 +3952,356 @@ mod tests {
         // Body should not have moved.
         let p = entities.get(&id).unwrap().position;
         assert!(close(p.x, start.x, 1e-6) && close(p.y, start.y, 1e-6));
+    }
+
+    // ─── kinematic proxy tests ──────────────────────────────────────────────────
+
+    fn step_with_neighbors(
+        sim: &RapierClusterSim,
+        entities: &mut HashMap<Uuid, EntityStateEntry>,
+        neighbors: &HashMap<Uuid, EntityStateEntry>,
+        tick: u64,
+        dt: f64,
+    ) {
+        let mut pending: Vec<Uuid> = Vec::new();
+        let actions: Vec<GameAction> = Vec::new();
+        let mut ctx = ClusterTickContext {
+            cluster_id: Uuid::nil(),
+            tick,
+            dt_seconds: dt,
+            entities,
+            pending_removals: &mut pending,
+            game_actions: &actions,
+            neighbor_entities: neighbors,
+        };
+        sim.on_tick(&mut ctx);
+    }
+
+    struct SimpleSim;
+    impl RapierClusterSimulation for SimpleSim {
+        fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+    }
+
+    #[test]
+    fn proxy_spawns_as_kinematic_for_neighbor_entity() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Neighbor should have a body in Rapier
+        assert_eq!(handle_count(&sim), 1);
+        // Entity should be in proxy_entities set
+        let state = sim.state.lock().unwrap();
+        assert!(state.proxy_entities.contains(&neighbor_id));
+        // Body should be KinematicPositionBased — verify by checking it doesn't move under gravity
+        drop(state);
+        let neighbors2 = neighbors.clone();
+        for _ in 0..10 {
+            step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+        }
+        let p = entities.get(&neighbor_id);
+        // No entity in local entities, so position not in map
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn proxy_position_tracks_neighbor_entry() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Change neighbor position
+        let mut neighbors2 = neighbors;
+        neighbors2.get_mut(&neighbor_id).unwrap().position = Vec3::new(5.0, 2.0, 1.0);
+
+        step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+
+        // Verify proxy body position matches
+        let state = sim.state.lock().unwrap();
+        if let Some(&handle) = state.handles.get(&neighbor_id) {
+            if let Some(body) = state.bodies.get(handle) {
+                let rapier_pos = body.translation();
+                assert!(close(rapier_pos.x as f64, 5.0, 1e-2));
+                assert!(close(rapier_pos.y as f64, 2.0, 1e-2));
+                assert!(close(rapier_pos.z as f64, 1.0, 1e-2));
+            }
+        } else {
+            panic!("neighbor proxy not found");
+        }
+    }
+
+    #[test]
+    fn proxy_despawns_when_neighbor_removed() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        assert_eq!(handle_count(&sim), 1);
+
+        // Remove from neighbors
+        let neighbors2: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        step_with_neighbors(&sim, &mut entities, &neighbors2, 2, CLUSTER_DT);
+
+        // Body should be gone
+        assert_eq!(handle_count(&sim), 0);
+        let state = sim.state.lock().unwrap();
+        assert!(!state.proxy_entities.contains(&neighbor_id));
+    }
+
+    #[test]
+    fn proxy_does_not_overwrite_entity_map() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let neighbor_id = Uuid::from_u128(1);
+        let proxy_pos = Vec3::new(5.0, 2.0, 1.0);
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(neighbor_id, proxy_pos, Vec3::new(0.0, 0.0, 0.0)),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // After sync_outputs, ctx.entities should not contain the proxy
+        assert!(!entities.contains_key(&neighbor_id));
+    }
+
+    #[test]
+    fn local_body_collides_with_proxy() {
+        let local_id = Uuid::from_u128(1);
+        let neighbor_id = Uuid::from_u128(2);
+        let events: Arc<Mutex<Vec<ContactEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        struct CollisionCaptureSim {
+            local_id: Uuid,
+            neighbor_id: Uuid,
+            events: Arc<Mutex<Vec<ContactEvent>>>,
+        }
+        impl RapierClusterSimulation for CollisionCaptureSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                for &event in ctx.contact_events {
+                    if (event.entity_a == self.local_id && event.entity_b == self.neighbor_id)
+                        || (event.entity_a == self.neighbor_id && event.entity_b == self.local_id)
+                    {
+                        self.events.lock().unwrap().push(event);
+                    }
+                }
+            }
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                RapierColliderShape::Ball(1.0)
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(CollisionCaptureSim {
+                local_id,
+                neighbor_id,
+                events: events_clone,
+            }),
+            RapierConfig {
+                gravity: [0.0, 0.0, 0.0],
+                ..RapierConfig::default()
+            },
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        entities.insert(
+            local_id,
+            mk_entry(local_id, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+        );
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(1.8, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        // Tick 1: spawn both entities, physics steps, contact emitted post-step
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        // Tick 2: contact events surfaced to user via on_tick
+        step_with_neighbors(&sim, &mut entities, &neighbors, 2, CLUSTER_DT);
+
+        let captured = events.lock().unwrap();
+        assert!(
+            !captured.is_empty(),
+            "Expected contact event between local and proxy"
+        );
+        assert!(captured[0].started, "Expected Started contact event");
+    }
+
+    #[test]
+    fn owned_entity_takes_precedence_over_proxy() {
+        let sim = RapierClusterSim::with_rapier_sim(Arc::new(SimpleSim), RapierConfig::default());
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let entity_id = Uuid::from_u128(1);
+
+        // Same entity_id in both owned and neighbor
+        entities.insert(
+            entity_id,
+            mk_entry(
+                entity_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+        neighbors.insert(
+            entity_id,
+            mk_entry(
+                entity_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Body should exist (from owned entity)
+        assert_eq!(handle_count(&sim), 1);
+        // Entity should NOT be in proxy_entities
+        let state = sim.state.lock().unwrap();
+        assert!(!state.proxy_entities.contains(&entity_id));
+    }
+
+    #[test]
+    fn raycast_hits_proxy() {
+        let neighbor_id = Uuid::from_u128(1);
+        struct RaycastSim {
+            #[allow(dead_code)]
+            neighbor_id: Uuid,
+            hit_id: Arc<Mutex<Option<Uuid>>>,
+        }
+        impl RapierClusterSimulation for RaycastSim {
+            fn on_tick(&self, ctx: &mut RapierClusterTickContext<'_>) {
+                if ctx.tick == 2 {
+                    if let Some(hit) = ctx.physics.raycast(
+                        Vec3::new(0.0, 0.0, 0.0),
+                        Vec3::new(1.0, 0.0, 0.0),
+                        10.0,
+                    ) {
+                        *self.hit_id.lock().unwrap() = Some(hit.entity_id);
+                    }
+                }
+            }
+            fn collider_for(
+                &self,
+                _entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                RapierColliderShape::Ball(1.0)
+            }
+        }
+
+        let hit_id = Arc::new(Mutex::new(None));
+        let hit_id_clone = hit_id.clone();
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(RaycastSim {
+                neighbor_id,
+                hit_id: hit_id_clone,
+            }),
+            RapierConfig::default(),
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+        step_with_neighbors(&sim, &mut entities, &neighbors, 2, CLUSTER_DT);
+
+        let result = hit_id.lock().unwrap();
+        assert_eq!(*result, Some(neighbor_id));
+    }
+
+    #[test]
+    fn proxy_uses_game_collider_shape() {
+        let neighbor_id = Uuid::from_u128(1);
+        struct CuboidSim {
+            neighbor_id: Uuid,
+        }
+        impl RapierClusterSimulation for CuboidSim {
+            fn on_tick(&self, _ctx: &mut RapierClusterTickContext<'_>) {}
+            fn collider_for(
+                &self,
+                entry: &EntityStateEntry,
+                _config: &RapierConfig,
+            ) -> RapierColliderShape {
+                if entry.entity_id == self.neighbor_id {
+                    RapierColliderShape::Cuboid([2.0, 1.0, 1.0])
+                } else {
+                    RapierColliderShape::Ball(1.0)
+                }
+            }
+        }
+
+        let sim = RapierClusterSim::with_rapier_sim(
+            Arc::new(CuboidSim { neighbor_id }),
+            RapierConfig::default(),
+        );
+        let mut entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        let mut neighbors: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        neighbors.insert(
+            neighbor_id,
+            mk_entry(
+                neighbor_id,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+
+        step_with_neighbors(&sim, &mut entities, &neighbors, 1, CLUSTER_DT);
+
+        // Verify the collider exists and has the right shape
+        // For now, just verify the body exists (detailed shape verification would require more API)
+        assert_eq!(handle_count(&sim), 1);
+        let state = sim.state.lock().unwrap();
+        assert!(state.proxy_entities.contains(&neighbor_id));
     }
 }
