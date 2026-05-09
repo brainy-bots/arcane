@@ -107,6 +107,26 @@
 //! precision in the standard `f32` way. If your world exceeds those bounds,
 //! enable Rapier's `f64` feature in a follow-up.
 //!
+//! # Cross-cluster physics
+//!
+//! Entities from neighboring clusters appear as kinematic proxy bodies in the
+//! local Rapier world. Raycasts and collision detection work against them.
+//!
+//! When a `PhysicsHandle` write op (impulse, force, etc.) targets a proxy,
+//! the operation routes via Redis to the authority cluster. Contact events
+//! involving proxies flow back to the authority cluster so both sides observe
+//! the collision.
+//!
+//! Cross-cluster joints are not supported — `create_joint` returns `None`
+//! when either entity is a proxy. Affinity clustering should co-locate
+//! joint participants.
+//!
+//! Authority transfer (entity migration between clusters) is not yet
+//! implemented. It ships with the affinity clustering infrastructure.
+//!
+//! See [`docs/architecture/adr/002-cross-cluster-physics.md`](https://github.com/brainy-bots/arcane/blob/main/docs/architecture/adr/002-cross-cluster-physics.md)
+//! for full design rationale.
+//!
 //! # Example
 //!
 //! ```no_run

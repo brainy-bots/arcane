@@ -69,7 +69,7 @@ Maintain a **bidirectional map** in the integration layer:
 |---------|----------------|
 | `entity_id` (`Uuid`) | Stable Arcane / wire identity; store as FGuid or string in UE per project convention. |
 | Chaos / Rapier actor / body | Spawn when a new owned entity appears in the authoritative set; destroy when removed or when `pending_removals`-style lifecycle fires. |
-| Neighbor entities | **Policy:** treat as **kinematic** or **pose-only** proxies — do not double-simulate. Full cross-cluster coupling is deferred work (see clustering-binding epic). |
+| Neighbor entities | Appear as **kinematic proxy bodies** in the local Rapier world. Raycasts and collision detection work against them. Write ops on proxies route via `arcane:physics_events:<target_cluster_uuid>` Redis channel to the authority cluster. Contact events flow back bidirectionally. See [ADR-002](adr/002-cross-cluster-physics.md) for full design. Authority transfer (entity migration) deferred to affinity clustering infrastructure. |
 | `user_data` | Optional: stiffness, hitbox id, team — replicated; keep small. |
 | `local_data` | Solver scratch, cooldowns — **not** on Redis wire; see [four-bucket-state-model.md](four-bucket-state-model.md). |
 | **Body kind** | Per-entity, declared at first-sight via `body_kind_for` hook. `Dynamic` (players, projectiles, debris), `KinematicPositionBased` / `KinematicVelocityBased` (server-controlled motion), `Fixed` (walls, placed structures). Default `Dynamic`. See [entity-model.md §4](entity-model.md). |
@@ -92,7 +92,9 @@ The Rapier (Rust) backend has landed and is documented in [ADR-001](adr/001-rapi
 - **Rapier as `optional = true` Cargo dep on `arcane-infra` behind feature `rapier-cluster`.** Vanilla builds pull zero `rapier3d`. No separate crate needed; the feature-flag pattern is sufficient.
 - **Per-engine API discipline:** Rapier-specific types (`RapierColliderShape`, `RapierBodyKind`, `RapierMaterial`) stay in `arcane-infra::rapier_cluster`. They are **not** promoted to engine-neutral `arcane-core` types — see [`entity-model.md` §8](entity-model.md) for why.
 
-The Unreal/Chaos backend will follow the same composition pattern but with engine-native concerns (UE-native types, World Partition integration, Y↔Z axis swap, ×100 unit scale at the wire boundary). [`#124`](https://github.com/brainy-bots/arcane/issues/124) is the implementation epic; ADR-002 (pending) will capture the Unreal-side decisions.
+Cross-cluster physics (neighbor entities as kinematic proxies + imperative-op routing) is documented in [ADR-002](adr/002-cross-cluster-physics.md).
+
+The Unreal/Chaos backend will follow the same composition pattern but with engine-native concerns (UE-native types, World Partition integration, Y↔Z axis swap, ×100 unit scale at the wire boundary). [`#124`](https://github.com/brainy-bots/arcane/issues/124) is the implementation epic; ADR-003 (pending) will capture the Unreal-side decisions.
 
 ---
 

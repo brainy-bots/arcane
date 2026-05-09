@@ -11,4 +11,5 @@ Link new ADRs from [physics-backends-and-unreal.md](../physics-backends-and-unre
 | # | Date | Title | Status |
 |---|---|---|---|
 | [001](001-rapier-cluster-integration-shape.md) | 2026-05-03 | Rapier cluster integration shape — composition over inheritance; in-process Rust; entity-keyed user API; spawn-time hooks once per entity | Accepted |
-| 002 | TBD | Unreal cluster integration shape — UE-native dedicated server with Chaos; plugin distribution; UE version pin; networking implementation (C++ native vs FFI shim) | Pending — required by [`#124`](https://github.com/brainy-bots/arcane/issues/124) |
+| [002](002-cross-cluster-physics.md) | 2026-05-09 | Cross-cluster physics interaction — kinematic proxies + imperative-op routing; Layer 1&2 of three-layer design; Layer 3 (authority transfer) deferred until migration infrastructure | Accepted |
+| 003 | TBD | Unreal cluster integration shape — UE-native dedicated server with Chaos; plugin distribution; UE version pin; networking implementation (C++ native vs FFI shim) | Pending — required by [`#124`](https://github.com/brainy-bots/arcane/issues/124) |
