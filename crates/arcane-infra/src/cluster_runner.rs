@@ -155,6 +155,32 @@ where
     #[cfg(feature = "spacetimedb-persist")]
     let persist = SpacetimeDbPersist::from_env();
 
+    #[cfg(feature = "spacetimedb-persist")]
+    {
+        if !neighbor_ids.is_empty() {
+            let spacetime_uri = std::env::var("SPACETIMEDB_URI").ok();
+            let spacetime_db = std::env::var("SPACETIMEDB_DATABASE").ok();
+            let bootstrap_entities = SpacetimeDbPersist::read_entities_for_clusters(
+                spacetime_uri.as_deref(),
+                spacetime_db.as_deref(),
+                &neighbor_ids,
+            );
+            let entity_count = bootstrap_entities.len();
+            for entity in bootstrap_entities {
+                neighbor_latest
+                    .entry(entity.cluster_id)
+                    .or_insert_with(Vec::new)
+                    .push(entity);
+            }
+            if entity_count > 0 {
+                eprintln!(
+                    "bootstrapped {} neighbor entities from SpacetimeDB",
+                    entity_count
+                );
+            }
+        }
+    }
+
     let interval = Duration::from_millis(1000 / tick_rate_hz);
     let dt_seconds = interval.as_secs_f64();
     let mut tick_count: u64 = 0;

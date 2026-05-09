@@ -17,25 +17,6 @@ use crate::ReplicationChannelManager;
 /// entities injected by `simulate_before_tick` are not capped (they are server-authoritative).
 pub const DEFAULT_MAX_ENTITIES: usize = 100_000;
 
-/// Default resync cadence for velocity-based dead reckoning, in ticks. Every
-/// N ticks the cluster broadcasts every entity regardless of velocity change,
-/// so clients that missed a velocity-change broadcast (packet loss, late
-/// join) re-anchor to fresh server state. 60 ticks ≈ 2-3 sec wall-clock
-/// across the benchmark's tick range (20-60 Hz). Override via
-/// `ARCANE_RESYNC_EVERY_N_TICKS`.
-pub const DEFAULT_RESYNC_EVERY_N_TICKS: u64 = 60;
-
-/// Read the resync cadence from the environment. Clamped to `>= 1` so a
-/// misconfigured value can't accidentally disable resync entirely (which
-/// would leave dropped-velocity-change entities stale forever).
-fn resolve_resync_every_n_ticks() -> u64 {
-    std::env::var("ARCANE_RESYNC_EVERY_N_TICKS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_RESYNC_EVERY_N_TICKS)
-}
-
 /// One process per cluster. Runs simulation, replication, client connections.
 pub struct ClusterServer {
     cluster_id: Uuid,
@@ -48,14 +29,10 @@ pub struct ClusterServer {
     /// Last-broadcast velocity per entity (quantized to wire form). Used for
     /// velocity-based dead reckoning: an entity is omitted from a broadcast
     /// when its current velocity quantizes identically to its last-broadcast
-    /// velocity. New entities and the periodic resync tick force inclusion.
-    /// Comparing in `Vec3Q` (i16) instead of `Vec3` (f64) means the skip
-    /// decision matches the client's view exactly — if the wire bytes
-    /// wouldn't change, the broadcast doesn't happen.
+    /// velocity. New entities force inclusion. Comparing in `Vec3Q` (i16) instead
+    /// of `Vec3` (f64) means the skip decision matches the client's view exactly —
+    /// if the wire bytes wouldn't change, the broadcast doesn't happen.
     last_broadcast_velocity: Mutex<HashMap<Uuid, Vec3Q>>,
-    /// Resync cadence in ticks. Read once at construction from
-    /// `ARCANE_RESYNC_EVERY_N_TICKS`. See [`DEFAULT_RESYNC_EVERY_N_TICKS`].
-    resync_every_n_ticks: u64,
 }
 
 impl ClusterServer {
@@ -73,7 +50,6 @@ impl ClusterServer {
             pending_removed: Mutex::new(Vec::new()),
             max_entities,
             last_broadcast_velocity: Mutex::new(HashMap::new()),
-            resync_every_n_ticks: resolve_resync_every_n_ticks(),
         }
     }
 
@@ -151,14 +127,6 @@ impl ClusterServer {
         let t = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
         let s = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // A resync tick rebroadcasts every entity (both for late joiners and
-        // to recover from any silently dropped velocity-change broadcasts).
-        // Tick 0 is impossible here (we just incremented), so the first
-        // resync naturally fires at tick `resync_every_n_ticks` rather than
-        // on the very first tick — that's fine, the first-broadcast path
-        // below already includes every entity once.
-        let is_resync_tick = t.is_multiple_of(self.resync_every_n_ticks);
-
         let (updated, removed) = {
             let entities = self.entities.lock().expect("entities lock");
             let mut last_vel = self
@@ -167,9 +135,10 @@ impl ClusterServer {
                 .expect("last_broadcast_velocity lock");
 
             // Collect entities that need broadcasting this tick. New entity
-            // (no last-broadcast record), velocity-quantum-changed entity,
-            // or every entity on a resync tick — otherwise skip and let the
-            // client extrapolate from its last anchor.
+            // (no last-broadcast record) or velocity-quantum-changed entity;
+            // otherwise skip and let the client extrapolate from its last anchor.
+            // Neighbor bootstrap reads full state from SpacetimeDB; resync tick
+            // removed as Redis is now only for deltas.
             let mut updated: Vec<EntityStateEntry> = Vec::new();
             for entry in entities.values() {
                 let current_vel_q = Vec3Q::from_vec3(arcane_wire::Vec3::new(
@@ -179,7 +148,6 @@ impl ClusterServer {
                 ));
                 let include = match last_vel.get(&entry.entity_id) {
                     None => true, // new entity — first broadcast
-                    Some(_) if is_resync_tick => true,
                     Some(prev) => *prev != current_vel_q,
                 };
                 if include {

@@ -1,14 +1,15 @@
-//! SpacetimeDB persistence adapter for throttled state snapshots.
+//! SpacetimeDB persistence adapter for throttled state snapshots and neighbor bootstrap.
 //!
 //! Responsibilities:
 //! - derive persist cadence and endpoint config from environment
 //! - encode `EntityStateEntry` batches into SpacetimeDB reducer payload shape
 //! - send chunked HTTP requests and log success/failure totals
+//! - read entity snapshots for neighbor bootstrap (gap recovery)
 //!
 //! **Four buckets:** this path mirrors **bucket 1** (pose) *and* **bucket 2** (`user_data`) into
 //! **bucket 4** (durable tables) at a throttled cadence — not a substitute for hot Redis
 //! replication between clusters. The target SpacetimeDB module's `Entity` table must include
-//! columns matching the fields this encoder emits (`entity_id`, `x`, `y`, `z`, `user_data`).
+//! columns matching the fields this encoder emits (`entity_id`, `x`, `y`, `z`, `user_data`, `cluster_id`).
 //!
 //! **Progressive-API note (see `docs/architecture/progressive-api.md`):** this is the level-1
 //! auto-persist path. Level-0 users get positions for free; level-1 users put any additional
@@ -18,9 +19,11 @@
 //!
 //! This module does not own simulation timing; `cluster_runner` decides when to call it.
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use arcane_core::replication_channel::EntityStateEntry;
+use uuid::Uuid;
 
 #[derive(serde::Serialize)]
 struct SpacetimeUuid {
@@ -71,6 +74,59 @@ fn encode_spacetimedb_entities_body(
 
 fn should_persist_tick(tick: u64, interval_ticks: u64, entries_len: usize) -> bool {
     tick.is_multiple_of(interval_ticks) && entries_len > 0
+}
+
+/// Parse SpacetimeDB Entity table response, filtering by cluster_ids.
+/// Expected schema: array of {entity_id: {__uuid__: number}, x, y, z, user_data, cluster_id, ...}
+fn parse_entity_rows(value: serde_json::Value, cluster_ids: &[Uuid]) -> Vec<EntityStateEntry> {
+    let cluster_id_set: HashSet<_> = cluster_ids.iter().copied().collect();
+    let mut entries = Vec::new();
+
+    if let Some(rows) = value.as_array() {
+        for row in rows {
+            let entity_id = match extract_uuid(&row["entity_id"]) {
+                Some(id) => id,
+                None => continue,
+            };
+            let cluster_id = match extract_uuid(&row["cluster_id"]) {
+                Some(id) => id,
+                None => continue,
+            };
+            if !cluster_id_set.contains(&cluster_id) {
+                continue;
+            }
+            let x = row["x"].as_f64().unwrap_or(0.0);
+            let y = row["y"].as_f64().unwrap_or(0.0);
+            let z = row["z"].as_f64().unwrap_or(0.0);
+            let user_data = if let Some(ud_str) = row["user_data"].as_str() {
+                if ud_str.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(ud_str).unwrap_or(serde_json::Value::Null)
+                }
+            } else {
+                serde_json::Value::Null
+            };
+
+            let mut entry = EntityStateEntry::new(
+                entity_id,
+                cluster_id,
+                arcane_core::Vec3::new(x, y, z),
+                arcane_core::Vec3::new(0.0, 0.0, 0.0), // velocity is not persisted
+            );
+            entry.user_data = user_data;
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Extract UUID from SpacetimeDB's {__uuid__: u128} format.
+fn extract_uuid(value: &serde_json::Value) -> Option<Uuid> {
+    value
+        .get("__uuid__")
+        .and_then(|v| v.as_u64())
+        .map(|n| Uuid::from_u128(n as u128))
 }
 
 pub struct SpacetimeDbPersist {
@@ -182,6 +238,55 @@ impl SpacetimeDbPersist {
                 chunk_size,
                 ms
             );
+        }
+    }
+
+    /// Read entity snapshots from SpacetimeDB for the given cluster IDs (e.g., neighbor clusters).
+    /// Returns a flat list of EntityStateEntry for all matches.
+    /// If SpacetimeDB is unreachable or empty, returns an empty list (soft failure).
+    pub fn read_entities_for_clusters(
+        uri: Option<&str>,
+        db: Option<&str>,
+        cluster_ids: &[Uuid],
+    ) -> Vec<EntityStateEntry> {
+        if cluster_ids.is_empty() {
+            return Vec::new();
+        }
+        let uri = uri.unwrap_or_else(|| "http://127.0.0.1:3000");
+        let db = db.unwrap_or_else(|| "arcane");
+        let url = format!(
+            "{}/v1/database/{}/tables/Entity",
+            uri.trim_end_matches('/'),
+            db
+        );
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SpacetimeDB read: client build failed: {}", e);
+                return Vec::new();
+            }
+        };
+
+        match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
+                Ok(rows) => parse_entity_rows(rows, cluster_ids),
+                Err(e) => {
+                    eprintln!("SpacetimeDB read: parse failed: {}", e);
+                    Vec::new()
+                }
+            },
+            Ok(resp) => {
+                eprintln!("SpacetimeDB read: HTTP {}", resp.status());
+                Vec::new()
+            }
+            Err(e) => {
+                eprintln!("SpacetimeDB read: request failed: {}", e);
+                Vec::new()
+            }
         }
     }
 }

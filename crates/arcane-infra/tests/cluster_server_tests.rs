@@ -372,28 +372,6 @@ mod dead_reckoning {
     }
 
     #[test]
-    fn resync_tick_rebroadcasts_unchanged_entities() {
-        // Every Nth tick (default 60 in production; we override to 3 here so
-        // the test is fast), the cluster must broadcast every entity even if
-        // velocity didn't change. Late joiners and packet-loss recovery rely
-        // on this.
-        std::env::set_var("ARCANE_RESYNC_EVERY_N_TICKS", "3");
-        let server = ClusterServer::new(Uuid::new_v4());
-        std::env::remove_var("ARCANE_RESYNC_EVERY_N_TICKS");
-
-        let id = Uuid::from_u128(1);
-        server.add_entity(entry(id, 5.0));
-        // Tick 1: anchor broadcast.
-        assert_eq!(server.tick().updated.len(), 1);
-        // Ticks 2: skipped (velocity unchanged).
-        server.add_entity(entry(id, 5.0));
-        assert_eq!(server.tick().updated.len(), 0);
-        // Tick 3: resync — rebroadcast even though velocity unchanged.
-        server.add_entity(entry(id, 5.0));
-        assert_eq!(server.tick().updated.len(), 1);
-    }
-
-    #[test]
     fn removed_entity_drops_dead_reckoning_record() {
         // After an entity is removed, its last-broadcast-velocity record
         // must be dropped so the map stays bounded by current_entities and
