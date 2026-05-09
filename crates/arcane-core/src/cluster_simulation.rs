@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::physics_events::{PhysicsEvent, PhysicsEventBatch};
 use crate::replication_channel::EntityStateEntry;
 
 /// A game action sent by a client through the cluster WebSocket. The cluster's
@@ -69,4 +70,16 @@ pub trait ClusterSimulation: Send + Sync {
     /// Advance simulation state by one tick. Called once per tick after client updates and injected
     /// entities are applied, and before the replication delta is built.
     fn on_tick(&self, ctx: &mut ClusterTickContext<'_>);
+
+    /// Apply inbound physics events from neighbor clusters (e.g., routed impulses,
+    /// contact flow-back). Called at the start of the tick, before `on_tick`.
+    /// Default: no-op.
+    fn apply_inbound_physics_events(&self, _events: Vec<PhysicsEventBatch>) {}
+
+    /// Drain any physics events that should be routed to neighbor clusters
+    /// (e.g., impulses applied to proxy entities, contact flow-back).
+    /// Called after `on_tick`. Default: empty.
+    fn drain_routed_physics_ops(&self) -> Vec<(Uuid, PhysicsEvent)> {
+        Vec::new()
+    }
 }
