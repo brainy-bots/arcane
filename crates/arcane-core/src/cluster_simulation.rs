@@ -58,6 +58,10 @@ pub struct ClusterTickContext<'a> {
     /// Game actions received from clients this tick. The simulation processes these — the library
     /// does not interpret them. Drained each tick (actions not consumed are discarded).
     pub game_actions: &'a [GameAction],
+    /// Read-only view of entities owned by neighboring clusters.
+    /// Keyed by entity_id. Updated each tick from neighbor replication deltas.
+    /// These entities are NOT owned by this cluster — do not modify them.
+    pub neighbor_entities: &'a HashMap<Uuid, EntityStateEntry>,
 }
 
 /// Custom simulation step for entities owned by this cluster.

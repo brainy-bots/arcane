@@ -1370,6 +1370,7 @@ mod tests {
     ) {
         let mut pending: Vec<Uuid> = Vec::new();
         let actions: Vec<GameAction> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick,
@@ -1377,6 +1378,7 @@ mod tests {
             entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
     }
@@ -1815,6 +1817,7 @@ mod tests {
         };
         let actions = vec![action];
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 42,
@@ -1822,6 +1825,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
 
@@ -2650,6 +2654,7 @@ mod tests {
             },
         ];
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 99,
@@ -2657,6 +2662,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim.on_tick(&mut ctx);
 
@@ -2826,6 +2832,7 @@ mod tests {
 
         let actions: Vec<GameAction> = Vec::new();
         let mut pending: Vec<Uuid> = Vec::new();
+        let neighbors = HashMap::new();
         let mut ctx = ClusterTickContext {
             cluster_id: Uuid::nil(),
             tick: 1,
@@ -2833,6 +2840,7 @@ mod tests {
             entities: &mut entities,
             pending_removals: &mut pending,
             game_actions: &actions,
+            neighbor_entities: &neighbors,
         };
         sim_b.on_tick(&mut ctx);
 

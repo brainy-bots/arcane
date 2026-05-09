@@ -1,5 +1,6 @@
 //! Tests for ClusterServer (IN-02). Define expected behavior; implementation must satisfy these.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arcane_infra::{ClusterServer, ClusterSimulation, ReplicationChannelManager};
@@ -120,7 +121,7 @@ fn simulate_before_tick_runs_before_delta_and_sees_upcoming_tick() {
         Vec3::new(0.0, 0.0, 0.0),
         Vec3::new(0.0, 0.0, 0.0),
     ));
-    server.simulate_before_tick(0.05, 1, Some(&RecordTick), &[]);
+    server.simulate_before_tick(0.05, 1, Some(&RecordTick), &[], &HashMap::new());
     let delta = server.tick();
     assert_eq!(delta.tick, 1);
 }
@@ -139,7 +140,7 @@ fn simulate_before_tick_can_mutate_positions() {
         Vec3::new(0.0, 0.0, 0.0),
         Vec3::new(1.0, 0.0, 0.0),
     ));
-    server.simulate_before_tick(1.0, 1, Some(&NudgePositiveX), &[]);
+    server.simulate_before_tick(1.0, 1, Some(&NudgePositiveX), &[], &HashMap::new());
     let delta = server.tick();
     assert_eq!(delta.updated[0].position.x, 10.0);
 }
@@ -167,7 +168,7 @@ fn simulate_before_tick_pending_removals_end_up_in_delta_removed() {
         Vec3::new(0.0, 0.0, 0.0),
         Vec3::new(0.0, 0.0, 0.0),
     ));
-    server.simulate_before_tick(0.05, 1, Some(&RemoveAll), &[]);
+    server.simulate_before_tick(0.05, 1, Some(&RemoveAll), &[], &HashMap::new());
     let delta = server.tick();
     assert!(delta.updated.is_empty());
     assert_eq!(delta.removed, vec![entity_id]);
@@ -276,7 +277,7 @@ fn simulate_before_tick_panicking_simulation_poisons_but_does_not_cascade() {
     ));
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        server.simulate_before_tick(0.05, 1, Some(&PanicSim), &[]);
+        server.simulate_before_tick(0.05, 1, Some(&PanicSim), &[], &HashMap::new());
     }));
     assert!(result.is_err(), "panicking simulation should propagate");
     // After a panic, the entities lock is poisoned — tick() will also panic.
