@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Accepted |
 | **Date** | 2026-05-09 |
-| **Implemented in** | PR [`brainy-bots/arcane#128`](https://github.com/brainy-bots/arcane/pull/128) (epic PR); sub-PRs [`#130`](https://github.com/brainy-bots/arcane/pull/130), [`#131`](https://github.com/brainy-bots/arcane/pull/131), [`#132`](https://github.com/brainy-bots/arcane/pull/132) |
+| **Implemented in** | PR [`brainy-bots/arcane#129`](https://github.com/brainy-bots/arcane/pull/129) (epic PR); sub-PRs [`#134`](https://github.com/brainy-bots/arcane/pull/134), [`#136`](https://github.com/brainy-bots/arcane/pull/136), [`#137`](https://github.com/brainy-bots/arcane/pull/137) |
 | **Related epic** | [`#127`](https://github.com/brainy-bots/arcane/issues/127) — Cross-cluster physics interaction |
 | **Related issues** | [`#117`](https://github.com/brainy-bots/arcane/issues/117), [`#120`](https://github.com/brainy-bots/arcane/issues/120), [`#121`](https://github.com/brainy-bots/arcane/issues/121), [`#122`](https://github.com/brainy-bots/arcane/issues/122) |
 
@@ -47,7 +47,7 @@ Entity migration between clusters (the proxy becomes real, the real becomes a pr
 - Joint and contact-state coherence during handoff.
 - Deterministic state snapshot semantics.
 
-This ships with the **affinity clustering infrastructure epic** ([`#135`](https://github.com/brainy-bots/arcane/issues/135) — planned). Until then, entities stay on their original cluster.
+This ships with the **affinity clustering infrastructure epic** ([`#34`](https://github.com/brainy-bots/arcane/issues/34) — planned). Until then, entities stay on their original cluster.
 
 ### Key decisions
 
@@ -84,10 +84,10 @@ cargo build -p arcane-infra --features rapier-cluster
 cargo test -p arcane-infra --features rapier-cluster
 
 # Cross-cluster contact events + raycasts + ops routing
-# (tested in sub-PR #132 — cross-cluster physics integration tests)
+# (tested in sub-PRs #136 and #137)
 ```
 
-The 15 cross-cluster-specific tests in `rapier_cluster::tests::cross_cluster_*` cover:
+The 21 cross-cluster-specific tests in `rapier_cluster::tests` and `physics_events_channel::tests` cover:
 
 - Proxy spawn/despawn (neighbor appears, disappears).
 - Proxy position sync each tick (follows replicated position).
@@ -119,7 +119,7 @@ The 15 cross-cluster-specific tests in `rapier_cluster::tests::cross_cluster_*` 
 
 - [`#119`](https://github.com/brainy-bots/arcane/issues/119) — Terrain epic; terrain colliders already support neighbor reads via `RapierMapProvider`.
 - [`#122`](https://github.com/brainy-bots/arcane/issues/122) — Rapier gap inventory; lists proxy configurability and other capabilities.
-- [`#135`](https://github.com/brainy-bots/arcane/issues/135) — Affinity clustering epic (planned); entity migration + authority transfer as a sub-epic.
+- [`#34`](https://github.com/brainy-bots/arcane/issues/34) — Affinity clustering epic (planned); entity migration + authority transfer as a sub-epic.
 
 ## References
 
