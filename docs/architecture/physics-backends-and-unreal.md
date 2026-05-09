@@ -68,22 +68,31 @@ Maintain a **bidirectional map** in the integration layer:
 | Concept | Responsibility |
 |---------|----------------|
 | `entity_id` (`Uuid`) | Stable Arcane / wire identity; store as FGuid or string in UE per project convention. |
-| Chaos actor / body | Spawn when a new owned entity appears in the authoritative set; destroy when removed or when `pending_removals`-style lifecycle fires. |
-| Neighbor entities | **Policy (v1):** treat as **kinematic** or **pose-only** proxies — do not double-simulate. Full cross-cluster coupling is game-specific. |
+| Chaos / Rapier actor / body | Spawn when a new owned entity appears in the authoritative set; destroy when removed or when `pending_removals`-style lifecycle fires. |
+| Neighbor entities | **Policy:** treat as **kinematic** or **pose-only** proxies — do not double-simulate. Full cross-cluster coupling is deferred work (see clustering-binding epic). |
 | `user_data` | Optional: stiffness, hitbox id, team — replicated; keep small. |
 | `local_data` | Solver scratch, cooldowns — **not** on Redis wire; see [four-bucket-state-model.md](four-bucket-state-model.md). |
+| **Body kind** | Per-entity, declared at first-sight via `body_kind_for` hook. `Dynamic` (players, projectiles, debris), `KinematicPositionBased` / `KinematicVelocityBased` (server-controlled motion), `Fixed` (walls, placed structures). Default `Dynamic`. See [entity-model.md §4](entity-model.md). |
+| **Terrain / world geometry** | **Not entities.** Loaded into the cluster's physics world automatically by the Arcane runtime based on entity positions. Game developers do not insert terrain colliders by hand. See [issue #119](https://github.com/brainy-bots/arcane/issues/119). |
 
-**Spawn sync:** On first sight of `entity_id`, create default Chaos representation (capsule/box) from game data or `user_data` schema version.
+**Spawn sync:** On first sight of `entity_id`, create the appropriate body via the `body_kind_for` + `collider_for` hooks. Default body kind is `Dynamic` with a sphere collider matching `RapierConfig::default_body_radius`.
 
-**Despawn:** On removal from cluster authority or `pending_removals`, destroy Chaos objects and clear handles.
+**Despawn:** On removal from cluster authority or `pending_removals`, destroy physics objects and clear handles.
+
+**Sleeping bodies:** stationary Dynamic / Kinematic bodies and all Fixed bodies are essentially free per tick — Rapier's sleep mechanism + Fixed-body solver-skip means a cluster with hundreds of stationary entities pays cost proportional only to active (awake) bodies. The "no entities → no simulation" intuition is preserved by this mechanism without needing a separate concept for stationary objects.
 
 ---
 
 ## 7. Multi-backend path (second engine)
 
-- Add a **separate** crate or binary (e.g. `my-game-physics-rapier`) that implements `ClusterSimulation` for Rapier **without** pulling Rapier into `arcane-core`.
-- **Selection:** which implementation is passed into `run_cluster_loop` (Rust path) or which module runs (Unreal path) is a **build-time or packaging** choice, not a runtime plugin registry in v1.
-- Optional later: feature flags on a game binary that select `Arc<dyn ClusterSimulation>`.
+The Rapier (Rust) backend has landed and is documented in [ADR-001](adr/001-rapier-cluster-integration-shape.md) — composition over inheritance, in-process Rust, single Cargo feature flag, no separate crate. The decisions are captured there:
+
+- **No new `PhysicsBackend` trait.** `RapierClusterSim` is itself a `ClusterSimulation` impl that wraps a user `ClusterSimulation` (or, in the V2 path, a sibling `RapierClusterSimulation`).
+- **Selection** is build-time (Cargo features) and construction-time (which `Arc<dyn ClusterSimulation>` is passed to `run_cluster_loop`); no runtime plugin registry.
+- **Rapier as `optional = true` Cargo dep on `arcane-infra` behind feature `rapier-cluster`.** Vanilla builds pull zero `rapier3d`. No separate crate needed; the feature-flag pattern is sufficient.
+- **Per-engine API discipline:** Rapier-specific types (`RapierColliderShape`, `RapierBodyKind`, `RapierMaterial`) stay in `arcane-infra::rapier_cluster`. They are **not** promoted to engine-neutral `arcane-core` types — see [`entity-model.md` §8](entity-model.md) for why.
+
+The Unreal/Chaos backend will follow the same composition pattern but with engine-native concerns (UE-native types, World Partition integration, Y↔Z axis swap, ×100 unit scale at the wire boundary). [`#124`](https://github.com/brainy-bots/arcane/issues/124) is the implementation epic; ADR-002 (pending) will capture the Unreal-side decisions.
 
 ---
 
