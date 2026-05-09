@@ -104,8 +104,7 @@ pub enum CloseReason {
 
 /// Contract for publishing/subscribing to a neighbor cluster's entity state. One instance per neighbor.
 pub trait IReplicationChannel: Send + Sync {
-    /// Enqueue a delta for transmission. Non-blocking; may return a congestion signal or silently
-    /// drop when the queue is full.
+    /// Enqueue a delta for transmission. Non-blocking; may silently drop when the queue is full.
     fn send(&self, delta: EntityStateDelta);
 
     /// Close the channel, flush pending sends, and release transport resources.
