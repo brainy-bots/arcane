@@ -117,6 +117,7 @@ impl ClusterServer {
         upcoming_tick: u64,
         simulation: Option<&dyn ClusterSimulation>,
         game_actions: &[GameAction],
+        neighbor_entities: &HashMap<Uuid, EntityStateEntry>,
     ) {
         let Some(sim) = simulation else {
             return;
@@ -131,6 +132,7 @@ impl ClusterServer {
                 entities: &mut entities,
                 pending_removals: &mut pending_removals,
                 game_actions,
+                neighbor_entities,
             });
         }
         for id in pending_removals {
