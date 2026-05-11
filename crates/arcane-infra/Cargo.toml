@@ -13,20 +13,21 @@ arcane-pool = { path = "../arcane-pool" }
 arcane-wire = { path = "../arcane-wire" }
 axum = { version = "0.7", optional = true }
 futures-util = { version = "0.3", optional = true }
+libc = { version = "0.2", optional = true }
 rayon = { version = "1", optional = true }
 rapier3d = { version = "0.32", optional = true }
 redis = "0.27"
 reqwest = { version = "0.12", features = ["json", "blocking"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"], optional = true }
 tokio-tungstenite = { version = "0.21", optional = true }
 uuid = { version = "1.0", features = ["v4"] }
 
 [features]
 default = ["cluster-ws"]
 manager = ["dep:axum", "dep:tokio"]
-cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon"]
+cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon", "dep:libc"]
 spacetimedb-persist = ["dep:reqwest"]
 affinity-clustering = ["dep:arcane-affinity"]
 rapier-cluster = ["cluster-ws", "dep:rapier3d"]

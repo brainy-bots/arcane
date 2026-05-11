@@ -41,6 +41,11 @@ pub struct ClusterStats {
     /// transport failure). Non-zero under WS-egress saturation or client
     /// drops. Paired with `ws_accepts` to compute active-connection churn.
     pub ws_send_errors: AtomicU64,
+    /// Accept loop errors (transient EMFILE/ENFILE, peer resets, kernel
+    /// firewall hooks, etc.). Non-zero indicates error recovery happened;
+    /// zero indicates the accept loop never hit any condition that required
+    /// backoff or continuation.
+    pub accept_errors: AtomicU64,
     /// Current entity count observed at the end of the most recent tick.
     pub entities_current: AtomicU64,
     /// Peak entity count observed since startup.
@@ -99,7 +104,7 @@ impl ClusterStats {
     /// so the harness's SSM/poll path is cheap.
     pub fn to_json(&self, cluster_id: &str) -> String {
         format!(
-            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"broadcast_lagged_frames":{},"ws_send_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
+            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"broadcast_lagged_frames":{},"ws_send_errors":{},"accept_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{}}}"#,
             cluster_id,
             self.ws_accepts.load(Ordering::Relaxed),
             self.msgs_player_state.load(Ordering::Relaxed),
@@ -110,6 +115,7 @@ impl ClusterStats {
             self.broadcast_lagged_events.load(Ordering::Relaxed),
             self.broadcast_lagged_frames.load(Ordering::Relaxed),
             self.ws_send_errors.load(Ordering::Relaxed),
+            self.accept_errors.load(Ordering::Relaxed),
             self.entities_current.load(Ordering::Relaxed),
             self.entities_peak.load(Ordering::Relaxed),
             self.unique_entity_ids_count(),
@@ -211,6 +217,7 @@ mod tests {
         s.broadcast_lagged_events.store(4, Ordering::Relaxed);
         s.broadcast_lagged_frames.store(17, Ordering::Relaxed);
         s.ws_send_errors.store(1, Ordering::Relaxed);
+        s.accept_errors.store(2, Ordering::Relaxed);
         s.set_entities(42);
         s.tick.store(500, Ordering::Relaxed);
         s.seq.store(501, Ordering::Relaxed);
@@ -230,6 +237,7 @@ mod tests {
         assert_eq!(parsed["broadcast_lagged_events"], 4);
         assert_eq!(parsed["broadcast_lagged_frames"], 17);
         assert_eq!(parsed["ws_send_errors"], 1);
+        assert_eq!(parsed["accept_errors"], 2);
         assert_eq!(parsed["entities_current"], 42);
         assert_eq!(parsed["entities_peak"], 42);
         assert_eq!(parsed["unique_entity_ids_seen"], 2);
