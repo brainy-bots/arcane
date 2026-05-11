@@ -34,6 +34,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
@@ -59,6 +60,14 @@ fn should_keep_ws_loop_running_on_broadcast_error(
     error: &tokio::sync::broadcast::error::RecvError,
 ) -> bool {
     matches!(error, tokio::sync::broadcast::error::RecvError::Lagged(_))
+}
+
+/// Determine if an accept error should trigger backoff (resource exhaustion).
+/// EMFILE and ENFILE indicate the process or system has run out of file descriptors
+/// and should back off to avoid a tight error loop. Other errors (peer resets, etc.)
+/// continue immediately.
+fn should_backoff_on_accept_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 /// Convert a [`PlayerStatePayload`] (wire-side) into the cluster-internal
@@ -379,7 +388,22 @@ async fn ws_loop(
         }
     });
 
-    while let Ok((stream, peer_addr)) = listener.accept().await {
+    loop {
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                stats.accept_errors.fetch_add(1, Ordering::Relaxed);
+                // Backoff on resource exhaustion to avoid a tight error loop;
+                // continue immediately on transient peer-side errors.
+                if should_backoff_on_accept_error(&e) {
+                    eprintln!("ws accept: fd exhaustion ({}); backing off 100ms", e);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    eprintln!("ws accept: transient error ({}); continuing", e);
+                }
+                continue;
+            }
+        };
         let mut ws_stream = match tokio_tungstenite::accept_async(stream).await {
             Ok(s) => s,
             Err(_) => continue,
@@ -447,7 +471,8 @@ async fn ws_loop(
 mod tests {
     use super::{
         assemble_outbound_frame, encode_entity_chunk, entry_from_wire_player_state,
-        game_action_from_wire, pre_encode_tick, should_keep_ws_loop_running_on_broadcast_error,
+        game_action_from_wire, pre_encode_tick, should_backoff_on_accept_error,
+        should_keep_ws_loop_running_on_broadcast_error,
     };
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::Vec3;
@@ -471,6 +496,34 @@ mod tests {
         assert!(!should_keep_ws_loop_running_on_broadcast_error(
             &RecvError::Closed
         ));
+    }
+
+    // ── accept loop error handling ──────────────────────────────────────
+
+    #[test]
+    fn accept_error_backoff_triggers_on_emfile() {
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(should_backoff_on_accept_error(&err));
+    }
+
+    #[test]
+    fn accept_error_backoff_triggers_on_enfile() {
+        let err = std::io::Error::from_raw_os_error(libc::ENFILE);
+        assert!(should_backoff_on_accept_error(&err));
+    }
+
+    #[test]
+    fn accept_error_no_backoff_on_other_errors() {
+        // ECONNABORTED and other transient errors should not trigger backoff.
+        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert!(!should_backoff_on_accept_error(&err));
+
+        // Test a few other error codes that accept() can return.
+        let err = std::io::Error::from_raw_os_error(libc::EPROTO);
+        assert!(!should_backoff_on_accept_error(&err));
+
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(!should_backoff_on_accept_error(&err));
     }
 
     // ── inbound wire decode (kept from the pre-Shape-B era) ──────────────
