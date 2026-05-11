@@ -18,6 +18,7 @@
 //!
 //! This module does not own simulation timing; `cluster_runner` decides when to call it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -122,6 +123,8 @@ impl SpacetimeDbPersist {
         );
 
         let (tx, rx) = mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+        let persist_count = std::sync::Arc::new(AtomicU64::new(0));
+        let persist_count_bg = persist_count.clone();
 
         std::thread::spawn(move || {
             let client = reqwest::blocking::Client::builder()
@@ -130,7 +133,9 @@ impl SpacetimeDbPersist {
                 .expect("reqwest client");
 
             while let Ok(entries) = rx.recv() {
-                Self::persist_entries(&client, &url, &entries, max_batch_size);
+                let count = persist_count_bg.fetch_add(1, Ordering::Relaxed);
+                let log_this_cycle = count % 10 == 0;
+                Self::persist_entries(&client, &url, &entries, max_batch_size, log_this_cycle);
             }
         });
 
@@ -145,6 +150,7 @@ impl SpacetimeDbPersist {
         url: &str,
         entries: &[EntityStateEntry],
         max_batch_size: usize,
+        log_stats: bool,
     ) {
         if entries.is_empty() {
             return;
@@ -187,15 +193,17 @@ impl SpacetimeDbPersist {
             }
         }
 
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let chunks = entries.len().div_ceil(chunk_size);
-        eprintln!(
-            "SpacetimeDB persist: {} entities ({} chunk(s), max {} each) in {:.1}ms",
-            ok_count + err_count,
-            chunks,
-            chunk_size,
-            ms
-        );
+        if log_stats {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let chunks = entries.len().div_ceil(chunk_size);
+            eprintln!(
+                "SpacetimeDB persist: {} entities ({} chunk(s), max {} each) in {:.1}ms",
+                ok_count + err_count,
+                chunks,
+                chunk_size,
+                ms
+            );
+        }
     }
 
     pub fn maybe_persist(&self, tick: u64, entries: &[EntityStateEntry]) {
@@ -290,34 +298,38 @@ mod tests {
     }
 
     #[test]
-    fn channel_delivery_sends_entries() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+    fn maybe_persist_delivers_entries_through_channel() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+        let persist = SpacetimeDbPersist {
+            sender: tx,
+            interval_ticks: 1,
+        };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
-        tx.send(vec![entry.clone()]).unwrap();
+        persist.maybe_persist(0, &[entry.clone()]);
 
-        let received = rx.recv().unwrap();
+        let received = rx.try_recv().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].entity_id, entry.entity_id);
         assert_eq!(received[0].position.x, 1.0);
     }
 
     #[test]
-    fn backpressure_on_full_channel() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<EntityStateEntry>>(1);
+    fn maybe_persist_drops_on_full_channel() {
+        let (tx, _rx) = mpsc::sync_channel::<Vec<EntityStateEntry>>(1);
+        let persist = SpacetimeDbPersist {
+            sender: tx,
+            interval_ticks: 1,
+        };
 
         let entry = mk_entry(Uuid::from_u128(101), 0.0, 0.0, 0.0);
-        let entries = vec![entry];
-
-        tx.send(entries.clone()).unwrap();
-        let result = tx.try_send(entries);
-
-        match result {
-            Err(mpsc::TrySendError::Full(_)) => {
-                // Expected: channel is full
-            }
-            _ => panic!("Expected channel to be full"),
-        }
+        // Fill the channel
+        persist.maybe_persist(0, &[entry.clone()]);
+        // Second call should drop without blocking (channel full)
+        let t0 = Instant::now();
+        persist.maybe_persist(1, &[entry]);
+        let elapsed = t0.elapsed().as_millis();
+        assert!(elapsed < 10, "maybe_persist blocked on full channel: {}ms", elapsed);
     }
 
     #[test]
