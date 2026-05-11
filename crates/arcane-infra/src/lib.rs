@@ -33,6 +33,8 @@ pub mod cluster_stats;
 #[cfg(feature = "cluster-ws")]
 pub mod physics_events_channel;
 #[cfg(feature = "cluster-ws")]
+pub mod startup;
+#[cfg(feature = "cluster-ws")]
 pub mod ws_server;
 
 #[cfg(feature = "rapier-cluster")]

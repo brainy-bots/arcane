@@ -134,7 +134,7 @@ impl SpacetimeDbPersist {
 
             while let Ok(entries) = rx.recv() {
                 let count = persist_count_bg.fetch_add(1, Ordering::Relaxed);
-                let log_this_cycle = count % 10 == 0;
+                let log_this_cycle = count.is_multiple_of(10);
                 Self::persist_entries(&client, &url, &entries, max_batch_size, log_this_cycle);
             }
         });
@@ -306,7 +306,7 @@ mod tests {
         };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
-        persist.maybe_persist(0, &[entry.clone()]);
+        persist.maybe_persist(0, std::slice::from_ref(&entry));
 
         let received = rx.try_recv().unwrap();
         assert_eq!(received.len(), 1);
@@ -324,12 +324,16 @@ mod tests {
 
         let entry = mk_entry(Uuid::from_u128(101), 0.0, 0.0, 0.0);
         // Fill the channel
-        persist.maybe_persist(0, &[entry.clone()]);
+        persist.maybe_persist(0, std::slice::from_ref(&entry));
         // Second call should drop without blocking (channel full)
         let t0 = Instant::now();
         persist.maybe_persist(1, &[entry]);
         let elapsed = t0.elapsed().as_millis();
-        assert!(elapsed < 10, "maybe_persist blocked on full channel: {}ms", elapsed);
+        assert!(
+            elapsed < 10,
+            "maybe_persist blocked on full channel: {}ms",
+            elapsed
+        );
     }
 
     #[test]
