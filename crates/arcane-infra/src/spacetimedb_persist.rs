@@ -18,6 +18,7 @@
 //!
 //! This module does not own simulation timing; `cluster_runner` decides when to call it.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use arcane_core::replication_channel::EntityStateEntry;
@@ -74,11 +75,8 @@ fn should_persist_tick(tick: u64, interval_ticks: u64, entries_len: usize) -> bo
 }
 
 pub struct SpacetimeDbPersist {
-    client: reqwest::blocking::Client,
-    url: String,
+    sender: mpsc::SyncSender<Vec<EntityStateEntry>>,
     interval_ticks: u64,
-    /// Max entities per HTTP request (0 = no cap, send all in one request).
-    max_batch_size: usize,
 }
 
 impl SpacetimeDbPersist {
@@ -122,29 +120,46 @@ impl SpacetimeDbPersist {
                 max_batch_size.to_string()
             }
         );
-        Some(Self {
-            client: reqwest::blocking::Client::builder()
+
+        let (tx, rx) = mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+
+        std::thread::spawn(move || {
+            let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
-                .expect("reqwest client"),
-            url,
+                .expect("reqwest client");
+
+            while let Ok(entries) = rx.recv() {
+                Self::persist_entries(&client, &url, &entries, max_batch_size);
+            }
+        });
+
+        Some(Self {
+            sender: tx,
             interval_ticks,
-            max_batch_size,
         })
     }
 
-    pub fn maybe_persist(&self, tick: u64, entries: &[EntityStateEntry]) {
-        if !should_persist_tick(tick, self.interval_ticks, entries.len()) {
+    fn persist_entries(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        entries: &[EntityStateEntry],
+        max_batch_size: usize,
+    ) {
+        if entries.is_empty() {
             return;
         }
-        let chunk_size = if self.max_batch_size > 0 {
-            self.max_batch_size
+
+        let chunk_size = if max_batch_size > 0 {
+            max_batch_size
         } else {
             entries.len()
         };
+
         let t0 = Instant::now();
         let mut ok_count = 0usize;
         let mut err_count = 0usize;
+
         for chunk in entries.chunks(chunk_size) {
             let body = match encode_spacetimedb_entities_body(chunk) {
                 Ok(s) => s,
@@ -154,9 +169,8 @@ impl SpacetimeDbPersist {
                     continue;
                 }
             };
-            match self
-                .client
-                .post(&self.url)
+            match client
+                .post(url)
                 .header("Content-Type", "application/json")
                 .body(body)
                 .send()
@@ -172,16 +186,31 @@ impl SpacetimeDbPersist {
                 }
             }
         }
-        if tick.is_multiple_of(self.interval_ticks * 10) && !entries.is_empty() {
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let chunks = entries.len().div_ceil(chunk_size);
-            eprintln!(
-                "SpacetimeDB persist: {} entities ({} chunk(s), max {} each) in {:.1}ms",
-                ok_count + err_count,
-                chunks,
-                chunk_size,
-                ms
-            );
+
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let chunks = entries.len().div_ceil(chunk_size);
+        eprintln!(
+            "SpacetimeDB persist: {} entities ({} chunk(s), max {} each) in {:.1}ms",
+            ok_count + err_count,
+            chunks,
+            chunk_size,
+            ms
+        );
+    }
+
+    pub fn maybe_persist(&self, tick: u64, entries: &[EntityStateEntry]) {
+        if !should_persist_tick(tick, self.interval_ticks, entries.len()) {
+            return;
+        }
+
+        match self.sender.try_send(entries.to_vec()) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                eprintln!("SpacetimeDB persist: channel full, dropping snapshot");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                eprintln!("SpacetimeDB persist: background thread exited");
+            }
         }
     }
 }
@@ -258,5 +287,59 @@ mod tests {
         assert!(!should_persist_tick(1, 20, 5));
         assert!(!should_persist_tick(19, 20, 5));
         assert!(!should_persist_tick(20, 20, 0));
+    }
+
+    #[test]
+    fn channel_delivery_sends_entries() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+
+        let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
+        tx.send(vec![entry.clone()]).unwrap();
+
+        let received = rx.recv().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].entity_id, entry.entity_id);
+        assert_eq!(received[0].position.x, 1.0);
+    }
+
+    #[test]
+    fn backpressure_on_full_channel() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<EntityStateEntry>>(1);
+
+        let entry = mk_entry(Uuid::from_u128(101), 0.0, 0.0, 0.0);
+        let entries = vec![entry];
+
+        tx.send(entries.clone()).unwrap();
+        let result = tx.try_send(entries);
+
+        match result {
+            Err(mpsc::TrySendError::Full(_)) => {
+                // Expected: channel is full
+            }
+            _ => panic!("Expected channel to be full"),
+        }
+    }
+
+    #[test]
+    fn maybe_persist_is_nonblocking() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<EntityStateEntry>>(1);
+
+        let persist = SpacetimeDbPersist {
+            sender: tx,
+            interval_ticks: 1,
+        };
+
+        let entry = mk_entry(Uuid::from_u128(102), 0.0, 0.0, 0.0);
+        let entries = vec![entry];
+
+        let t0 = Instant::now();
+        persist.maybe_persist(0, &entries);
+        let elapsed = t0.elapsed().as_millis();
+
+        assert!(
+            elapsed < 10,
+            "maybe_persist should complete in < 10ms, took {}ms",
+            elapsed
+        );
     }
 }
