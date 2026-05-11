@@ -329,7 +329,11 @@ mod tests {
         let t0 = Instant::now();
         persist.maybe_persist(1, &[entry]);
         let elapsed = t0.elapsed().as_millis();
-        assert!(elapsed < 10, "maybe_persist blocked on full channel: {}ms", elapsed);
+        assert!(
+            elapsed < 10,
+            "maybe_persist blocked on full channel: {}ms",
+            elapsed
+        );
     }
 
     #[test]

@@ -19,6 +19,7 @@ use arcane_infra::cluster_runner::{self, ClusterEnv};
 use arcane_infra::{RapierClusterSim, RapierConfig};
 
 fn main() -> Result<(), String> {
+    arcane_infra::startup::raise_and_assert_fd_limit()?;
     let env = ClusterEnv::from_env()?;
 
     let user_sim: Option<Arc<dyn ClusterSimulation>> = None;
