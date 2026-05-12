@@ -190,6 +190,19 @@ The Arcane repos are operated as an AI-native workflow: many agents working conc
 - **Standalone PR → main**: agent merges per the rubric. If anything is uncertain, escalate.
 - **Epic PR → main**: founder always. Hard invariant in the orchestrator skill — never auto-merge.
 
+### Post-merge issue closure
+
+After merging a sub-PR to the epic branch, **close the linked sub-issue** (not the epic issue). GitHub's `Closes #X` keyword only fires when the PR merges to the default branch; sub-PRs must explicitly close:
+
+```bash
+gh issue close "$ISSUE_NUMBER" \
+  --comment "Implemented in PR #$PR_NUMBER, merged to \`$EPIC_BRANCH\`."
+```
+
+**Exception:** Do not close epic issues — those stay open until the epic→main PR merges to `main`.
+
+See `arcane-worker/references/pr-conventions.md` for full details.
+
 The full rubric (low-complexity criteria, architectural pillars list, escalation triggers, chain-issue convention, how-to-apply) is the canonical agent-readable doc at [`references/merge-authority.md`](references/merge-authority.md). Read it before any merge.
 
 ## Architecture review lives in the epic conversation
