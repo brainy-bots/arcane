@@ -25,7 +25,7 @@ Imperative, scoped, ≤72 chars. Match the project's existing commit/PR style (r
 Closes #N
 ```
 
-The `Closes #N` line on its own at the bottom auto-closes the issue when the PR merges (GitHub convention). For sub-issues of an epic, the orchestrator handles the close on epic→main merge — so use `Refs #N` instead of `Closes #N` to avoid GitHub auto-closing prematurely. (The orchestrator's Rule 10 cleanup handles labels separately.)
+For standalone PRs targeting `main`, use `Closes #N` — GitHub auto-closes the issue on merge. For sub-PRs targeting an epic branch, use `Refs #N` (GitHub won't auto-close for non-default branches) and follow the post-merge issue closure process below.
 
 ## Decisions made — the bar
 
@@ -101,3 +101,25 @@ For non-trivial implementations (any change that introduces new modules, types, 
 Match what the issue body specifies; add obvious categories the issue didn't anticipate. Integration tests alone are not sufficient — unit-test new modules in `#[cfg(test)] mod tests { ... }` blocks (Rust) or the equivalent for other stacks.
 
 Pure scaffolding (e.g., adding an empty file referenced by another change) doesn't need tests. Use judgment.
+
+## Post-merge issue closure
+
+**After merging a sub-PR to the epic branch**, close the linked issue with a comment. This step is mandatory for sub-PRs; it ensures issues don't accumulate in `OPEN` state after implementation.
+
+**For sub-PRs (targeting epic branch):**
+GitHub's `Closes #X` keyword only closes issues when the PR merges to the default branch. Since sub-PRs target epic branches, you must explicitly close the issue:
+
+```bash
+gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+  --comment "Implemented in PR #$PR_NUMBER, merged to \`$TARGET_BRANCH\`."
+```
+
+**Exception:** Do NOT close epic issues — those stay open until the epic→main PR merges to `main`. Only close sub-issues.
+
+**For standalone PRs (targeting main):**
+GitHub's `Closes #X` in the PR description auto-closes the issue. No additional step needed.
+
+**If a PR implements multiple issues:**
+Close all of them with the same comment pattern.
+
+This is part of the merge workflow, not a separate step — it pairs with the PR merge itself.
