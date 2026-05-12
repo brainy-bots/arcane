@@ -75,11 +75,35 @@ gh pr merge "$SUB_PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
 
 `--delete-branch=false` keeps the worker's branch around in case we need to inspect it later. The orchestrator never deletes branches itself.
 
+### Step 3a: Close linked issues (unless epic)
+
+After merging, close each implementing sub-issue so issues don't accumulate in `OPEN` state. GitHub's `Closes #X` only works for PRs targeting `main`; sub-PRs targeting epic branches must close explicitly.
+
+A PR may implement multiple issues. Extract all referenced issue numbers from the PR body (`Refs #N`, `Fixes #N`, `Closes #N`, `(#N)` in the title).
+
+```bash
+for ISSUE_NUMBER in $LINKED_ISSUE_NUMBERS; do
+  # Check the epic label — this is the structured metadata, not body text
+  LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+    --json labels --jq '.labels[].name')
+
+  if echo "$LABELS" | grep -qw "epic"; then
+    echo "Skipping close for epic issue #$ISSUE_NUMBER"
+    continue
+  fi
+
+  gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+    --comment "Implemented in PR #$SUB_PR_NUMBER, merged to \`$EPIC_BRANCH\`."
+done
+```
+
 ### Step 4: Label cleanup (Rule 10)
 
 ```bash
-gh issue edit "$SUB_ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label claude-ready || true
-gh issue edit "$SUB_ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label claude-working || true
+for ISSUE_NUMBER in $LINKED_ISSUE_NUMBERS; do
+  gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label claude-ready || true
+  gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label claude-working || true
+done
 ```
 
 ### Step 5: Update epic PR body
