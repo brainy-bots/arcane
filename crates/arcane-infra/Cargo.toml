@@ -12,6 +12,7 @@ arcane-affinity = { path = "../arcane-affinity", optional = true }
 arcane-pool = { path = "../arcane-pool" }
 arcane-wire = { path = "../arcane-wire" }
 axum = { version = "0.7", optional = true }
+dashmap = { version = "5.5", optional = true }
 futures-util = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 rayon = { version = "1", optional = true }
@@ -27,7 +28,7 @@ uuid = { version = "1.0", features = ["v4"] }
 [features]
 default = ["cluster-ws"]
 manager = ["dep:axum", "dep:tokio"]
-cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon", "dep:libc"]
+cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon", "dep:libc", "dep:dashmap"]
 spacetimedb-persist = ["dep:reqwest"]
 affinity-clustering = ["dep:arcane-affinity"]
 rapier-cluster = ["cluster-ws", "dep:rapier3d"]
