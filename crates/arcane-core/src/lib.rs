@@ -8,6 +8,7 @@
 //! - `server_pool`: allocation/release contract for cluster server capacity.
 //! - `replication_channel`: neighbor-delta contract, [`EntityStateEntry`](replication_channel::EntityStateEntry) (four-bucket spine + JSON fields), [`IReplicationChannel`](replication_channel::IReplicationChannel).
 //! - `world_simulator`: contract for unobserved entity state progression.
+//! - `visibility`: per-client visibility filtering in the outbound pipeline, [`IVisibilityFilter`](visibility::IVisibilityFilter).
 //!
 //! ## Interaction model
 //! Implementations in sibling crates (`arcane-rules`, `arcane-pool`, `arcane-infra`) depend on
@@ -20,6 +21,7 @@ pub mod physics_events;
 pub mod replication_channel;
 pub mod server_pool;
 pub mod types;
+pub mod visibility;
 pub mod world_simulator;
 
 pub use cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
@@ -35,4 +37,5 @@ pub use server_pool::{
     FailureType, IServerPool, PoolError, PoolErrorCode, PoolStatus, ReplacementHandle, ServerHandle,
 };
 pub use types::{ClusterGeometry, Vec2, Vec3};
+pub use visibility::IVisibilityFilter;
 pub use world_simulator::{IWorldSimulator, LastKnownState, SimulatedState, WorldContext};
