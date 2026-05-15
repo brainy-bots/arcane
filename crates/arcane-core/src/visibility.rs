@@ -8,8 +8,8 @@ use crate::types::Vec3;
 use uuid::Uuid;
 
 /// Per-client visibility filter. Called once per subscriber per tick
-/// during outbound frame assembly to select which entity chunks
-/// this client should receive.
+/// by the producer task during visibility mask computation. Filters
+/// determine which entity chunks this client should receive.
 pub trait IVisibilityFilter: Send + Sync {
     /// Filter entities based on observer position.
     ///

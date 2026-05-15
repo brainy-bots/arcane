@@ -148,6 +148,7 @@ where
         client_updates_tx,
         game_actions_tx,
         stats.clone(),
+        None,
     );
 
     let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel::<EntityStateDelta>();

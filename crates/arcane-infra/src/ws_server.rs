@@ -23,7 +23,7 @@
 //! chunk, builds a [`PreEncodedTick`] holding `Arc<Vec<u8>>` chunks plus the
 //! delta header and removed-id list, and broadcasts that to all subscribers.
 //! Per-client tasks assemble their outbound frame by selecting which entity
-//! chunks to include (today: all; with AOI: a filtered subset) and calling
+//! chunks to include (via precomputed visibility masks when a filter is active) and calling
 //! [`arcane_wire::encode_server_delta_from_chunks`]. Subscribers never
 //! re-serialize individual entities, so the per-tick cost is O(entity count)
 //! at the producer and O(entity count × subscriber count) in Arc clones and
@@ -153,7 +153,7 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
 
 /// Per-tick snapshot assembled once by the producer and broadcast to all
 /// subscribers. Each per-client task builds its outbound wire frame by
-/// selecting which entity chunks it wants (today: all; with AOI: a subset)
+/// selecting which entity chunks it wants (via precomputed visibility masks when a filter is active)
 /// and calling [`arcane_wire::encode_server_delta_from_chunks`].
 ///
 /// Entity chunks are `Arc<Vec<u8>>` so N subscribers share one allocation per
@@ -395,6 +395,7 @@ pub fn run_ws_server(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<ClusterStats>,
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -417,6 +418,7 @@ pub fn run_ws_server(
             client_updates_tx,
             game_actions_tx,
             stats,
+            visibility_filter,
         ));
     });
 }
@@ -430,6 +432,7 @@ async fn ws_loop(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<ClusterStats>,
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity postcard chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
@@ -462,6 +465,12 @@ async fn ws_loop(
     let subscriber_positions = Arc::new(DashMap::new());
     let positions_clone = subscriber_positions.clone();
 
+    // Clone the visibility filter for the producer task
+    let filter_clone = visibility_filter.clone();
+
+    // Determine if position tracking is active (only when filter is configured)
+    let filter_active = visibility_filter.is_some();
+
     tokio::spawn(async move {
         let recompute_interval = visibility_recompute_interval();
         let mut cached_masks: Arc<HashMap<u64, Vec<bool>>> = Arc::new(HashMap::new());
@@ -479,8 +488,12 @@ async fn ws_loop(
 
                     let entity_count = tick.entity_metadata.len();
                     if ticks_until_recompute == 0 || entity_count != cached_entity_count {
-                        cached_masks =
-                            Arc::new(compute_visibility_masks(&tick, None, &positions_clone));
+                        let filter_ref = filter_clone.as_ref().map(|f| f.as_ref());
+                        cached_masks = Arc::new(compute_visibility_masks(
+                            &tick,
+                            filter_ref,
+                            &positions_clone,
+                        ));
                         cached_entity_count = entity_count;
                         ticks_until_recompute = recompute_interval;
                     } else {
@@ -533,6 +546,7 @@ async fn ws_loop(
         let positions = subscriber_positions.clone();
 
         tokio::spawn(async move {
+            let track_positions = filter_active;
             loop {
                 tokio::select! {
                     result = recv.recv() => {
@@ -570,10 +584,12 @@ async fn ws_loop(
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Binary(bytes))) => {
-                                if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
-                                    if let Some(entry) = entry_from_wire_player_state(&payload) {
-                                        // Update shared subscriber positions
-                                        positions.insert(subscriber_id, entry.position);
+                                // Track positions only when filter is active
+                                if track_positions {
+                                    if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
+                                        if let Some(entry) = entry_from_wire_player_state(&payload) {
+                                            positions.insert(subscriber_id, entry.position);
+                                        }
                                     }
                                 }
                                 let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
