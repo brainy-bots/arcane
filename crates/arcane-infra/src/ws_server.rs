@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+use arcane_core::visibility::IVisibilityFilter;
 use arcane_core::Vec3;
 use arcane_wire::{
     ClientFrame, DeltaHeader, EntityState as WireEntityState, GameActionPayload,
@@ -159,6 +160,7 @@ struct PreEncodedTick {
     header: DeltaHeader,
     entity_chunks: Vec<Arc<Vec<u8>>>,
     removed: Vec<Uuid>,
+    entity_metadata: Vec<(Uuid, Vec3)>,
 }
 
 /// Convert an [`EntityStateDelta`] to a [`PreEncodedTick`] by serializing
@@ -183,6 +185,11 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
         .par_iter()
         .map(|e| Arc::new(encode_entity_chunk(e)))
         .collect();
+    let entity_metadata: Vec<(Uuid, Vec3)> = delta
+        .updated
+        .iter()
+        .map(|e| (e.entity_id, e.position))
+        .collect();
     PreEncodedTick {
         header: DeltaHeader {
             source_cluster_id: delta.source_cluster_id,
@@ -192,14 +199,29 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
         },
         entity_chunks,
         removed: delta.removed.clone(),
+        entity_metadata,
     }
 }
 
 /// Assemble the outbound wire frame for one subscriber from a shared
 /// [`PreEncodedTick`]. Today every subscriber takes all chunks; with AOI it
 /// will take a filtered subset.
-fn assemble_outbound_frame(tick: &PreEncodedTick) -> Result<Vec<u8>, arcane_wire::Error> {
-    let chunk_refs: Vec<&[u8]> = tick.entity_chunks.iter().map(|c| c.as_slice()).collect();
+fn assemble_outbound_frame(
+    tick: &PreEncodedTick,
+    filter: Option<&dyn IVisibilityFilter>,
+    observer_position: Option<Vec3>,
+) -> Result<Vec<u8>, arcane_wire::Error> {
+    let chunk_refs: Vec<&[u8]> = match (filter, observer_position) {
+        (Some(f), Some(obs)) => {
+            let mask = f.filter(obs, &tick.entity_metadata);
+            tick.entity_chunks
+                .iter()
+                .zip(mask.iter())
+                .filter_map(|(c, &visible)| if visible { Some(c.as_slice()) } else { None })
+                .collect()
+        }
+        _ => tick.entity_chunks.iter().map(|c| c.as_slice()).collect(),
+    };
     arcane_wire::encode_server_delta_from_chunks(&tick.header, &chunk_refs, &tick.removed)
 }
 
@@ -417,6 +439,7 @@ async fn ws_loop(
         let actions_tx = game_actions_tx.clone();
         let stats = stats.clone();
         tokio::spawn(async move {
+            let mut observer_position: Option<Vec3> = None;
             loop {
                 tokio::select! {
                     result = recv.recv() => {
@@ -426,7 +449,7 @@ async fn ws_loop(
                                 // (today: all; with AOI: filtered subset)
                                 // and assemble a wire-compatible frame. No
                                 // per-entity re-serialization happens here.
-                                let bytes = match assemble_outbound_frame(&tick_arc) {
+                                let bytes = match assemble_outbound_frame(&tick_arc, None, observer_position) {
                                     Ok(b) => b,
                                     Err(_) => continue,
                                 };
@@ -453,6 +476,11 @@ async fn ws_loop(
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Binary(bytes))) => {
+                                if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
+                                    if let Some(entry) = entry_from_wire_player_state(&payload) {
+                                        observer_position = Some(entry.position);
+                                    }
+                                }
                                 let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
                             }
                             Some(Err(_)) | None => break,
@@ -673,7 +701,7 @@ mod tests {
         assert_eq!(pre_tick.header.seq, 7);
         assert_eq!(pre_tick.header.tick, 42);
 
-        let bytes = assemble_outbound_frame(&pre_tick).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
 
@@ -705,7 +733,7 @@ mod tests {
             removed: Vec::new(),
         };
         let pre_tick = pre_encode_tick(&delta);
-        let bytes = assemble_outbound_frame(&pre_tick).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         assert!(payload.updated.is_empty());
@@ -743,7 +771,8 @@ mod tests {
             removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
 
-        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta)).expect("shape-b bytes");
+        let via_shape_b =
+            assemble_outbound_frame(&pre_encode_tick(&delta), None, None).expect("shape-b bytes");
 
         // Reference: build the wire DeltaPayload by materializing every
         // WireEntityState inline, encode as one ServerFrame::Delta — the
@@ -840,7 +869,7 @@ mod tests {
 
         // Also verify end-to-end frame decodes identically to what a
         // serial encode would have produced.
-        let bytes = assemble_outbound_frame(&pre_tick).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         for (i, e) in payload.updated.iter().enumerate() {
@@ -892,5 +921,165 @@ mod tests {
             Some(v) => std::env::set_var("ARCANE_CLUSTER_ENCODE_THREADS", v),
             None => std::env::remove_var("ARCANE_CLUSTER_ENCODE_THREADS"),
         }
+    }
+
+    // ── visibility filter integration ────────────────────────────────────
+
+    /// Mock visibility filter for testing AOI integration.
+    struct MockRadiusFilter {
+        radius: f64,
+    }
+
+    impl MockRadiusFilter {
+        fn new(radius: f64) -> Self {
+            Self { radius }
+        }
+    }
+
+    impl arcane_core::visibility::IVisibilityFilter for MockRadiusFilter {
+        fn filter(&self, observer_position: Vec3, entities: &[(Uuid, Vec3)]) -> Vec<bool> {
+            entities
+                .iter()
+                .map(|(_, pos)| {
+                    let distance_sq = observer_position.distance_sq_to(pos);
+                    distance_sq <= self.radius * self.radius
+                })
+                .collect()
+        }
+    }
+
+    /// With a visibility filter applied, only entities passing the filter
+    /// should appear in the outbound frame.
+    #[test]
+    fn assemble_with_filter_includes_only_visible_entities() {
+        let mut entities = Vec::new();
+        // Entity at (0, 0, 0)
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(1),
+            Uuid::from_u128(99),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+        // Entity at (5, 0, 0) — within radius 10
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(99),
+            Vec3::new(5.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+        // Entity at (20, 0, 0) — outside radius 10
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(3),
+            Uuid::from_u128(99),
+            Vec3::new(20.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: entities,
+            removed: Vec::new(),
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+
+        // Observer at (0, 0, 0), filter radius 10
+        let observer_pos = Vec3::new(0.0, 0.0, 0.0);
+        let filter = MockRadiusFilter::new(10.0);
+        let bytes_filtered = assemble_outbound_frame(&pre_tick, Some(&filter), Some(observer_pos))
+            .expect("filtered");
+
+        // Decode the filtered frame
+        let decoded_filtered =
+            arcane_wire::decode_server(&bytes_filtered).expect("decode filtered");
+        let ServerFrame::Delta(payload) = decoded_filtered;
+        assert_eq!(payload.updated.len(), 2);
+        assert_eq!(payload.updated[0].entity_id, Uuid::from_u128(1));
+        assert_eq!(payload.updated[1].entity_id, Uuid::from_u128(2));
+    }
+
+    /// Without a visibility filter (None), all entities should be included
+    /// — this is the backward-compatible no-filter behavior.
+    #[test]
+    fn assemble_without_filter_includes_all_entities() {
+        let mut entities = Vec::new();
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(1),
+            Uuid::from_u128(99),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(2),
+            Uuid::from_u128(99),
+            Vec3::new(5.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+        entities.push(EntityStateEntry::new(
+            Uuid::from_u128(3),
+            Uuid::from_u128(99),
+            Vec3::new(20.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 0.0),
+        ));
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: entities,
+            removed: Vec::new(),
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+
+        // No filter (None)
+        let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None, None).expect("unfiltered");
+
+        // Decode the unfiltered frame
+        let decoded_unfiltered =
+            arcane_wire::decode_server(&bytes_unfiltered).expect("decode unfiltered");
+        let ServerFrame::Delta(payload) = decoded_unfiltered;
+        assert_eq!(payload.updated.len(), 3);
+        assert_eq!(payload.updated[0].entity_id, Uuid::from_u128(1));
+        assert_eq!(payload.updated[1].entity_id, Uuid::from_u128(2));
+        assert_eq!(payload.updated[2].entity_id, Uuid::from_u128(3));
+    }
+
+    /// Verify that Shape B byte-for-byte parity still holds when filter is None.
+    #[test]
+    fn shape_b_byte_parity_maintained_with_none_filter() {
+        let mut entities = Vec::new();
+        for i in 0..10_u128 {
+            let e = EntityStateEntry::new(
+                Uuid::from_u128(i),
+                Uuid::from_u128(99),
+                Vec3::new(i as f64, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            );
+            entities.push(e);
+        }
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: entities.clone(),
+            removed: Vec::new(),
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+
+        // Both should produce identical bytes when filter is None
+        let bytes_no_args = assemble_outbound_frame(&pre_tick, None, None).expect("no args");
+        let bytes_none_filter =
+            assemble_outbound_frame(&pre_tick, None, Some(Vec3::new(0.0, 0.0, 0.0)))
+                .expect("none filter");
+
+        assert_eq!(bytes_no_args, bytes_none_filter);
     }
 }
