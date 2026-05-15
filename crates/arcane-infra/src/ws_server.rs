@@ -166,15 +166,13 @@ struct PreEncodedTick {
 }
 
 /// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
-/// Holds `Arc<PreEncodedTick>` and a `HashMap<u64, Vec<bool>>` for subscriber-specific
-/// visibility masks computed by the producer using rayon parallelization.
-///
-/// When a visibility filter is active, masks are precomputed for each connected subscriber
-/// and stored here. Subscribers apply the precomputed mask (O(1) lookup + mask application)
-/// instead of calling the filter themselves.
+/// Masks are wrapped in `Arc` so the producer can cache and reuse them across multiple
+/// ticks without cloning the full HashMap. Recomputation happens every N ticks
+/// (configurable via `ARCANE_VISIBILITY_RECOMPUTE_TICKS`), or immediately when the
+/// entity count changes (mask length would mismatch).
 struct TickBroadcast {
     tick: Arc<PreEncodedTick>,
-    masks: HashMap<u64, Vec<bool>>,
+    masks: Arc<HashMap<u64, Vec<bool>>>,
 }
 
 /// Convert an [`EntityStateDelta`] to a [`PreEncodedTick`] by serializing
@@ -339,6 +337,25 @@ fn init_encode_thread_pool() {
     }
 }
 
+/// How many ticks to reuse cached visibility masks before recomputing.
+///
+/// At 3K entities × 3K subscribers, a full recompute is ~9M distance checks.
+/// Reusing masks across ticks amortizes this cost: at 60 Hz with an interval
+/// of 30, masks recompute at ~2 Hz — reducing filter work by ~30×.
+///
+/// Masks are also invalidated when the entity count changes (spawn/despawn),
+/// since the mask length must match the entity chunk count.
+///
+/// `ARCANE_VISIBILITY_RECOMPUTE_TICKS` env var overrides the default.
+fn visibility_recompute_interval() -> u64 {
+    if let Ok(s) = std::env::var("ARCANE_VISIBILITY_RECOMPUTE_TICKS") {
+        if let Ok(n) = s.parse::<u64>() {
+            return n.max(1);
+        }
+    }
+    30
+}
+
 /// Compute all subscriber visibility masks in parallel via rayon.
 /// Takes the preencoded tick, the visibility filter, and subscriber positions.
 /// Returns a HashMap<subscriber_id, mask> where each mask is a Vec<bool> indicating
@@ -446,6 +463,11 @@ async fn ws_loop(
     let positions_clone = subscriber_positions.clone();
 
     tokio::spawn(async move {
+        let recompute_interval = visibility_recompute_interval();
+        let mut cached_masks: Arc<HashMap<u64, Vec<bool>>> = Arc::new(HashMap::new());
+        let mut cached_entity_count: usize = 0;
+        let mut ticks_until_recompute: u64 = 0;
+
         loop {
             let r = rx.clone();
             let delta = tokio::task::spawn_blocking(move || r.lock().unwrap().recv())
@@ -453,16 +475,22 @@ async fn ws_loop(
                 .unwrap();
             match delta {
                 Ok(d) => {
-                    // Per-tick producer work: serialize every entity once
-                    // and build the shared tick struct. All subscribers
-                    // reuse these Arc-shared chunks without re-serializing.
                     let tick = Arc::new(pre_encode_tick(&d));
 
-                    // Compute visibility masks for all subscribers in parallel.
-                    // When a filter is active, masks are precomputed here.
-                    // When filter is None, masks HashMap is empty (no filtering).
-                    let masks = compute_visibility_masks(&tick, None, &positions_clone);
-                    let broadcast = Arc::new(TickBroadcast { tick, masks });
+                    let entity_count = tick.entity_metadata.len();
+                    if ticks_until_recompute == 0 || entity_count != cached_entity_count {
+                        cached_masks =
+                            Arc::new(compute_visibility_masks(&tick, None, &positions_clone));
+                        cached_entity_count = entity_count;
+                        ticks_until_recompute = recompute_interval;
+                    } else {
+                        ticks_until_recompute -= 1;
+                    }
+
+                    let broadcast = Arc::new(TickBroadcast {
+                        tick,
+                        masks: cached_masks.clone(),
+                    });
                     let _ = tx_clone.send(broadcast);
                 }
                 Err(_) => break,
