@@ -952,28 +952,29 @@ mod tests {
     /// should appear in the outbound frame.
     #[test]
     fn assemble_with_filter_includes_only_visible_entities() {
-        let mut entities = Vec::new();
-        // Entity at (0, 0, 0)
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(1),
-            Uuid::from_u128(99),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
-        // Entity at (5, 0, 0) — within radius 10
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(2),
-            Uuid::from_u128(99),
-            Vec3::new(5.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
-        // Entity at (20, 0, 0) — outside radius 10
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(3),
-            Uuid::from_u128(99),
-            Vec3::new(20.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
+        let entities = vec![
+            // Entity at (0, 0, 0)
+            EntityStateEntry::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(99),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            // Entity at (5, 0, 0) — within radius 10
+            EntityStateEntry::new(
+                Uuid::from_u128(2),
+                Uuid::from_u128(99),
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            // Entity at (20, 0, 0) — outside radius 10
+            EntityStateEntry::new(
+                Uuid::from_u128(3),
+                Uuid::from_u128(99),
+                Vec3::new(20.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        ];
 
         let delta = EntityStateDelta {
             source_cluster_id: Uuid::from_u128(99),
@@ -1005,25 +1006,26 @@ mod tests {
     /// — this is the backward-compatible no-filter behavior.
     #[test]
     fn assemble_without_filter_includes_all_entities() {
-        let mut entities = Vec::new();
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(1),
-            Uuid::from_u128(99),
-            Vec3::new(0.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(2),
-            Uuid::from_u128(99),
-            Vec3::new(5.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
-        entities.push(EntityStateEntry::new(
-            Uuid::from_u128(3),
-            Uuid::from_u128(99),
-            Vec3::new(20.0, 0.0, 0.0),
-            Vec3::new(0.0, 0.0, 0.0),
-        ));
+        let entities = vec![
+            EntityStateEntry::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(99),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            EntityStateEntry::new(
+                Uuid::from_u128(2),
+                Uuid::from_u128(99),
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            EntityStateEntry::new(
+                Uuid::from_u128(3),
+                Uuid::from_u128(99),
+                Vec3::new(20.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        ];
 
         let delta = EntityStateDelta {
             source_cluster_id: Uuid::from_u128(99),
