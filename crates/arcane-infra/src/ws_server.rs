@@ -30,8 +30,9 @@
 //! byte-concatenation — never O(entity count × subscriber count) in
 //! serialization, which was the regression this design fixes.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,7 @@ use arcane_wire::{
     ClientFrame, DeltaHeader, EntityState as WireEntityState, GameActionPayload,
     PlayerStatePayload, Vec3 as WireVec3,
 };
+use dashmap::DashMap;
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use rayon::prelude::*;
 use tokio::net::TcpListener;
@@ -163,6 +165,18 @@ struct PreEncodedTick {
     entity_metadata: Vec<(Uuid, Vec3)>,
 }
 
+/// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
+/// Holds `Arc<PreEncodedTick>` and a `HashMap<u64, Vec<bool>>` for subscriber-specific
+/// visibility masks computed by the producer using rayon parallelization.
+///
+/// When a visibility filter is active, masks are precomputed for each connected subscriber
+/// and stored here. Subscribers apply the precomputed mask (O(1) lookup + mask application)
+/// instead of calling the filter themselves.
+struct TickBroadcast {
+    tick: Arc<PreEncodedTick>,
+    masks: HashMap<u64, Vec<bool>>,
+}
+
 /// Convert an [`EntityStateDelta`] to a [`PreEncodedTick`] by serializing
 /// each entity once. Called by the producer task every tick.
 ///
@@ -204,23 +218,20 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
 }
 
 /// Assemble the outbound wire frame for one subscriber from a shared
-/// [`PreEncodedTick`]. Today every subscriber takes all chunks; with AOI it
-/// will take a filtered subset.
+/// [`PreEncodedTick`] and a precomputed visibility mask.
+/// The mask is a boolean vector where `true` means the entity is visible.
 fn assemble_outbound_frame(
     tick: &PreEncodedTick,
-    filter: Option<&dyn IVisibilityFilter>,
-    observer_position: Option<Vec3>,
+    mask: Option<&[bool]>,
 ) -> Result<Vec<u8>, arcane_wire::Error> {
-    let chunk_refs: Vec<&[u8]> = match (filter, observer_position) {
-        (Some(f), Some(obs)) => {
-            let mask = f.filter(obs, &tick.entity_metadata);
-            tick.entity_chunks
-                .iter()
-                .zip(mask.iter())
-                .filter_map(|(c, &visible)| if visible { Some(c.as_slice()) } else { None })
-                .collect()
-        }
-        _ => tick.entity_chunks.iter().map(|c| c.as_slice()).collect(),
+    let chunk_refs: Vec<&[u8]> = match mask {
+        Some(m) => tick
+            .entity_chunks
+            .iter()
+            .zip(m.iter())
+            .filter_map(|(c, &visible)| if visible { Some(c.as_slice()) } else { None })
+            .collect(),
+        None => tick.entity_chunks.iter().map(|c| c.as_slice()).collect(),
     };
     arcane_wire::encode_server_delta_from_chunks(&tick.header, &chunk_refs, &tick.removed)
 }
@@ -328,6 +339,39 @@ fn init_encode_thread_pool() {
     }
 }
 
+/// Compute all subscriber visibility masks in parallel via rayon.
+/// Takes the preencoded tick, the visibility filter, and subscriber positions.
+/// Returns a HashMap<subscriber_id, mask> where each mask is a Vec<bool> indicating
+/// which entities are visible to that subscriber.
+fn compute_visibility_masks(
+    tick: &PreEncodedTick,
+    filter: Option<&dyn IVisibilityFilter>,
+    subscriber_positions: &DashMap<u64, Vec3>,
+) -> HashMap<u64, Vec<bool>> {
+    match filter {
+        Some(f) => {
+            // Collect subscriber IDs and positions into a vec for parallel iteration
+            let subscribers: Vec<(u64, Vec3)> = subscriber_positions
+                .iter()
+                .map(|entry| (*entry.key(), *entry.value()))
+                .collect();
+
+            // Compute masks in parallel
+            subscribers
+                .par_iter()
+                .map(|&(sub_id, obs_pos)| {
+                    let mask = f.filter(obs_pos, &tick.entity_metadata);
+                    (sub_id, mask)
+                })
+                .collect()
+        }
+        None => {
+            // No filter active; no masks needed
+            HashMap::new()
+        }
+    }
+}
+
 pub fn run_ws_server(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -360,6 +404,9 @@ pub fn run_ws_server(
     });
 }
 
+/// Global atomic counter for assigning unique subscriber IDs.
+static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
+
 async fn ws_loop(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -367,9 +414,10 @@ async fn ws_loop(
     game_actions_tx: Sender<GameAction>,
     stats: Arc<ClusterStats>,
 ) {
-    // Broadcast carries a PreEncodedTick — per-entity postcard chunks plus
-    // delta header and removed-id list. Subscribers assemble their outbound
-    // frame from the shared chunks via arcane_wire::encode_server_delta_from_chunks.
+    // Broadcast carries a TickBroadcast — per-entity postcard chunks plus
+    // delta header and removed-id list, plus precomputed visibility masks.
+    // Subscribers assemble their outbound frame from the shared chunks via
+    // arcane_wire::encode_server_delta_from_chunks with a precomputed mask.
     // One serialization per entity per tick, shared across all subscribers.
     //
     // Buffer cap is the deepest backlog the slowest subscriber can fall
@@ -380,7 +428,7 @@ async fn ws_loop(
     // CPU and NIC both had headroom; lagged_frames kept firing).
     let cap = crate::broadcast_channel_cap::broadcast_channel_cap();
     eprintln!("cluster broadcast channel cap: {cap} (override: ARCANE_BROADCAST_CHANNEL_CAP)");
-    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<PreEncodedTick>>(cap);
+    let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Arc<TickBroadcast>>(cap);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.expect("bind ws port");
     eprintln!(
@@ -391,6 +439,12 @@ async fn ws_loop(
     let broadcast_tx = Arc::new(broadcast_tx);
     let tx_clone = broadcast_tx.clone();
     let rx = Arc::new(std::sync::Mutex::new(state_rx));
+
+    // Shared subscriber position map: DashMap<subscriber_id, position>
+    // Updated by subscriber tasks on PLAYER_STATE, read by producer for mask computation.
+    let subscriber_positions = Arc::new(DashMap::new());
+    let positions_clone = subscriber_positions.clone();
+
     tokio::spawn(async move {
         loop {
             let r = rx.clone();
@@ -403,7 +457,13 @@ async fn ws_loop(
                     // and build the shared tick struct. All subscribers
                     // reuse these Arc-shared chunks without re-serializing.
                     let tick = Arc::new(pre_encode_tick(&d));
-                    let _ = tx_clone.send(tick);
+
+                    // Compute visibility masks for all subscribers in parallel.
+                    // When a filter is active, masks are precomputed here.
+                    // When filter is None, masks HashMap is empty (no filtering).
+                    let masks = compute_visibility_masks(&tick, None, &positions_clone);
+                    let broadcast = Arc::new(TickBroadcast { tick, masks });
+                    let _ = tx_clone.send(broadcast);
                 }
                 Err(_) => break,
             }
@@ -434,22 +494,28 @@ async fn ws_loop(
         if accept_n <= 3 || accept_n.is_power_of_two() {
             eprintln!("ws accept #{} from {}", accept_n, peer_addr);
         }
+
+        // Assign unique subscriber ID
+        let subscriber_id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
+
         let mut recv = broadcast_tx.subscribe();
         let updates_tx = client_updates_tx.clone();
         let actions_tx = game_actions_tx.clone();
         let stats = stats.clone();
+        let positions = subscriber_positions.clone();
+
         tokio::spawn(async move {
-            let mut observer_position: Option<Vec3> = None;
             loop {
                 tokio::select! {
                     result = recv.recv() => {
                         match result {
-                            Ok(tick_arc) => {
-                                // Subscriber-side work: pick entity chunks
-                                // (today: all; with AOI: filtered subset)
-                                // and assemble a wire-compatible frame. No
-                                // per-entity re-serialization happens here.
-                                let bytes = match assemble_outbound_frame(&tick_arc, None, observer_position) {
+                            Ok(broadcast_arc) => {
+                                // Subscriber-side work: look up precomputed mask
+                                // (if any), and assemble a wire-compatible frame.
+                                // No per-entity re-serialization or per-entity
+                                // filter calls happen here.
+                                let mask = broadcast_arc.masks.get(&subscriber_id).map(|m| m.as_slice());
+                                let bytes = match assemble_outbound_frame(&broadcast_arc.tick, mask) {
                                     Ok(b) => b,
                                     Err(_) => continue,
                                 };
@@ -478,12 +544,17 @@ async fn ws_loop(
                             Some(Ok(Message::Binary(bytes))) => {
                                 if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
                                     if let Some(entry) = entry_from_wire_player_state(&payload) {
-                                        observer_position = Some(entry.position);
+                                        // Update shared subscriber positions
+                                        positions.insert(subscriber_id, entry.position);
                                     }
                                 }
                                 let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
                             }
-                            Some(Err(_)) | None => break,
+                            Some(Err(_)) | None => {
+                                // Subscriber disconnected; remove from position map
+                                positions.remove(&subscriber_id);
+                                break;
+                            },
                             // Text and other frame types are not part of the
                             // supported wire protocol and are silently ignored.
                             _ => {}
@@ -491,6 +562,8 @@ async fn ws_loop(
                     }
                 }
             }
+            // Clean up position on task exit
+            positions.remove(&subscriber_id);
         });
     }
 }
@@ -503,6 +576,7 @@ mod tests {
         should_keep_ws_loop_running_on_broadcast_error,
     };
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+    use arcane_core::visibility::IVisibilityFilter;
     use arcane_core::Vec3;
     use arcane_wire::{
         ClientFrame, GameActionPayload, PlayerStatePayload, ServerFrame, Vec3 as WireVec3,
@@ -701,7 +775,7 @@ mod tests {
         assert_eq!(pre_tick.header.seq, 7);
         assert_eq!(pre_tick.header.tick, 42);
 
-        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
 
@@ -733,7 +807,7 @@ mod tests {
             removed: Vec::new(),
         };
         let pre_tick = pre_encode_tick(&delta);
-        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         assert!(payload.updated.is_empty());
@@ -772,7 +846,7 @@ mod tests {
         };
 
         let via_shape_b =
-            assemble_outbound_frame(&pre_encode_tick(&delta), None, None).expect("shape-b bytes");
+            assemble_outbound_frame(&pre_encode_tick(&delta), None).expect("shape-b bytes");
 
         // Reference: build the wire DeltaPayload by materializing every
         // WireEntityState inline, encode as one ServerFrame::Delta — the
@@ -869,7 +943,7 @@ mod tests {
 
         // Also verify end-to-end frame decodes identically to what a
         // serial encode would have produced.
-        let bytes = assemble_outbound_frame(&pre_tick, None, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         for (i, e) in payload.updated.iter().enumerate() {
@@ -990,8 +1064,8 @@ mod tests {
         // Observer at (0, 0, 0), filter radius 10
         let observer_pos = Vec3::new(0.0, 0.0, 0.0);
         let filter = MockRadiusFilter::new(10.0);
-        let bytes_filtered = assemble_outbound_frame(&pre_tick, Some(&filter), Some(observer_pos))
-            .expect("filtered");
+        let mask = filter.filter(observer_pos, &pre_tick.entity_metadata);
+        let bytes_filtered = assemble_outbound_frame(&pre_tick, Some(&mask)).expect("filtered");
 
         // Decode the filtered frame
         let decoded_filtered =
@@ -1039,7 +1113,7 @@ mod tests {
         let pre_tick = pre_encode_tick(&delta);
 
         // No filter (None)
-        let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None, None).expect("unfiltered");
+        let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None).expect("unfiltered");
 
         // Decode the unfiltered frame
         let decoded_unfiltered =
@@ -1076,12 +1150,10 @@ mod tests {
 
         let pre_tick = pre_encode_tick(&delta);
 
-        // Both should produce identical bytes when filter is None
-        let bytes_no_args = assemble_outbound_frame(&pre_tick, None, None).expect("no args");
-        let bytes_none_filter =
-            assemble_outbound_frame(&pre_tick, None, Some(Vec3::new(0.0, 0.0, 0.0)))
-                .expect("none filter");
+        // Both should produce identical bytes when mask is None
+        let bytes_no_mask = assemble_outbound_frame(&pre_tick, None).expect("no mask");
+        let bytes_none_mask = assemble_outbound_frame(&pre_tick, None).expect("none mask");
 
-        assert_eq!(bytes_no_args, bytes_none_filter);
+        assert_eq!(bytes_no_mask, bytes_none_mask);
     }
 }
