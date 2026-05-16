@@ -1,4 +1,4 @@
-//! ClusterServer (IN-02) — simulation unit per cluster.
+//! ArcaneNode (IN-02) — simulation unit per cluster.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -37,7 +37,7 @@ fn resolve_resync_every_n_ticks() -> u64 {
 }
 
 /// One process per cluster. Runs simulation, replication, client connections.
-pub struct ClusterServer {
+pub struct ArcaneNode {
     cluster_id: Uuid,
     tick: AtomicU64,
     seq: AtomicI64,
@@ -58,7 +58,7 @@ pub struct ClusterServer {
     resync_every_n_ticks: u64,
 }
 
-impl ClusterServer {
+impl ArcaneNode {
     pub fn new(cluster_id: Uuid) -> Self {
         Self::with_max_entities(cluster_id, DEFAULT_MAX_ENTITIES)
     }
@@ -105,7 +105,7 @@ impl ClusterServer {
     }
 
     /// Runs custom simulation with exclusive access to the local entity map, then applies any
-    /// [`ClusterTickContext::pending_removals`]. Call immediately before [`ClusterServer::tick`].
+    /// [`ClusterTickContext::pending_removals`]. Call immediately before [`ArcaneNode::tick`].
     /// `upcoming_tick` must match the tick index the next `tick()` will assign (`current_tick() + 1`
     /// before the first `tick()` call).
     ///

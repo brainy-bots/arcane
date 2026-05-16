@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry, IReplicationChannel};
 use arcane_core::Vec3;
 use arcane_infra::{
-    ClusterManager, ClusterServer, RedisReplicationChannel, ReplicationChannelManager,
+    ArcaneNode, ClusterManager, RedisReplicationChannel, ReplicationChannelManager,
 };
 use uuid::Uuid;
 
@@ -187,9 +187,9 @@ fn redis_channel_publish_received_by_subscriber() {
     assert_eq!(received.updated[0].position.x, delta.updated[0].position.x);
 }
 
-/// Manager provides topology; ReplicationChannelManager started with Redis; ClusterServer ticks and subscriber receives. Skipped when Redis is down.
+/// Manager provides topology; ReplicationChannelManager started with Redis; ArcaneNode ticks and subscriber receives. Skipped when Redis is down.
 #[test]
-fn manager_replication_cluster_server_integration() {
+fn manager_replication_node_integration() {
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let client = match redis::Client::open(url.as_str()) {
         Ok(c) => c,
@@ -217,7 +217,7 @@ fn manager_replication_cluster_server_integration() {
     }
     replication_mgr.set_neighbors(neighbors);
 
-    let server = ClusterServer::new(cluster_a);
+    let server = ArcaneNode::new(cluster_a);
     server.set_replication(Arc::new(replication_mgr));
 
     let topic = format!("arcane:replication:{}", cluster_a);

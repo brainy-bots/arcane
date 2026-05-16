@@ -8,7 +8,7 @@
 | **Component ID** | IN-01 |
 | **Layer** | Infrastructure |
 | **Type** | Component |
-| **Purpose** | Central coordinator: assign players to cluster servers, maintain spatial index and neighbor topology, invoke the clustering model, and write assignment and topology state to SpacetimeDB. Clients connect to the ClusterManager for join/leave and cluster assignment; cluster servers learn their workload and neighbors from SpacetimeDB. |
+| **Purpose** | Central coordinator: assign players to Arcane Nodes, maintain spatial index and neighbor topology, invoke the clustering model, and write assignment and topology state to SpacetimeDB. Clients connect to the ClusterManager for join/leave and cluster assignment; Arcane Nodes learn their workload and neighbors from SpacetimeDB. |
 | **Document version** | 1.0 |
 | **System-level companion** | [SYS-01 clustering-system-requirements.md](clustering-system-requirements.md) — ClusterManager is the orchestration component that executes on the clustering model's decisions. The SYS-01 spec describes the full decision space (capability-aware placement, market signals, etc.) this module must eventually support. |
 
@@ -16,19 +16,19 @@
 
 ## 1. Overview
 
-ClusterManager is the single process through which all client connections (join/leave) and all clustering decisions (merge/split) flow. It does not simulate game state or run replication; it only decides *who belongs to which cluster* and *which clusters are neighbors*, and writes that state to SpacetimeDB. Cluster servers and clients then react to that state (via SpacetimeDB subscriptions or Manager messages). ClusterManager uses IClusteringModel for merge/split decisions and IServerPool to allocate or release cluster servers. It maintains a live view of world state from SpacetimeDB subscriptions and runs the clustering model on a fixed cadence. See `docs/END_TO_END_FLOWS.md` for step-by-step player join, merge, and split.
+ClusterManager is the single process through which all client connections (join/leave) and all clustering decisions (merge/split) flow. It does not simulate game state or run replication; it only decides *who belongs to which cluster* and *which clusters are neighbors*, and writes that state to SpacetimeDB. Cluster servers and clients then react to that state (via SpacetimeDB subscriptions or Manager messages). ClusterManager uses IClusteringModel for merge/split decisions and IServerPool to allocate or release Arcane Nodes. It maintains a live view of world state from SpacetimeDB subscriptions and runs the clustering model on a fixed cadence. See `docs/END_TO_END_FLOWS.md` for step-by-step player join, merge, and split.
 
 ---
 
 ## 2. Responsibilities
 
 - Accept **PLAYER_JOIN** on the Manager WebSocket (clients); validate or delegate auth; decide which cluster the player joins (existing cluster with capacity or new cluster via IServerPool.allocate()).
-- **Write to SpacetimeDB** the player → cluster assignment (and server_host, server_port) so cluster servers and clients have a single source of truth.
+- **Write to SpacetimeDB** the player → cluster assignment (and server_host, server_port) so Arcane Nodes and clients have a single source of truth.
 - Send **CLUSTER_ASSIGN** to the client with cluster_id, server_host, server_port.
-- Accept **PLAYER_LEAVE**; update SpacetimeDB (remove or mark player left); optionally release a cluster server if it becomes empty (IServerPool.release()).
+- Accept **PLAYER_LEAVE**; update SpacetimeDB (remove or mark player left); optionally release a Arcane Node if it becomes empty (IServerPool.release()).
 - Maintain a **live in-memory view** of world state (cluster assignments, player positions, cluster topology, interaction signals) via SpacetimeDB subscriptions. No ad-hoc polling; the view is kept current by subscription callbacks.
-- On a **fixed cadence**, call **IClusteringModel.evaluate(view)** to get merge/split decisions. Apply guardrails (confidence threshold, rate limits, resource limits). For each decision the ClusterManager agrees with: write updated assignments and topology to SpacetimeDB; send **CLUSTER_REASSIGN** to affected clients; ensure cluster servers can observe the change (they subscribe to SpacetimeDB) and, if needed, notify cluster servers to drop players/entities at end of tick (see Message Protocol).
-- **Publish or write neighbor lists** so that each cluster server (or ReplicationChannelManager) knows which clusters to subscribe to for replication. Neighbor list is derived from spatial index and clustering model; stored in SpacetimeDB or pushed via a dedicated channel (see Open Questions).
+- On a **fixed cadence**, call **IClusteringModel.evaluate(view)** to get merge/split decisions. Apply guardrails (confidence threshold, rate limits, resource limits). For each decision the ClusterManager agrees with: write updated assignments and topology to SpacetimeDB; send **CLUSTER_REASSIGN** to affected clients; ensure Arcane Nodes can observe the change (they subscribe to SpacetimeDB) and, if needed, notify Arcane Nodes to drop players/entities at end of tick (see Message Protocol).
+- **Publish or write neighbor lists** so that each Arcane Node (or ReplicationChannelManager) knows which clusters to subscribe to for replication. Neighbor list is derived from spatial index and clustering model; stored in SpacetimeDB or pushed via a dedicated channel (see Open Questions).
 - When a cluster is dissolved (merge or empty), **tear down replication subscriptions** that reference that cluster’s server, then call **IServerPool.release(server_id)**.
 - Expose **Prometheus metrics** (active clusters, players, join/leave rate, merge/split rate, model eval duration, pool status).
 
@@ -36,17 +36,17 @@ ClusterManager is the single process through which all client connections (join/
 
 ## 3. What It Does NOT Do
 
-- **Simulate game state or physics** — that is ClusterServer.
-- **Run replication** (publish/subscribe between cluster servers) — that is ReplicationChannelManager and IReplicationChannel.
+- **Simulate game state or physics** — that is ArcaneNode.
+- **Run replication** (publish/subscribe between Arcane Nodes) — that is ReplicationChannelManager and IReplicationChannel.
 - **Execute game logic or RPCs** between clusters — discrete game logic (attack hit, inventory) runs in SpacetimeDB reducers; ClusterManager only handles assignment and topology. Optional RPCHandler (IN-05) is for non-game use only.
-- **Store or compute game logic** — it only handles assignment and topology; authoritative game state and discrete events live in SpacetimeDB (reducers); simulation runs on ClusterServers.
+- **Store or compute game logic** — it only handles assignment and topology; authoritative game state and discrete events live in SpacetimeDB (reducers); simulation runs on ArcaneNodes.
 - **Authenticate users** — it may delegate to an auth service or trust the client token; auth is out of scope for this component.
 
 ---
 
 ## 4. Interface / Public API
 
-ClusterManager is a long-running process. Its “API” is the **Manager WebSocket** (for clients) and the **SpacetimeDB write surface** (for assignment and topology). It does not expose a separate RPC API for cluster servers; cluster servers learn assignments and topology from SpacetimeDB subscriptions.
+ClusterManager is a long-running process. Its “API” is the **Manager WebSocket** (for clients) and the **SpacetimeDB write surface** (for assignment and topology). It does not expose a separate RPC API for Arcane Nodes; Arcane Nodes learn assignments and topology from SpacetimeDB subscriptions.
 
 ### 4.1 Manager WebSocket (client-facing)
 
@@ -72,11 +72,11 @@ ClusterManager is a long-running process. Its “API” is the **Manager WebSock
   - A **WebSocket server** for Manager connections; each client connection is tracked (player_id, connection state, current cluster_id).
   - **SpacetimeDB subscription handlers** that update the in-memory view (assignments, positions, topology, signals).
   - A **timer or tick** that fires at the evaluation cadence (e.g. every 50–200 ms). On tick: build WorldStateView from the live view, call IClusteringModel.evaluate(view), apply guardrails, for each agreed decision execute the merge or split (write SpacetimeDB, send CLUSTER_REASSIGN, tear down replication for dissolved cluster, release server if applicable).
-  - Optional: a **notification path** to cluster servers (“drop these players/entities at end of tick”). If cluster servers learn purely from SpacetimeDB subscriptions, they see the assignment change and drop players/entities without an explicit message; otherwise ClusterManager sends a message (e.g. over a control channel or via a SpacetimeDB reducer that cluster servers subscribe to). See Open Questions.
+  - Optional: a **notification path** to Arcane Nodes (“drop these players/entities at end of tick”). If Arcane Nodes learn purely from SpacetimeDB subscriptions, they see the assignment change and drop players/entities without an explicit message; otherwise ClusterManager sends a message (e.g. over a control channel or via a SpacetimeDB reducer that Arcane Nodes subscribe to). See Open Questions.
 
 - **Spatial index:** ClusterManager maintains a structure (e.g. 2D grid or spatial hash) that maps world regions or cluster centroids to cluster_ids. This is updated from the live view (player positions, cluster bounds). It is used to build the neighbor list (which clusters are “near” each other) and to feed the WorldStateView for the clustering model. The spatial index may be implemented inline in ClusterManager or delegated to a separate SpatialIndex component (IN-03); the ClusterManager is the owner of the logic that derives “who are my neighbors” from the index.
 
-- **No blocking on cluster servers:** ClusterManager does not wait for cluster servers to acknowledge “drop” or “new assignment.” It writes to SpacetimeDB and sends to clients; cluster servers react asynchronously via subscriptions.
+- **No blocking on Arcane Nodes:** ClusterManager does not wait for Arcane Nodes to acknowledge “drop” or “new assignment.” It writes to SpacetimeDB and sends to clients; Arcane Nodes react asynchronously via subscriptions.
 
 ---
 
@@ -84,7 +84,7 @@ ClusterManager is a long-running process. Its “API” is the **Manager WebSock
 
 - **Owns:** In-memory live view (derived from SpacetimeDB subscriptions); spatial index (or reference to IN-03); per-client connection state (player_id, cluster_id, WebSocket); evaluation cadence timer state.
 - **Reads:** SpacetimeDB (subscriptions) for assignments, positions, topology, signals. IClusteringModel (evaluate). IServerPool (allocate, release, get_status).
-- **Writes:** SpacetimeDB (assignment and topology tables only). Sends messages to clients over Manager WebSocket. Does not write to Redis or to cluster server processes except via SpacetimeDB or via a defined “notify cluster server” mechanism if any (see Open Questions).
+- **Writes:** SpacetimeDB (assignment and topology tables only). Sends messages to clients over Manager WebSocket. Does not write to Redis or to Arcane Node processes except via SpacetimeDB or via a defined “notify Arcane Node” mechanism if any (see Open Questions).
 
 ---
 
@@ -120,18 +120,18 @@ ClusterManager is a long-running process. Its “API” is the **Manager WebSock
 | SYSTEM_MESSAGE | `{ type, severity, message, timestamp }` | Optional; server announcements. |
 | METRICS_UPDATE | `{ type, ... }` | Optional; pushed metrics. |
 
-### 8.2 ClusterManager → ClusterServer (notify “drop” or topology)
+### 8.2 ClusterManager → ArcaneNode (notify “drop” or topology)
 
-**Open:** Whether ClusterManager sends an explicit message to a cluster server to “drop these players/entities at end of tick” is TBD. Alternatives:
+**Open:** Whether ClusterManager sends an explicit message to a Arcane Node to “drop these players/entities at end of tick” is TBD. Alternatives:
 
 - **A. SpacetimeDB only:** Cluster servers subscribe to assignments for their cluster_id. When ClusterManager updates assignments (e.g. player P moved from B to A), server B’s subscription sees “P no longer in B” and server B drops P at end of tick. No explicit message from ClusterManager to servers.
-- **B. Control channel:** ClusterManager sends a message (e.g. over TCP or a dedicated Redis topic) to each affected cluster server: “drop players [list] at end of tick.” Server acknowledges or does not; ClusterManager does not block.
+- **B. Control channel:** ClusterManager sends a message (e.g. over TCP or a dedicated Redis topic) to each affected Arcane Node: “drop players [list] at end of tick.” Server acknowledges or does not; ClusterManager does not block.
 
-Current flows doc assumes cluster servers learn from SpacetimeDB; so **A** is sufficient unless we need tighter ordering. Document in Open Questions until chosen.
+Current flows doc assumes Arcane Nodes learn from SpacetimeDB; so **A** is sufficient unless we need tighter ordering. Document in Open Questions until chosen.
 
 ### 8.3 Neighbor list delivery to ReplicationChannelManager
 
-ClusterManager writes **cluster topology** (which clusters exist, which are neighbors) to SpacetimeDB. ReplicationChannelManager (IN-06) on each cluster server subscribes to that topology (e.g. “neighbors of my cluster_id”) and opens/closes IReplicationChannel subscriptions accordingly. So ClusterManager does not push directly to IN-06; it writes to SpacetimeDB and IN-06 reads via subscription.
+ClusterManager writes **cluster topology** (which clusters exist, which are neighbors) to SpacetimeDB. ReplicationChannelManager (IN-06) on each Arcane Node subscribes to that topology (e.g. “neighbors of my cluster_id”) and opens/closes IReplicationChannel subscriptions accordingly. So ClusterManager does not push directly to IN-06; it writes to SpacetimeDB and IN-06 reads via subscription.
 
 ---
 
@@ -170,7 +170,7 @@ ClusterManager writes **cluster topology** (which clusters exist, which are neig
 
 | Failure | Detection | Response |
 |---------|-----------|----------|
-| SpacetimeDB unreachable | Connection or subscription error | Retry with backoff; do not accept new PLAYER_JOIN until reconnected. Existing assignments remain in SpacetimeDB; cluster servers may keep running. |
+| SpacetimeDB unreachable | Connection or subscription error | Retry with backoff; do not accept new PLAYER_JOIN until reconnected. Existing assignments remain in SpacetimeDB; Arcane Nodes may keep running. |
 | IClusteringModel.evaluate() throws or times out | Exception or wall-clock timeout | Log; skip this evaluation cycle; do not execute any decision. Next cycle runs on cadence. Optional: fallback to static rules if ML fails repeatedly. |
 | IServerPool.allocate() fails (pool exhausted) | PoolError returned | Do not create new cluster; reject or queue PLAYER_JOIN (implementation choice). Emit metric; alert. |
 | Manager WebSocket client disconnect | Connection close | Treat as PLAYER_LEAVE if not already; update SpacetimeDB; optionally release cluster if empty. |
@@ -180,8 +180,8 @@ ClusterManager writes **cluster topology** (which clusters exist, which are neig
 
 ## 12. Open Questions
 
-- **Explicit “drop” message to cluster servers:** Use SpacetimeDB-only (servers see assignment change and drop) or add a control channel from ClusterManager to cluster servers for “drop at end of tick”? Recommendation: SpacetimeDB-only for MVP; add control channel only if ordering or latency requires it.
-- **First-connect client message:** On first join, does the client send any message to the ClusterServer (e.g. “I am player P”) or does the server infer from the connection (e.g. auth token)? Affects ClusterServer spec and wire protocol.
+- **Explicit “drop” message to Arcane Nodes:** Use SpacetimeDB-only (servers see assignment change and drop) or add a control channel from ClusterManager to Arcane Nodes for “drop at end of tick”? Recommendation: SpacetimeDB-only for MVP; add control channel only if ordering or latency requires it.
+- **First-connect client message:** On first join, does the client send any message to the ArcaneNode (e.g. “I am player P”) or does the server infer from the connection (e.g. auth token)? Affects ArcaneNode spec and wire protocol.
 - **SpatialIndex ownership:** Is the spatial index a separate component (IN-03) with its own API, or inline in ClusterManager? If separate, ClusterManager depends on IN-03; if inline, IN-03 doc may describe the algorithm only and ClusterManager implements it.
 
 ---

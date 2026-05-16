@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **arcane-infra**: Renamed `ClusterServer` type to `ArcaneNode`; file `cluster_server.rs` → `node.rs`. "Node" is the industry-standard term for one server in a distributed fleet; "cluster" now unambiguously means the group of entities.
+
 ## [0.2.0] - 2026-04-18
 
 ### Added

@@ -8,21 +8,21 @@
 | **Component ID** | IF-03 |
 | **Layer** | Infrastructure Interface |
 | **Type** | Interface — no implementation, only contract |
-| **Purpose** | Define the contract for state broadcast between neighboring cluster servers via **pub/sub**. Clusters **publish** their entity state and **subscribe** to neighbors' updates; there are no direct cluster-to-cluster connections. Allows the replication transport (e.g. Redis pub/sub) to be substituted without touching the ClusterServer or ReplicationChannelManager. |
+| **Purpose** | Define the contract for state broadcast between neighboring Arcane Nodes via **pub/sub**. Clusters **publish** their entity state and **subscribe** to neighbors' updates; there are no direct cluster-to-cluster connections. Allows the replication transport (e.g. Redis pub/sub) to be substituted without touching the ArcaneNode or ReplicationChannelManager. |
 | **Implementations** | RedisPubSubReplication (default) · TCPReplicationChannel (alternative) · InProcessReplicationChannel (testing) |
 | **Language** | Rust |
 | **Depends On** | None |
-| **Required By** | IN-02 ClusterServer · IN-06 ReplicationChannelManager |
+| **Required By** | IN-02 ArcaneNode · IN-06 ReplicationChannelManager |
 
 ---
 
 ## 1. Overview
 
-Replication between clusters uses **pub/sub**: each cluster **publishes** its entity state to a topic (e.g. keyed by cluster_id) and **subscribes** to the topics of its neighbors. There are no direct cluster-to-cluster connections. IReplicationChannel represents the contract for this: one cluster's subscription to another's updates (and the corresponding publish path). Each cluster server maintains a set of IReplicationChannel instances (one per current neighbor) through the ReplicationChannelManager — each instance represents "we subscribe to that neighbor's topic and publish to our own."
+Replication between clusters uses **pub/sub**: each cluster **publishes** its entity state to a topic (e.g. keyed by cluster_id) and **subscribes** to the topics of its neighbors. There are no direct cluster-to-cluster connections. IReplicationChannel represents the contract for this: one cluster's subscription to another's updates (and the corresponding publish path). Each Arcane Node maintains a set of IReplicationChannel instances (one per current neighbor) through the ReplicationChannelManager — each instance represents "we subscribe to that neighbor's topic and publish to our own."
 
 The interface is deliberately fire-and-forget on the publish side. Replication data is ephemeral — a position update that fails to arrive is superseded by the next one 50ms later. Pub/sub does not guarantee delivery and we do not implement acknowledgement or retry. It optimizes for throughput and low latency, not reliability. Reliability is the job of the game state layer (SpacetimeDB), not the replication layer.
 
-Replication carries **simulation state** (position, movement) only. **Discrete game outcomes** (damage applied, ability resolved) are handled by **SpacetimeDB reducers**; the ClusterServer calls the reducer and sends RPC_RESULT to the client from the reducer return. Optional RPCHandler (IN-05) is for non-game server-to-server RPC only.
+Replication carries **simulation state** (position, movement) only. **Discrete game outcomes** (damage applied, ability resolved) are handled by **SpacetimeDB reducers**; the ArcaneNode calls the reducer and sends RPC_RESULT to the client from the reducer return. Optional RPCHandler (IN-05) is for non-game server-to-server RPC only.
 
 ---
 
@@ -149,7 +149,7 @@ effective_radius = observation_radius + dest_cluster.spread_radius
 distance(entity.position, dest_centroid) <= effective_radius
 ```
 
-Where `spread_radius` is the maximum distance of any player in the destination cluster from its centroid. It is maintained incrementally by the destination ClusterServer — updated on every player position change at the same cadence as the centroid itself. One additional float per cluster, one addition per entity check on the hot path.
+Where `spread_radius` is the maximum distance of any player in the destination cluster from its centroid. It is maintained incrementally by the destination ArcaneNode — updated on every player position change at the same cadence as the centroid itself. One additional float per cluster, one addition per entity check on the hot path.
 
 ```rust
 fn should_send(entity: &EntityStateEntry, dest: &DestClusterState) -> bool {
@@ -211,7 +211,7 @@ close(): Unsubscribe from destination's topic. Flush pending publish queue.
 
 ### TCPReplicationChannel (alternative implementation)
 
-For environments where Redis is not used, a direct TCP connection to the destination cluster server is an alternative. open() connects to destination.host:rpc_port+1; send_loop() sends batches over the socket. Same interface, different transport.
+For environments where Redis is not used, a direct TCP connection to the destination Arcane Node is an alternative. open() connects to destination.host:rpc_port+1; send_loop() sends batches over the socket. Same interface, different transport.
 
 ### InProcessReplicationChannel (testing)
 
@@ -222,7 +222,7 @@ For unit and integration tests, this implementation calls the destination's `on_
 ## 8. Data Ownership
 
 - **Owns:** Publish queue, subscription state (or connection state for TCP implementation), per-entity last-sent tick tracking
-- **Reads:** Destination cluster centroid (pushed by ReplicationChannelManager), entity state deltas (provided by ClusterServer per tick)
+- **Reads:** Destination cluster centroid (pushed by ReplicationChannelManager), entity state deltas (provided by ArcaneNode per tick)
 - **Writes:** Nothing to shared storage — all state is in-process
 
 ---
@@ -256,7 +256,7 @@ None at interface level. RedisPubSubReplication depends on Redis client availabi
 | `arcane_replication_drops_total` | counter | `source=, dest=` | Messages dropped due to full queue |
 | `arcane_replication_entities_per_delta` | histogram | | Entities transmitted per tick per subscription |
 | `arcane_replication_filtered_pct` | gauge | `source=, dest=` | Fraction of entities filtered by observation radius |
-| `arcane_replication_subscription_count` | gauge | `cluster_id=` | Active subscriptions (neighbors we subscribe to) per cluster server |
+| `arcane_replication_subscription_count` | gauge | `cluster_id=` | Active subscriptions (neighbors we subscribe to) per Arcane Node |
 | `arcane_replication_reconnects_total` | counter | `source=, dest=` | Reconnect or resubscribe events |
 
 ---

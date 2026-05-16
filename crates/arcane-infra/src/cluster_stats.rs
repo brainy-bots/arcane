@@ -50,9 +50,9 @@ pub struct ClusterStats {
     pub entities_current: AtomicU64,
     /// Peak entity count observed since startup.
     pub entities_peak: AtomicU64,
-    /// Most recent full tick number (see ClusterServer::current_tick).
+    /// Most recent full tick number (see ArcaneNode::current_tick).
     pub tick: AtomicU64,
-    /// Most recent replication sequence (see ClusterServer::current_seq).
+    /// Most recent replication sequence (see ArcaneNode::current_seq).
     pub seq: AtomicU64,
     /// Most recent tick elapsed time, in microseconds, for quick health signaling.
     pub last_tick_us: AtomicU64,

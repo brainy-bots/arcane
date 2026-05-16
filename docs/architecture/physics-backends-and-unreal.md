@@ -25,12 +25,12 @@ This document describes how to integrate **authoritative physics** with Arcane: 
 Read in order:
 
 1. [`crates/arcane-infra/src/cluster_runner.rs`](../../crates/arcane-infra/src/cluster_runner.rs) — `run_cluster_loop`: drain client updates → optional injected entities → neighbor deltas → **`simulate_before_tick`** → **`tick`** → persist → WebSocket send.
-2. [`crates/arcane-infra/src/cluster_server.rs`](../../crates/arcane-infra/src/cluster_server.rs) — `simulate_before_tick` calls [`ClusterSimulation::on_tick`](../../crates/arcane-core/src/cluster_simulation.rs).
+2. [`crates/arcane-infra/src/node.rs`](../../crates/arcane-infra/src/node.rs) — `simulate_before_tick` calls [`ClusterSimulation::on_tick`](../../crates/arcane-core/src/cluster_simulation.rs).
 3. [`crates/arcane-core/src/cluster_simulation.rs`](../../crates/arcane-core/src/cluster_simulation.rs) — trait + `ClusterTickContext` (`entities`, `dt_seconds`, `tick`, `pending_removals`).
 
 **Contract today:** implement `ClusterSimulation: Send + Sync` with `fn on_tick(&self, ctx: &mut ClusterTickContext<'_>)`. The trait uses **`&self`**, so physics world state must use **interior mutability** (e.g. `Mutex<ChaosWorldHandle>` or solver’s internal sync).
 
-**After `on_tick`:** `ClusterServer::tick` builds `EntityStateDelta` and replication runs. Pose must be written back to `EntityStateEntry::position` / `velocity` (and `user_data` if needed) before `tick` returns.
+**After `on_tick`:** `ArcaneNode::tick` builds `EntityStateDelta` and replication runs. Pose must be written back to `EntityStateEntry::position` / `velocity` (and `user_data` if needed) before `tick` returns.
 
 ---
 
@@ -130,7 +130,7 @@ Minimum fields for an entry (see `EntityStateEntry`): `entity_id`, `cluster_id`,
 
 **Phase A — Read and freeze decisions**
 
-- [ ] Read `cluster_runner.rs`, `cluster_server.rs`, `cluster_simulation.rs`, `replication_channel.rs`.
+- [ ] Read `cluster_runner.rs`, `node.rs`, `cluster_simulation.rs`, `replication_channel.rs`.
 - [ ] Read [four-bucket-state-model.md](four-bucket-state-model.md).
 - [ ] Write ADR: integration shape + UE version + tick/substep policy.
 

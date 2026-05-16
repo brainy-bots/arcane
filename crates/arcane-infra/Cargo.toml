@@ -2,7 +2,7 @@
 name = "arcane-infra"
 version = "0.1.0"
 edition = "2021"
-description = "Arcane Engine — ClusterManager, ClusterServer, ReplicationChannelManager, RPCHandler (IN-01, 02, 05, 06)"
+description = "Arcane Engine — ClusterManager, ArcaneNode, ReplicationChannelManager, RPCHandler (IN-01, 02, 05, 06)"
 
 [dependencies]
 arcane-core = { path = "../arcane-core" }

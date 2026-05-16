@@ -1,4 +1,4 @@
-//! Arcane Engine — LocalPool (IN-07 ClusterServerPool).
+//! Arcane Engine — LocalPool (IN-07 ArcaneNodePool).
 //!
 //! Pre-provisioned local pool implementing IServerPool for development.
 //! Scaffolding: impl with unimplemented!().
