@@ -52,7 +52,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use crate::cluster_stats::ClusterStats;
+use crate::node_stats::NodeStats;
 
 /// Maximum byte length of a single inbound WebSocket binary payload. Client
 /// frames larger than this are dropped and counted as parse failures —
@@ -244,7 +244,7 @@ fn handle_binary_client_frame(
     bytes: &[u8],
     updates_tx: &Sender<EntityStateEntry>,
     actions_tx: &Sender<GameAction>,
-    stats: &ClusterStats,
+    stats: &NodeStats,
 ) -> ClientMessageOutcome {
     if bytes.len() > MAX_MESSAGE_BYTES {
         stats.parse_failures.fetch_add(1, Ordering::Relaxed);
@@ -394,7 +394,7 @@ pub fn run_ws_server(
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
-    stats: Arc<ClusterStats>,
+    stats: Arc<NodeStats>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -429,7 +429,7 @@ async fn ws_loop(
     state_rx: Receiver<EntityStateDelta>,
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
-    stats: Arc<ClusterStats>,
+    stats: Arc<NodeStats>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity postcard chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.

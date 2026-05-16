@@ -1,5 +1,5 @@
 //! Node run loop — library entry point for running a node with optional per-tick entity injection.
-//! Used by the arcane-cluster binary (no demo) and by arcane-demo's cluster-demo binary (with demo agents).
+//! Used by the arcane-node binary (no demo) and by arcane-demo's node-demo binary (with demo agents).
 //! Keeps infrastructure (this crate) free of game/demo logic.
 //!
 //! Interactions:
@@ -21,9 +21,9 @@ use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
 #[cfg(feature = "cluster-ws")]
-use crate::cluster_stats::{serve_stats_http, ClusterStats};
-#[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
+#[cfg(feature = "cluster-ws")]
+use crate::node_stats::{serve_stats_http, NodeStats};
 #[cfg(feature = "cluster-ws")]
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 #[cfg(feature = "spacetimedb-persist")]
@@ -36,25 +36,25 @@ const LOG_STATS_EVERY_TICKS: u64 = 40;
 /// Entities not updated by a neighbor for this many ticks are pruned (stale neighbor crash guard).
 const NEIGHBOR_STALE_TICKS: u64 = 300;
 
-/// Cluster-binary environment configuration (CLUSTER_ID, REDIS_URL,
-/// NEIGHBOR_IDS, CLUSTER_WS_PORT). Shared by every cluster-binary entry point
+/// Node-binary environment configuration (NODE_ID, REDIS_URL,
+/// NEIGHBOR_IDS, NODE_WS_PORT). Shared by every node-binary entry point
 /// so the env contract stays in one place.
 #[derive(Clone, Debug)]
-pub struct ClusterEnv {
+pub struct NodeEnv {
     pub cluster_id: Uuid,
     pub redis_url: String,
     pub neighbor_ids: Vec<Uuid>,
     pub ws_port: u16,
 }
 
-impl ClusterEnv {
-    /// Read the standard cluster env vars. `CLUSTER_ID` is required; the rest
+impl NodeEnv {
+    /// Read the standard node env vars. `NODE_ID` is required; the rest
     /// have defaults (Redis at `127.0.0.1:6379`, no neighbors, WS port `8080`).
     pub fn from_env() -> Result<Self, String> {
-        let cluster_id = std::env::var("CLUSTER_ID")
-            .map_err(|_| "CLUSTER_ID env var required (UUID)".to_string())?;
         let cluster_id =
-            Uuid::parse_str(&cluster_id).map_err(|e| format!("invalid CLUSTER_ID: {}", e))?;
+            std::env::var("NODE_ID").map_err(|_| "NODE_ID env var required (UUID)".to_string())?;
+        let cluster_id =
+            Uuid::parse_str(&cluster_id).map_err(|e| format!("invalid NODE_ID: {}", e))?;
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let neighbor_ids = std::env::var("NEIGHBOR_IDS")
@@ -66,7 +66,7 @@ impl ClusterEnv {
                     .collect()
             })
             .unwrap_or_default();
-        let ws_port: u16 = std::env::var("CLUSTER_WS_PORT")
+        let ws_port: u16 = std::env::var("NODE_WS_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
@@ -104,14 +104,14 @@ fn merge_with_neighbor_latest(
     }
 }
 
-/// Runs the cluster server loop with WebSocket and Redis replication.
+/// Runs the node server loop with WebSocket and Redis replication.
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
 ///
 /// When `simulation` is `Some`, [`ClusterSimulation::on_tick`] runs after those steps and before
 /// [`ArcaneNode::tick`], using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
 /// [`crate::tick_rate`]). Never returns on success (infinite loop); returns Err only if setup fails.
 #[cfg(feature = "cluster-ws")]
-pub fn run_cluster_loop<F>(
+pub fn run_node_loop<F>(
     cluster_id: Uuid,
     redis_url: String,
     neighbor_ids: Vec<Uuid>,
@@ -135,8 +135,8 @@ where
     let (client_updates_tx, client_updates_rx) = std::sync::mpsc::channel();
     let (game_actions_tx, game_actions_rx) = std::sync::mpsc::channel::<GameAction>();
 
-    let stats = ClusterStats::new();
-    let stats_port = std::env::var("CLUSTER_STATS_PORT")
+    let stats = NodeStats::new();
+    let stats_port = std::env::var("NODE_STATS_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(ws_port.saturating_add(1));
@@ -162,7 +162,7 @@ where
 
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     eprintln!(
-        "arcane-cluster started cluster_id={} neighbors={} tick_rate={}Hz",
+        "arcane-node started cluster_id={} neighbors={} tick_rate={}Hz",
         cluster_id,
         neighbor_ids.len(),
         tick_rate_hz

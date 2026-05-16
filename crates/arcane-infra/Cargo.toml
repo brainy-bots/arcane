@@ -34,8 +34,8 @@ affinity-clustering = ["dep:arcane-affinity"]
 rapier-cluster = ["cluster-ws", "dep:rapier3d"]
 
 [[bin]]
-name = "arcane-cluster"
-path = "src/bin/arcane_cluster.rs"
+name = "arcane-node"
+path = "src/bin/arcane_node.rs"
 required-features = ["cluster-ws"]
 
 [[bin]]
@@ -44,8 +44,8 @@ path = "src/bin/arcane_manager.rs"
 required-features = ["manager"]
 
 [[bin]]
-name = "arcane-rapier-cluster"
-path = "src/bin/arcane_rapier_cluster.rs"
+name = "arcane-rapier-node"
+path = "src/bin/arcane_rapier_node.rs"
 required-features = ["rapier-cluster"]
 
 [dev-dependencies]
