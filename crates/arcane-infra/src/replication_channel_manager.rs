@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::redis_channel::RedisReplicationChannel;
 
-/// Runs on each ClusterServer. Opens/closes channels from topology; send_to_neighbors, on_receive.
+/// Runs on each ArcaneNode. Opens/closes channels from topology; send_to_neighbors, on_receive.
 pub struct ReplicationChannelManager {
     cluster_id: Uuid,
     inner: Mutex<ManagerState>,

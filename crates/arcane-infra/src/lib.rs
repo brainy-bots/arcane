@@ -4,7 +4,7 @@
 //!
 //! ## Module responsibilities
 //! - `cluster_manager`: assignment/topology orchestration and control-plane decisions.
-//! - `cluster_server`: per-cluster simulation and state-delta production.
+//! - `node`: per-cluster simulation and state-delta production (ArcaneNode).
 //! - `replication_channel_manager` + `redis_channel`: neighbor transport plumbing.
 //! - `neighbor_subscriber`: inbound Redis subscriber loop for neighbor deltas.
 //! - `ws_server`: client-facing WebSocket transport.
@@ -16,9 +16,9 @@
 #[cfg(feature = "cluster-ws")]
 pub mod broadcast_channel_cap;
 pub mod cluster_manager;
-pub mod cluster_server;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
+pub mod node;
 pub mod redis_channel;
 pub mod replication_channel_manager;
 pub mod rpc_handler;
@@ -48,7 +48,7 @@ pub use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp
 pub use physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 
 pub use cluster_manager::ClusterManager;
-pub use cluster_server::ClusterServer;
+pub use node::ArcaneNode;
 pub use redis_channel::RedisReplicationChannel;
 pub use replication_channel_manager::ReplicationChannelManager;
 pub use rpc_handler::RpcHandler;

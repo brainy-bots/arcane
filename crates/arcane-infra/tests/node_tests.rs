@@ -1,9 +1,9 @@
-//! Tests for ClusterServer (IN-02). Define expected behavior; implementation must satisfy these.
+//! Tests for ArcaneNode (IN-02). Define expected behavior; implementation must satisfy these.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arcane_infra::{ClusterServer, ClusterSimulation, ReplicationChannelManager};
+use arcane_infra::{ArcaneNode, ClusterSimulation, ReplicationChannelManager};
 use uuid::Uuid;
 
 struct NudgePositiveX;
@@ -19,20 +19,20 @@ impl ClusterSimulation for NudgePositiveX {
 #[test]
 fn new_holds_cluster_id() {
     let id = Uuid::new_v4();
-    let server = ClusterServer::new(id);
+    let server = ArcaneNode::new(id);
     assert_eq!(server.cluster_id(), id);
 }
 
 #[test]
 fn current_tick_starts_at_zero_after_new() {
-    let server = ClusterServer::new(Uuid::new_v4());
+    let server = ArcaneNode::new(Uuid::new_v4());
     let tick = server.current_tick();
     assert_eq!(tick, 0, "tick should be 0 before run");
 }
 
 #[test]
 fn tick_increments_tick_and_seq() {
-    let server = ClusterServer::new(Uuid::new_v4());
+    let server = ArcaneNode::new(Uuid::new_v4());
     assert_eq!(server.current_tick(), 0);
     assert_eq!(server.current_seq(), 0);
     let _ = server.tick();
@@ -47,7 +47,7 @@ fn tick_increments_tick_and_seq() {
 #[test]
 fn tick_with_replication_and_neighbors_sends_delta() {
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let mgr = ReplicationChannelManager::new(cluster_id);
     mgr.set_neighbors(vec![Uuid::new_v4()]);
     server.set_replication(Arc::new(mgr));
@@ -60,7 +60,7 @@ fn tick_with_replication_and_neighbors_sends_delta() {
 #[test]
 fn tick_with_replication_zero_neighbors_no_panic() {
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let mgr = ReplicationChannelManager::new(cluster_id);
     assert_eq!(mgr.channel_count(), 0);
     server.set_replication(Arc::new(mgr));
@@ -75,7 +75,7 @@ fn tick_returns_delta_with_entities() {
     use arcane_core::Vec3;
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let entity_id = Uuid::new_v4();
     server.add_entity(EntityStateEntry::new(
         entity_id,
@@ -114,7 +114,7 @@ fn simulate_before_tick_runs_before_delta_and_sees_upcoming_tick() {
     }
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     server.add_entity(EntityStateEntry::new(
         Uuid::nil(),
         cluster_id,
@@ -132,7 +132,7 @@ fn simulate_before_tick_can_mutate_positions() {
     use arcane_core::Vec3;
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let entity_id = Uuid::new_v4();
     server.add_entity(EntityStateEntry::new(
         entity_id,
@@ -160,7 +160,7 @@ fn simulate_before_tick_pending_removals_end_up_in_delta_removed() {
     }
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let entity_id = Uuid::new_v4();
     server.add_entity(EntityStateEntry::new(
         entity_id,
@@ -180,7 +180,7 @@ fn remove_entity_appears_in_next_delta_removed() {
     use arcane_core::Vec3;
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     let entity_id = Uuid::new_v4();
     server.add_entity(EntityStateEntry::new(
         entity_id,
@@ -202,7 +202,7 @@ fn add_entity_respects_max_entity_cap() {
     use arcane_core::Vec3;
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::with_max_entities(cluster_id, 3);
+    let server = ArcaneNode::with_max_entities(cluster_id, 3);
 
     for i in 0..5u128 {
         server.add_entity(EntityStateEntry::new(
@@ -221,7 +221,7 @@ fn add_entity_allows_update_to_existing_at_cap() {
     use arcane_core::Vec3;
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::with_max_entities(cluster_id, 2);
+    let server = ArcaneNode::with_max_entities(cluster_id, 2);
     let existing_id = Uuid::from_u128(1);
 
     server.add_entity(EntityStateEntry::new(
@@ -268,7 +268,7 @@ fn simulate_before_tick_panicking_simulation_poisons_but_does_not_cascade() {
     }
 
     let cluster_id = Uuid::new_v4();
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     server.add_entity(EntityStateEntry::new(
         Uuid::nil(),
         cluster_id,
@@ -310,7 +310,7 @@ mod dead_reckoning {
         // First-ever broadcast must include each entity once so the client
         // has an anchor to extrapolate from. Without this, a constant-velocity
         // entity that just joined would never be sent at all.
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         for i in 0..5_u128 {
             server.add_entity(entry(Uuid::from_u128(i + 1), 0.0));
         }
@@ -323,7 +323,7 @@ mod dead_reckoning {
         // The whole point of dead reckoning: a moving-in-a-straight-line
         // entity should produce one broadcast (the anchor), then nothing,
         // until either velocity changes or a resync tick fires.
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         let id = Uuid::from_u128(1);
         server.add_entity(entry(id, 5.0));
         let delta1 = server.tick();
@@ -341,7 +341,7 @@ mod dead_reckoning {
 
     #[test]
     fn changed_velocity_is_included() {
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         let id = Uuid::from_u128(1);
         server.add_entity(entry(id, 5.0));
         let _ = server.tick();
@@ -359,7 +359,7 @@ mod dead_reckoning {
         // The skip decision is made in the wire's Vec3Q (i16) representation,
         // so a 0.1-unit jitter that quantizes to the same i16 doesn't trigger
         // a redundant broadcast — wire bytes wouldn't change anyway.
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         let id = Uuid::from_u128(1);
         server.add_entity(entry(id, 5.0));
         let _ = server.tick();
@@ -379,7 +379,7 @@ mod dead_reckoning {
         // velocity didn't change. Late joiners and packet-loss recovery rely
         // on this.
         std::env::set_var("ARCANE_RESYNC_EVERY_N_TICKS", "3");
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         std::env::remove_var("ARCANE_RESYNC_EVERY_N_TICKS");
 
         let id = Uuid::from_u128(1);
@@ -402,7 +402,7 @@ mod dead_reckoning {
         // entity with the same id rejoining at the same velocity should be
         // treated as new (first broadcast includes it) — which only happens
         // if the prior record was forgotten.
-        let server = ClusterServer::new(Uuid::new_v4());
+        let server = ArcaneNode::new(Uuid::new_v4());
         let id = Uuid::from_u128(1);
         server.add_entity(entry(id, 5.0));
         let _ = server.tick();

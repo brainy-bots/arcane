@@ -1,9 +1,9 @@
-//! Cluster server run loop — library entry point for running a cluster with optional per-tick entity injection.
+//! Node run loop — library entry point for running a cluster with optional per-tick entity injection.
 //! Used by the arcane-cluster binary (no demo) and by arcane-demo's cluster-demo binary (with demo agents).
 //! Keeps infrastructure (this crate) free of game/demo logic.
 //!
 //! Interactions:
-//! - pulls local simulation deltas from `ClusterServer`
+//! - pulls local simulation deltas from `ArcaneNode`
 //! - consumes neighbor deltas from `neighbor_subscriber`
 //! - publishes merged state to `ws_server`
 //! - optionally persists snapshots through `spacetimedb_persist`
@@ -28,7 +28,7 @@ use crate::neighbor_subscriber::spawn_neighbor_subscriber;
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 #[cfg(feature = "spacetimedb-persist")]
 use crate::spacetimedb_persist::SpacetimeDbPersist;
-use crate::{ClusterServer, ReplicationChannelManager};
+use crate::{ArcaneNode, ReplicationChannelManager};
 
 const LOG_EVERY_TICKS: u64 = 100;
 /// Log parseable server stats every N ticks (for benchmark: entities, clusters, tick_ms).
@@ -108,7 +108,7 @@ fn merge_with_neighbor_latest(
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
 ///
 /// When `simulation` is `Some`, [`ClusterSimulation::on_tick`] runs after those steps and before
-/// [`ClusterServer::tick`], using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
+/// [`ArcaneNode::tick`], using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
 /// [`crate::tick_rate`]). Never returns on success (infinite loop); returns Err only if setup fails.
 #[cfg(feature = "cluster-ws")]
 pub fn run_cluster_loop<F>(
@@ -128,7 +128,7 @@ where
         .map_err(|e| format!("Redis start failed: {}", e))?;
     replication.set_neighbors(neighbor_ids.clone());
 
-    let server = ClusterServer::new(cluster_id);
+    let server = ArcaneNode::new(cluster_id);
     server.set_replication(Arc::new(replication));
 
     let (state_tx, state_rx) = std::sync::mpsc::channel();
