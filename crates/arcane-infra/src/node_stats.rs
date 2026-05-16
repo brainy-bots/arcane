@@ -1,12 +1,12 @@
-//! Per-cluster runtime counters exposed to the benchmark harness (and anyone else
-//! who wants to verify the cluster is actually processing client traffic).
+//! Per-node runtime counters exposed to the benchmark harness (and anyone else
+//! who wants to verify the node is actually processing client traffic).
 //!
 //! The `ArcaneServerStats` log line has been the only observability signal until
 //! now, which lets silent failures (e.g. zero client messages accepted) pass as
 //! "successful" runs. This struct pairs with `serve_stats_http` below to expose
 //! the same counters over an HTTP `/stats` endpoint on a separate port, so the
 //! driver can cross-check "the swarm claims to have sent N messages" against
-//! "each cluster actually accepted K of them".
+//! "each node actually accepted K of them".
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Default)]
-pub struct ClusterStats {
-    /// WebSocket connections accepted by this cluster's server socket since startup.
+pub struct NodeStats {
+    /// WebSocket connections accepted by this node's server socket since startup.
     pub ws_accepts: AtomicU64,
     /// PLAYER_STATE messages successfully parsed and forwarded to the cluster.
     pub msgs_player_state: AtomicU64,
@@ -24,7 +24,7 @@ pub struct ClusterStats {
     pub msgs_game_action: AtomicU64,
     /// Incoming text messages that did not parse as either PLAYER_STATE or GAME_ACTION.
     pub parse_failures: AtomicU64,
-    /// Inbound text bytes received by this cluster's WebSocket server.
+    /// Inbound text bytes received by this node's WebSocket server.
     pub bytes_in: AtomicU64,
     /// Outbound WebSocket bytes sent to connected subscribers (cumulative
     /// across the run). Used alongside `ws_accepts` to compute egress rate.
@@ -63,7 +63,7 @@ pub struct ClusterStats {
     unique_entity_ids: Mutex<HashSet<Uuid>>,
 }
 
-impl ClusterStats {
+impl NodeStats {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -134,7 +134,7 @@ impl ClusterStats {
 /// `cluster-ws` feature. The protocol is one request, one response, no
 /// framing — enough for a counters endpoint.
 #[cfg(feature = "cluster-ws")]
-pub fn serve_stats_http(port: u16, cluster_id: String, stats: Arc<ClusterStats>) {
+pub fn serve_stats_http(port: u16, cluster_id: String, stats: Arc<NodeStats>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -145,11 +145,11 @@ pub fn serve_stats_http(port: u16, cluster_id: String, stats: Arc<ClusterStats>)
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("cluster stats HTTP bind failed on {}: {}", addr, e);
+                    eprintln!("node stats HTTP bind failed on {}: {}", addr, e);
                     return;
                 }
             };
-            eprintln!("cluster stats HTTP listening on http://{}/stats", addr);
+            eprintln!("node stats HTTP listening on http://{}/stats", addr);
 
             loop {
                 let (socket, _peer) = match listener.accept().await {
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn set_entities_tracks_peak() {
-        let s = ClusterStats::new();
+        let s = NodeStats::new();
         s.set_entities(10);
         s.set_entities(5);
         s.set_entities(20);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn to_json_includes_all_counters() {
-        let s = ClusterStats::new();
+        let s = NodeStats::new();
         s.ws_accepts.store(3, Ordering::Relaxed);
         s.msgs_player_state.store(100, Ordering::Relaxed);
         s.msgs_game_action.store(7, Ordering::Relaxed);

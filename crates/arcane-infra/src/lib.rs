@@ -27,23 +27,15 @@ pub mod spacetimedb_persist;
 pub mod tick_rate;
 
 #[cfg(feature = "cluster-ws")]
-pub mod cluster_stats;
-#[cfg(feature = "cluster-ws")]
 pub mod node_runner;
+#[cfg(feature = "cluster-ws")]
+pub mod node_stats;
 #[cfg(feature = "cluster-ws")]
 pub mod physics_events_channel;
 #[cfg(feature = "cluster-ws")]
 pub mod startup;
 #[cfg(feature = "cluster-ws")]
 pub mod ws_server;
-
-// Compatibility aliases — downstream crates (benchmarks, demos) import these module paths.
-// Remove in Phase 2 when all repos are updated simultaneously.
-#[deprecated(note = "renamed to manager")]
-pub use manager as cluster_manager;
-#[cfg(feature = "cluster-ws")]
-#[deprecated(note = "renamed to node_runner")]
-pub use node_runner as cluster_runner;
 
 #[cfg(feature = "rapier-cluster")]
 pub mod rapier_cluster;
@@ -56,8 +48,6 @@ pub use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp
 pub use physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 
 pub use manager::ArcaneManager;
-#[deprecated(note = "renamed to ArcaneManager")]
-pub use manager::ArcaneManager as ClusterManager;
 pub use node::ArcaneNode;
 pub use redis_channel::RedisReplicationChannel;
 pub use replication_channel_manager::ReplicationChannelManager;

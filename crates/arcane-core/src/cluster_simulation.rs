@@ -5,7 +5,7 @@
 //! **Durable / transactional state**: SpacetimeDB reducers and tables, not this hook alone.
 //!
 //! Implement [`ClusterSimulation`] in your crate and pass `Some(Arc::new(...))` to
-//! `arcane_infra::node_runner::run_cluster_loop` (Cargo feature `cluster-ws` on `arcane-infra`).
+//! `arcane_infra::node_runner::run_node_loop` (Cargo feature `cluster-ws` on `arcane-infra`).
 //! The hook runs
 //! after client updates and injected entities are applied, and before the replication delta is built.
 //!

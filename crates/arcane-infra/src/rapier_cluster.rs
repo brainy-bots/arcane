@@ -2,7 +2,7 @@
 //!
 //! [`RapierClusterSim`] wraps a user's [`ClusterSimulation`] and inserts a Rapier
 //! [`PhysicsPipeline::step`] after the user's `on_tick`. Drop into the existing
-//! [`crate::node_runner::run_cluster_loop`] in place of a bare user simulation —
+//! [`crate::node_runner::run_node_loop`] in place of a bare user simulation —
 //! all networking, replication, neighbor merge, and persistence are unchanged.
 //!
 //! # Contract
@@ -146,7 +146,7 @@
 //! // let game: Arc<dyn arcane_infra::RapierClusterSimulation> = Arc::new(MyGame::new());
 //! // let physics = Arc::new(RapierClusterSim::with_rapier_sim(game, RapierConfig::default()));
 //!
-//! // Pass `Some(physics)` as the simulation arg to `run_cluster_loop`.
+//! // Pass `Some(physics)` as the simulation arg to `run_node_loop`.
 //! ```
 //!
 //! Property-value-style impl that uses every spawn-time hook:
