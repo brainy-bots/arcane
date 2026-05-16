@@ -8,14 +8,14 @@
 | **Component ID** | IN-06 |
 | **Layer** | Infrastructure |
 | **Type** | Component |
-| **Purpose** | Runs on each ClusterServer. Subscribes to SpacetimeDB cluster_topology to get this cluster’s neighbor list; opens and closes IReplicationChannel instances (one per neighbor). Delivers outbound deltas from ClusterServer to each channel and inbound deltas from channels to ClusterServer. Does not decide who is a neighbor — topology comes from ClusterManager via SpacetimeDB. |
+| **Purpose** | Runs on each ArcaneNode. Subscribes to SpacetimeDB cluster_topology to get this cluster’s neighbor list; opens and closes IReplicationChannel instances (one per neighbor). Delivers outbound deltas from ArcaneNode to each channel and inbound deltas from channels to ArcaneNode. Does not decide who is a neighbor — topology comes from ClusterManager via SpacetimeDB. |
 | **Document version** | 1.0 |
 
 ---
 
 ## 1. Overview
 
-ReplicationChannelManager is the component that keeps replication subscriptions in sync with cluster topology. It does not run as a separate process; it runs inside each ClusterServer process. It reads the neighbor list (and optionally per-neighbor centroid/spread for observation-radius filtering) from SpacetimeDB `cluster_topology`; when the topology changes (merge, split, or ClusterManager refresh), it opens new IReplicationChannel instances for new neighbors and closes channels for neighbors that are no longer in the list. ClusterServer calls ReplicationChannelManager to send outbound deltas and receives inbound deltas via a callback or queue. See IF-03 for the IReplicationChannel contract and Redis pub/sub behavior; see `in_02_cluster_server.md` for how ClusterServer uses replication.
+ReplicationChannelManager is the component that keeps replication subscriptions in sync with cluster topology. It does not run as a separate process; it runs inside each ArcaneNode process. It reads the neighbor list (and optionally per-neighbor centroid/spread for observation-radius filtering) from SpacetimeDB `cluster_topology`; when the topology changes (merge, split, or ClusterManager refresh), it opens new IReplicationChannel instances for new neighbors and closes channels for neighbors that are no longer in the list. ArcaneNode calls ReplicationChannelManager to send outbound deltas and receives inbound deltas via a callback or queue. See IF-03 for the IReplicationChannel contract and Redis pub/sub behavior; see `in_02_arcane_node.md` for how ArcaneNode uses replication.
 
 ---
 
@@ -26,8 +26,8 @@ ReplicationChannelManager is the component that keeps replication subscriptions 
 - **Open channels:** For each new neighbor, call `IReplicationChannel.open(source_cluster_id = my_cluster_id, destination = neighbor’s ServerHandle, config)`. The implementation (e.g. RedisPubSubReplication) subscribes to that neighbor’s topic; this cluster’s state is published to its own topic (neighbors subscribe to us). Store the channel and the neighbor’s cluster_id and endpoint (host/port for TCP, or topic name for Redis).
 - **Close channels:** When a neighbor is removed from the list or the cluster is shutting down, call `IReplicationChannel.close(reason)`. Reason can be NEIGHBOR_DEPARTED, CLUSTERS_MERGED, or SHUTDOWN. Flush and unsubscribe; do not leave orphan subscriptions.
 - **Provide destination geometry to channels:** For observation-radius filtering (IF-03), each channel needs the destination cluster’s centroid and spread_radius. ReplicationChannelManager obtains these from cluster_topology if stored (optional columns), or from a separate subscription/view, or from a default. Push updates to each channel when topology or geometry changes so the send path can filter entities correctly.
-- **Send path:** Expose a method for ClusterServer to submit an outbound EntityStateDelta (e.g. `send_to_all_neighbors(delta)` or `get_channels() -> [IReplicationChannel]` and ClusterServer calls `send(delta)` on each). ReplicationChannelManager does not build the delta; ClusterServer builds it and passes it. Each channel may apply per-destination filtering (observation radius) using the destination geometry provided above.
-- **Receive path:** When a channel receives a message from a subscription (Redis callback or TCP read), decode the delta and deliver it to ClusterServer (e.g. `on_receive(source_cluster_id, delta)` callback or a queue that ClusterServer drains each tick). ClusterServer merges into its neighbor-entity cache and handles gap detection (IF-03).
+- **Send path:** Expose a method for ArcaneNode to submit an outbound EntityStateDelta (e.g. `send_to_all_neighbors(delta)` or `get_channels() -> [IReplicationChannel]` and ArcaneNode calls `send(delta)` on each). ReplicationChannelManager does not build the delta; ArcaneNode builds it and passes it. Each channel may apply per-destination filtering (observation radius) using the destination geometry provided above.
+- **Receive path:** When a channel receives a message from a subscription (Redis callback or TCP read), decode the delta and deliver it to ArcaneNode (e.g. `on_receive(source_cluster_id, delta)` callback or a queue that ArcaneNode drains each tick). ArcaneNode merges into its neighbor-entity cache and handles gap detection (IF-03).
 - **Reconnect handling:** IReplicationChannel implementations reconnect or resubscribe on broker failure. ReplicationChannelManager does not need to recreate channels unless the topology changed; it may expose channel status (connected/disconnected) for metrics or logging.
 - **Expose metrics:** Subscription count, per-channel send/receive rates, drop counts (from channel get_status() or equivalent). See IF-03 for per-channel metrics; ReplicationChannelManager may aggregate or re-export them with cluster_id label.
 
@@ -36,15 +36,15 @@ ReplicationChannelManager is the component that keeps replication subscriptions 
 ## 3. What It Does NOT Do
 
 - **Decide which clusters are neighbors** — ClusterManager (and IClusteringModel / SpatialIndex) decide; ClusterManager writes cluster_topology. ReplicationChannelManager only reads and applies.
-- **Build entity state deltas** — ClusterServer builds the delta from simulation state; ReplicationChannelManager only passes it to channels.
-- **Simulate or write to SpacetimeDB** — That is ClusterServer. ReplicationChannelManager only manages replication transport.
+- **Build entity state deltas** — ArcaneNode builds the delta from simulation state; ReplicationChannelManager only passes it to channels.
+- **Simulate or write to SpacetimeDB** — That is ArcaneNode. ReplicationChannelManager only manages replication transport.
 - **Authenticate or encrypt replication traffic** — Assumed private network (VPC). See IF-03.
 
 ---
 
 ## 4. Interface / Public API
 
-ReplicationChannelManager is used in-process by ClusterServer. It does not expose a network API.
+ReplicationChannelManager is used in-process by ArcaneNode. It does not expose a network API.
 
 ### 4.1 Lifecycle
 
@@ -58,9 +58,9 @@ Start the manager: subscribe to SpacetimeDB cluster_topology for this cluster_id
 stop() -> void
 ```
 
-Close all channels with reason SHUTDOWN. Unsubscribe from SpacetimeDB. Called when ClusterServer is shutting down.
+Close all channels with reason SHUTDOWN. Unsubscribe from SpacetimeDB. Called when ArcaneNode is shutting down.
 
-### 4.2 Send (used by ClusterServer)
+### 4.2 Send (used by ArcaneNode)
 
 ```
 send_to_neighbors(delta: EntityStateDelta) -> void
@@ -68,15 +68,15 @@ send_to_neighbors(delta: EntityStateDelta) -> void
 
 Broadcast the given delta to all current neighbor channels. Non-blocking; each channel enqueues (IReplicationChannel.send). Delta must include source_cluster_id (this cluster) and seq. EntityStateDelta shape is defined in IF-03.
 
-Alternatively, the API can expose `get_channels() -> [IReplicationChannel]` and ClusterServer calls `send(delta)` on each channel. The doc assumes a single entry point `send_to_neighbors` for clarity; implementation may delegate to channels internally.
+Alternatively, the API can expose `get_channels() -> [IReplicationChannel]` and ArcaneNode calls `send(delta)` on each channel. The doc assumes a single entry point `send_to_neighbors` for clarity; implementation may delegate to channels internally.
 
-### 4.3 Receive (callback to ClusterServer)
+### 4.3 Receive (callback to ArcaneNode)
 
 ```
 on_receive(source_cluster_id: ID, delta: EntityStateDelta) -> void
 ```
 
-Called by ReplicationChannelManager when an inbound delta is decoded from a subscription (Redis or TCP). ClusterServer implements this or registers a callback; it merges the delta into its neighbor-entity cache and performs gap detection (IF-03). ReplicationChannelManager is responsible for decoding and dispatching; it does not interpret entity state.
+Called by ReplicationChannelManager when an inbound delta is decoded from a subscription (Redis or TCP). ArcaneNode implements this or registers a callback; it merges the delta into its neighbor-entity cache and performs gap detection (IF-03). ReplicationChannelManager is responsible for decoding and dispatching; it does not interpret entity state.
 
 ### 4.4 Destination geometry (for filtering)
 
@@ -102,7 +102,7 @@ For metrics and debugging. ChannelStatus can include source_cluster_id, dest_clu
 - **Topology subscription handler:** On SpacetimeDB subscription callback for cluster_topology: diff current neighbor_ids with previous set. For each new neighbor_id: resolve endpoint (from topology row or neighbor table — server_host, server_port for TCP; topic name = f("cluster:{cluster_id}") or similar for Redis). Create IReplicationChannel implementation instance (e.g. RedisPubSubReplication), call open(my_cluster_id, destination, config). Store in map neighbor_id → channel. For each removed neighbor_id: get channel, call close(NEIGHBOR_DEPARTED or CLUSTERS_MERGED), remove from map. If topology includes centroid/spread per cluster, call set_neighbor_geometry for each neighbor.
 - **Send path:** send_to_neighbors(delta) iterates over the channel map and calls channel.send(delta) for each. Each channel may filter the delta (observation radius) using the destination geometry stored for that channel; IF-03 specifies the filter. Channels are responsible for encoding and publishing to Redis (or TCP).
 - **Receive path:** Each IReplicationChannel has a subscription callback (Redis message handler or TCP read loop). On message: decode payload to EntityStateDelta, call on_receive(source_cluster_id, delta). source_cluster_id is the topic owner (Redis) or the connection’s cluster_id (TCP). ReplicationChannelManager does not buffer large backlogs; decoding and callback should be fast so the subscription thread is not blocked.
-- **Concurrency:** Topology updates may arrive on a SpacetimeDB subscription thread; channel open/close and send may be called from ClusterServer’s tick thread. Access to the channel set must be thread-safe (e.g. mutex or concurrent map). Send can take a snapshot of the channel list to avoid holding the lock during send.
+- **Concurrency:** Topology updates may arrive on a SpacetimeDB subscription thread; channel open/close and send may be called from ArcaneNode’s tick thread. Access to the channel set must be thread-safe (e.g. mutex or concurrent map). Send can take a snapshot of the channel list to avoid holding the lock during send.
 
 ---
 
@@ -120,7 +120,7 @@ For metrics and debugging. ChannelStatus can include source_cluster_id, dest_clu
 |------------|--------------|----------------|
 | SpacetimeDB | cluster_topology subscription (my cluster_id row; optionally neighbor rows for endpoint and geometry) | Schema and subscription query must match; neighbor_ids and endpoint info shape. |
 | IReplicationChannel (IF-03) | open(), close(), send(), subscription callback | ReplicationChannelManager creates and holds channels; IF-03 defines lifecycle and delta shape. |
-| ClusterServer (IN-02) | Calls send_to_neighbors(delta); implements or registers on_receive(source_cluster_id, delta) | ClusterServer must build delta with correct source_cluster_id and seq; handle gap detection on receive. |
+| ArcaneNode (IN-02) | Calls send_to_neighbors(delta); implements or registers on_receive(source_cluster_id, delta) | ArcaneNode must build delta with correct source_cluster_id and seq; handle gap detection on receive. |
 
 ReplicationChannelManager does not depend on ClusterManager directly; it only reads from SpacetimeDB, which ClusterManager writes.
 
@@ -166,7 +166,7 @@ Per-channel metrics (send rate, drops, latency) are defined in IF-03 and exposed
 | Failure | Detection | Response |
 |---------|-----------|----------|
 | SpacetimeDB topology subscription fails or disconnects | Subscription error | Retry subscribe. Until restored, do not add new channels; existing channels keep running. Optionally close all channels and set neighbor set to empty so we do not send to stale neighbors (conservative). |
-| Topology row missing for my cluster_id | No row after startup or row removed | No neighbors; close all channels. Cluster may have been released (merge); ClusterServer may be shutting down or idle. |
+| Topology row missing for my cluster_id | No row after startup or row removed | No neighbors; close all channels. Cluster may have been released (merge); ArcaneNode may be shutting down or idle. |
 | Redis (or broker) unreachable | IReplicationChannel reports disconnected | Channels handle reconnect (IF-03). ReplicationChannelManager does not remove the channel; when broker is back, channel resubscribes. |
 | Channel open() fails (e.g. Redis subscribe fails) | open() returns Error | Log; do not add channel. Retry on next topology update or periodic retry. Emit metric. |
 

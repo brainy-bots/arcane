@@ -1,6 +1,6 @@
 # Arcane system architecture
 
-High-level view of how the system works, who is responsible for what, and how data moves between components. See the interface and component specs in the umbrella repo (e.g. `in_01_cluster_manager.md`, `in_02_cluster_server.md`, `in_06_replication_channel_manager.md`) for details.
+High-level view of how the system works, who is responsible for what, and how data moves between components. See the interface and component specs in the umbrella repo (e.g. `in_01_cluster_manager.md`, `in_02_arcane_node.md`, `in_06_replication_channel_manager.md`) for details.
 
 ---
 
@@ -17,9 +17,9 @@ flowchart TB
         M[Manager]
     end
 
-    subgraph clusters["Cluster servers"]
-        S1[ClusterServer A]
-        S2[ClusterServer B]
+    subgraph clusters["Arcane Nodes"]
+        S1[ArcaneNode A]
+        S2[ArcaneNode B]
     end
 
     subgraph data["Shared data & transport"]
@@ -43,12 +43,12 @@ flowchart TB
 
 | Component | Responsibility |
 |-----------|----------------|
-| **Client** | Connect to Manager for join/leave and cluster assignment; connect to ClusterServer for game session; send PLAYER_INPUT; receive STATE_UPDATE, RPC_RESULT, CLUSTER_ASSIGN/REASSIGN. |
+| **Client** | Connect to Manager for join/leave and cluster assignment; connect to Arcane Node for game session; send PLAYER_INPUT; receive STATE_UPDATE, RPC_RESULT, CLUSTER_ASSIGN/REASSIGN. |
 | **ClusterManager** | Single coordinator: assign players to clusters, maintain spatial index and neighbor topology, run clustering model (merge/split), write assignments and topology to SpacetimeDB; send CLUSTER_ASSIGN/REASSIGN to clients. Does not simulate or replicate. |
-| **ClusterServer** | One per cluster: run simulation (movement, physics, AI) for owned entities; accept client Cluster WebSocket; send STATE_UPDATE each tick; receive PLAYER_INPUT; publish entity state to Redis for neighbors; subscribe to neighbors via Redis; read assignments/topology from SpacetimeDB; write entity state to SpacetimeDB at throttled rate; call SpacetimeDB reducers for discrete events (e.g. attack hit). |
-| **ReplicationChannelManager** | Runs inside each ClusterServer: subscribe to SpacetimeDB cluster_topology; open/close one IReplicationChannel per neighbor; deliver outbound deltas to Redis and inbound deltas from Redis to ClusterServer. Does not decide neighbors (Manager does). |
+| **ArcaneNode** | One per cluster: run simulation (movement, physics, AI) for owned entities; accept client Cluster WebSocket; send STATE_UPDATE each tick; receive PLAYER_INPUT; publish entity state to Redis for neighbors; subscribe to neighbors via Redis; read assignments/topology from SpacetimeDB; write entity state to SpacetimeDB at throttled rate; call SpacetimeDB reducers for discrete events (e.g. attack hit). |
+| **ReplicationChannelManager** | Runs inside each ArcaneNode: subscribe to SpacetimeDB cluster_topology; open/close one IReplicationChannel per neighbor; deliver outbound deltas to Redis and inbound deltas from Redis to ArcaneNode. Does not decide neighbors (Manager does). |
 | **Redis** | Pub/sub transport for real-time entity state between neighboring clusters. Each cluster publishes to its topic; neighbors subscribe. Fire-and-forget; no delivery guarantee. |
-| **SpacetimeDB** | Authoritative store for assignments, topology, and persistent entity state. Manager writes assignments/topology; ClusterServers subscribe and write entity state (throttled). Reducers for discrete game events. Gap recovery uses SpacetimeDB. |
+| **SpacetimeDB** | Authoritative store for assignments, topology, and persistent entity state. Manager writes assignments/topology; Arcane Nodes subscribe and write entity state (throttled). Reducers for discrete game events. Gap recovery uses SpacetimeDB. |
 
 ---
 
@@ -59,7 +59,7 @@ sequenceDiagram
     participant C as Client
     participant M as ClusterManager
     participant SDB as SpacetimeDB
-    participant S as ClusterServer
+    participant S as ArcaneNode
 
     C->>M: PLAYER_JOIN (player_id, position, ...)
     M->>M: Decide cluster (existing or allocate from pool)
@@ -77,7 +77,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    subgraph ClusterA["ClusterServer A"]
+    subgraph ClusterA["ArcaneNode A"]
         A_Sim[Simulate<br/>owned entities]
         A_Client[Send STATE_UPDATE<br/>to clients]
         A_ReplOut[Build delta<br/>send to Redis]
@@ -89,7 +89,7 @@ flowchart LR
         TopicB[topic B]
     end
 
-    subgraph ClusterB["ClusterServer B"]
+    subgraph ClusterB["ArcaneNode B"]
         B_Sim[Simulate<br/>owned entities]
         B_Client[Send STATE_UPDATE<br/>to clients]
         B_ReplOut[Build delta<br/>send to Redis]
@@ -109,7 +109,7 @@ flowchart LR
     TopicA --> B_ReplIn
 ```
 
-- **Per tick:** Each ClusterServer runs simulation for its owned entities, builds one **EntityStateDelta** (batch) per tick, sends it to **all current neighbors** via ReplicationChannelManager (one publish per neighbor to Redis). It also receives deltas from neighbors (subscriptions) and merges them into a “neighbor entity” cache. STATE_UPDATE to clients includes both own entities and replicated neighbor entities.
+- **Per tick:** Each ArcaneNode runs simulation for its owned entities, builds one **EntityStateDelta** (batch) per tick, sends it to **all current neighbors** via ReplicationChannelManager (one publish per neighbor to Redis). It also receives deltas from neighbors (subscriptions) and merges them into a “neighbor entity” cache. STATE_UPDATE to clients includes both own entities and replicated neighbor entities.
 
 ---
 
@@ -117,7 +117,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph ClusterServer
+    subgraph ArcaneNodeProcess["ArcaneNode"]
         Tick[Simulation tick]
         Throttle[Throttled persist<br/>(e.g. every 1–2 s)]
         Event[Discrete event<br/>(e.g. hit, drop)]
@@ -135,8 +135,8 @@ flowchart TB
     Reducers --> Tables
 ```
 
-- **Persistence:** ClusterServer writes entity state to SpacetimeDB at a **throttled rate** (e.g. 1–2 s), not every tick. One batch per persist (full snapshot or ordered batch). High-frequency updates are replicated via Redis only.
-- **Discrete events:** When something like “projectile hit” or “use item” happens, ClusterServer **calls a SpacetimeDB reducer**. The reducer updates game tables and returns; ClusterServer sends **RPC_RESULT** to the client from that return.
+- **Persistence:** ArcaneNode writes entity state to SpacetimeDB at a **throttled rate** (e.g. 1–2 s), not every tick. One batch per persist (full snapshot or ordered batch). High-frequency updates are replicated via Redis only.
+- **Discrete events:** When something like “projectile hit” or “use item” happens, ArcaneNode **calls a SpacetimeDB reducer**. The reducer updates game tables and returns; ArcaneNode sends **RPC_RESULT** to the client from that return.
 
 ---
 
@@ -146,8 +146,8 @@ flowchart TB
 sequenceDiagram
     participant M as ClusterManager
     participant SDB as SpacetimeDB
-    participant S1 as ClusterServer A
-    participant S2 as ClusterServer B
+    participant S1 as ArcaneNode A
+    participant S2 as ArcaneNode B
     participant C as Client
 
     Note over M: Evaluation cadence: IClusteringModel.evaluate(view)
@@ -161,7 +161,7 @@ sequenceDiagram
     Note over S2: Stops; replication channels closed; pool release
 ```
 
-- **ClusterManager** is the only writer of assignments and topology. **ReplicationChannelManager** on each ClusterServer subscribes to **cluster_topology** and opens/closes **IReplicationChannel** (Redis subscriptions) when neighbors change.
+- **ClusterManager** is the only writer of assignments and topology. **ReplicationChannelManager** on each ArcaneNode subscribes to **cluster_topology** and opens/closes **IReplicationChannel** (Redis subscriptions) when neighbors change.
 
 ---
 
@@ -169,11 +169,11 @@ sequenceDiagram
 
 | Data | Written by | Read by | Transport / store |
 |------|------------|---------|--------------------|
-| Player → cluster assignment | ClusterManager | ClusterServers, clients (via Manager) | SpacetimeDB |
-| Cluster topology (neighbors) | ClusterManager | ReplicationChannelManager (per cluster) | SpacetimeDB |
-| Entity state (high-frequency) | ClusterServer (per tick) | Neighbor ClusterServers | Redis (pub/sub) |
-| Entity state (persistent) | ClusterServer (throttled) | ClusterServers (gap recovery, load) | SpacetimeDB |
-| Discrete game outcomes | ClusterServer → reducer | Client (RPC_RESULT), SpacetimeDB tables | SpacetimeDB reducers |
+| Player → cluster assignment | ClusterManager | Arcane Nodes, clients (via Manager) | SpacetimeDB |
+| Cluster topology (neighbors) | ClusterManager | ReplicationChannelManager (per node) | SpacetimeDB |
+| Entity state (high-frequency) | ArcaneNode (per tick) | Neighbor Arcane Nodes | Redis (pub/sub) |
+| Entity state (persistent) | ArcaneNode (throttled) | Arcane Nodes (gap recovery, load) | SpacetimeDB |
+| Discrete game outcomes | ArcaneNode → reducer | Client (RPC_RESULT), SpacetimeDB tables | SpacetimeDB reducers |
 
 For how **entity fields** map to replication vs SpacetimeDB vs process-local state, see [architecture/four-bucket-state-model.md](architecture/four-bucket-state-model.md). For **authoritative physics** (e.g. Unreal Chaos) and the cluster tick hook, see [architecture/physics-backends-and-unreal.md](architecture/physics-backends-and-unreal.md).
 

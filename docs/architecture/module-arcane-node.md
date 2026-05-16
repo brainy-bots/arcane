@@ -1,4 +1,4 @@
-# IN-02 — ClusterServer
+# IN-02 — ArcaneNode
 **Player simulation unit**
 
 ---
@@ -15,17 +15,17 @@
 
 ## 1. Overview
 
-ClusterServer is the process that clients connect to for a given cluster. It owns a set of players and entities (defined by SpacetimeDB assignments); it runs **high-frequency simulation** (movement, physics, **AI**) each tick, writes entity state to SpacetimeDB at a **throttled rate** (not every tick), and publishes state deltas to Redis via IReplicationChannel so neighbors see movement in real time. For **discrete game events** (e.g. projectile hits target), it **calls a SpacetimeDB reducer**; the reducer updates game tables and returns (success, state_tick); the server sends **RPC_RESULT** to the client from that return. It subscribes to neighbors' replication topics and to SpacetimeDB for assignments and gap recovery. It does not decide assignments or topology — ClusterManager does. See `00_component_index.md` § Simulation vs authoritative world state; `docs/END_TO_END_FLOWS.md`, `in_01_cluster_manager.md`, `docs/SPACETIMEDB_SCHEMA.md`, `ca_01_iclientadapter.md`.
+ArcaneNode is the process that clients connect to for a given cluster. It owns a set of players and entities (defined by SpacetimeDB assignments); it runs **high-frequency simulation** (movement, physics, **AI**) each tick, writes entity state to SpacetimeDB at a **throttled rate** (not every tick), and publishes state deltas to Redis via IReplicationChannel so neighbors see movement in real time. For **discrete game events** (e.g. projectile hits target), it **calls a SpacetimeDB reducer**; the reducer updates game tables and returns (success, state_tick); the server sends **RPC_RESULT** to the client from that return. It subscribes to neighbors' replication topics and to SpacetimeDB for assignments and gap recovery. It does not decide assignments or topology — ClusterManager does. See `00_component_index.md` § Simulation vs authoritative world state; `docs/END_TO_END_FLOWS.md`, `in_01_cluster_manager.md`, `docs/SPACETIMEDB_SCHEMA.md`, `ca_01_iclientadapter.md`.
 
 ---
 
 ## 2. Responsibilities
 
-- **Obtain cluster identity at startup:** Learn `cluster_id` (and optionally `server_id`) from environment, orchestration, or by subscribing to `cluster_topology` where this process is the server (e.g. by host:port or server_id). Until ClusterManager creates a row in `cluster_topology` for this server, the ClusterServer may have no cluster_id (idle server in pool) or may be started on demand with a pre-assigned cluster_id — see Configuration and Open Questions.
+- **Obtain cluster identity at startup:** Learn `cluster_id` (and optionally `server_id`) from environment, orchestration, or by subscribing to `cluster_topology` where this process is the server (e.g. by host:port or server_id). Until ClusterManager creates a row in `cluster_topology` for this server, the ArcaneNode may have no cluster_id (idle server in pool) or may be started on demand with a pre-assigned cluster_id — see Configuration and Open Questions.
 - **Subscribe to SpacetimeDB:** For `cluster_assignments` and `entity_assignments` filtered by `cluster_id = my_cluster_id`; for `entity_state` filtered by `cluster_id = my_cluster_id` (own entities). Optionally subscribe to `cluster_topology` for my cluster_id to get `neighbor_ids` and endpoint info (or ReplicationChannelManager does this). Subscription callbacks update the in-memory list of "my players" and "my entities."
 - **Run simulation tick:** Each tick (e.g. 20 Hz), run **simulation** (physics, movement, **AI behaviors**) for all entities this server owns. Apply player input (from PLAYER_INPUT) to player entities; run AI for NPCs/monsters. Produce updated entity state. **Do not** run discrete game logic (e.g. "apply damage") in the tick — that is done via SpacetimeDB reducers when an event occurs (e.g. projectile hit).
 - **Write owned entity state to SpacetimeDB:** At a **throttled rate** (e.g. every 1–2 s per entity or on significant change), call `upsert_entity_state` for owned entities. Only write for entities still assigned to this cluster_id. High-frequency position updates are replicated via Redis, not written every tick.
-- **Publish state to replication:** After tick, send entity state deltas for owned entities (within observation-radius filtering) to the replication layer via IReplicationChannel. ReplicationChannelManager holds the set of IReplicationChannel instances (one per neighbor); ClusterServer (or a sub-component) calls `send(delta)` on each. Deltas include `seq` for gap detection.
+- **Publish state to replication:** After tick, send entity state deltas for owned entities (within observation-radius filtering) to the replication layer via IReplicationChannel. ReplicationChannelManager holds the set of IReplicationChannel instances (one per neighbor); ArcaneNode (or a sub-component) calls `send(delta)` on each. Deltas include `seq` for gap detection.
 - **Receive neighbor state from replication:** ReplicationChannelManager delivers incoming deltas from neighbors' topics. On receive: merge into local view of "neighbor entities." On gap (missing `seq`): trigger full sync from SpacetimeDB for affected state (see IF-03 § Gap detection and recovery).
 - **Accept client Cluster connections:** Listen on the Cluster WebSocket port (e.g. 8080 + n). Accept connections; associate each connection with a player_id (from first message, e.g. "I am player P" or from HANDOFF_CLAIM with handoff_token). Only accept players that are in `cluster_assignments` for this cluster_id (learned from SpacetimeDB).
 - **Send STATE_UPDATE to connected clients:** Each tick, send STATE_UPDATE (delta or full) over each client's WebSocket with the visible entity set (own entities + entities received from replication). Include `tick`, `seq`, `updated`, `removed_entity_ids`. Use delta by default; full sync on client request or after gap recovery.
@@ -39,24 +39,24 @@ ClusterServer is the process that clients connect to for a given cluster. It own
 
 ## 3. What It Does NOT Do
 
-- **Assign players or entities to clusters** — ClusterManager writes assignments; ClusterServer only reads.
-- **Decide merge/split or topology** — ClusterManager and IClusteringModel do that; ClusterServer reacts to subscription updates (drop entities no longer mine, ReplicationChannelManager opens/closes subscriptions from topology).
-- **Authenticate players** — Auth may be done at Manager connection or at first Cluster message; ClusterServer trusts that ClusterManager only assigned valid players to this cluster (or validates token if provided).
+- **Assign players or entities to clusters** — ClusterManager writes assignments; ArcaneNode only reads.
+- **Decide merge/split or topology** — ClusterManager and IClusteringModel do that; ArcaneNode reacts to subscription updates (drop entities no longer mine, ReplicationChannelManager opens/closes subscriptions from topology).
+- **Authenticate players** — Auth may be done at Manager connection or at first Cluster message; ArcaneNode trusts that ClusterManager only assigned valid players to this cluster (or validates token if provided).
 - **Guarantee replication delivery** — Replication is fire-and-forget; gap recovery is via SpacetimeDB full sync.
-- **Run ClusterManager or ReplicationChannelManager** — Those are separate processes or components; ClusterServer uses ReplicationChannelManager (and IReplicationChannel) for publish/subscribe.
+- **Run ClusterManager or ReplicationChannelManager** — Those are separate processes or components; ArcaneNode uses ReplicationChannelManager (and IReplicationChannel) for publish/subscribe.
 
 ---
 
 ## 4. Interface / Public API
 
-ClusterServer is a long-running process. It does not expose a public API to other services; it exposes:
+ArcaneNode is a long-running process. It does not expose a public API to other services; it exposes:
 - **Cluster WebSocket** (clients): accept connections, send STATE_UPDATE / HANDOFF_ACCEPTED / RPC_RESULT, receive PLAYER_INPUT / HANDOFF_CLAIM.
 - **Optional RPC TCP port** (IN-05 RPCHandler): for non-game server-to-server RPC only. Game logic uses SpacetimeDB reducers; RPC_RESULT to the client comes from reducer return.
 
 Internal interfaces it uses:
 - **SpacetimeDB client:** Subscribe to cluster_assignments, entity_assignments, entity_state (filtered by cluster_id); call reducers upsert_entity_state, delete_entity_state.
-- **ReplicationChannelManager:** Get IReplicationChannel instances for each neighbor; call send(delta) on each; receive callbacks or stream of deltas from subscriptions. ReplicationChannelManager subscribes to cluster_topology and opens/closes channels — ClusterServer only feeds data and consumes received data.
-- **IWorldSimulator (optional):** For unobserved or low-priority entities, call FastForward or equivalent (see IF-04). ClusterServer may delegate to a component that implements IWorldSimulator for entities not currently observed by any player.
+- **ReplicationChannelManager:** Get IReplicationChannel instances for each neighbor; call send(delta) on each; receive callbacks or stream of deltas from subscriptions. ReplicationChannelManager subscribes to cluster_topology and opens/closes channels — ArcaneNode only feeds data and consumes received data.
+- **IWorldSimulator (optional):** For unobserved or low-priority entities, call FastForward or equivalent (see IF-04). ArcaneNode may delegate to a component that implements IWorldSimulator for entities not currently observed by any player.
 
 ---
 
@@ -83,25 +83,25 @@ Internal interfaces it uses:
 | Dependency | What is used | If it changes |
 |------------|--------------|----------------|
 | SpacetimeDB | Subscriptions (assignments, entity_state), reducers (upsert_entity_state, delete_entity_state; game reducers for discrete events) | Schema and reducer names must match; gap recovery assumes we can read full state; RPC_RESULT comes from reducer return. |
-| ReplicationChannelManager (IN-06) | Neighbor list and IReplicationChannel instances; send(delta), receive deltas | ClusterServer must still produce and consume deltas with seq; IN-06 handles who to subscribe to. |
+| ReplicationChannelManager (IN-06) | Neighbor list and IReplicationChannel instances; send(delta), receive deltas | ArcaneNode must still produce and consume deltas with seq; IN-06 handles who to subscribe to. |
 | IReplicationChannel (IF-03) | send(EntityStateDelta), receive path (callback or stream) | Delta shape and seq semantics must match; gap recovery behavior is specified in IF-03. |
-| RPCHandler (IN-05) | Optional. TCP endpoint for non-game RPC only | If used, ClusterServer hosts it; game logic does not flow through it. |
-| IWorldSimulator (IF-04) | Optional: FastForward for unobserved entities | If used, ClusterServer or a sub-component calls it; IF-04 defines the contract. |
+| RPCHandler (IN-05) | Optional. TCP endpoint for non-game RPC only | If used, ArcaneNode hosts it; game logic does not flow through it. |
+| IWorldSimulator (IF-04) | Optional: FastForward for unobserved entities | If used, ArcaneNode or a sub-component calls it; IF-04 defines the contract. |
 
 ---
 
 ## 8. Message Protocol
 
-### 8.1 Cluster WebSocket (ClusterServer ↔ client)
+### 8.1 Cluster WebSocket (ArcaneNode ↔ client)
 
-**Client → ClusterServer:**
+**Client → ArcaneNode:**
 
 | Message | Format | When |
 |---------|--------|------|
 | PLAYER_INPUT | `{ type, player_id, position, velocity, action, action_data?, timestamp, sequence_num, last_state_seq }` | Every tick (e.g. 20 Hz). |
 | HANDOFF_CLAIM | `{ type, handoff_token, player_id }` | On reconnect after CLUSTER_REASSIGN (merge/split). |
 
-**ClusterServer → Client:**
+**ArcaneNode → Client:**
 
 | Message | Format | When |
 |---------|--------|------|
@@ -122,8 +122,8 @@ On first join, the client connects without sending HANDOFF_CLAIM. The server mus
 
 | Key | Default | Description |
 |-----|---------|--------------|
-| CLUSTER_SERVER_HOST | 0.0.0.0 | Bind address for Cluster WebSocket. |
-| CLUSTER_SERVER_PORT | 8080 | Base port; may be 8080 + n when multiple servers on same host. |
+| NODE_HOST | 0.0.0.0 | Bind address for Cluster WebSocket. |
+| NODE_PORT | 8080 | Base port; may be 8080 + n when multiple servers on same host. |
 | CLUSTER_ID | — | This server's cluster_id (if set at startup). Else learned from cluster_topology (e.g. by SERVER_ID). |
 | SERVER_ID | — | Opaque server id from pool; used to find cluster_id in cluster_topology. |
 | TICK_RATE_HZ | 20 | Simulation and STATE_UPDATE rate. |
@@ -137,16 +137,16 @@ On first join, the client connects without sending HANDOFF_CLAIM. The server mus
 
 | Metric | Type | Labels | Measures |
 |--------|------|--------|----------|
-| arcane_cluster_server_tick_duration_ms | histogram | | Time per simulation tick. |
-| arcane_cluster_server_tick_rate_hz | gauge | | Actual tick rate (1 / tick_interval). |
-| arcane_cluster_server_connected_clients | gauge | cluster_id= | Number of open Cluster WebSocket connections. |
-| arcane_cluster_server_owned_entity_count | gauge | cluster_id= | Number of entities assigned to this cluster (from subscription). |
-| arcane_cluster_server_spacetime_writes_total | counter | cluster_id= | upsert_entity_state / delete_entity_state calls. |
-| arcane_cluster_server_replication_sent_total | counter | cluster_id= | Deltas sent via IReplicationChannel.send(). |
-| arcane_cluster_server_replication_received_total | counter | cluster_id= | Deltas received from neighbors. |
-| arcane_cluster_server_replication_gap_recoveries_total | counter | cluster_id= | Gap detected and full sync from SpacetimeDB performed. |
-| arcane_cluster_server_rpc_requests_total | counter | cluster_id= | Incoming RPCs (local + cross-cluster). |
-| arcane_cluster_server_rpc_latency_ms | histogram | cluster_id= | RPC handling latency. |
+| arcane_node_tick_duration_ms | histogram | | Time per simulation tick. |
+| arcane_node_tick_rate_hz | gauge | | Actual tick rate (1 / tick_interval). |
+| arcane_node_connected_clients | gauge | cluster_id= | Number of open Cluster WebSocket connections. |
+| arcane_node_owned_entity_count | gauge | cluster_id= | Number of entities assigned to this cluster (from subscription). |
+| arcane_node_spacetime_writes_total | counter | cluster_id= | upsert_entity_state / delete_entity_state calls. |
+| arcane_node_replication_sent_total | counter | cluster_id= | Deltas sent via IReplicationChannel.send(). |
+| arcane_node_replication_received_total | counter | cluster_id= | Deltas received from neighbors. |
+| arcane_node_replication_gap_recoveries_total | counter | cluster_id= | Gap detected and full sync from SpacetimeDB performed. |
+| arcane_node_rpc_requests_total | counter | cluster_id= | Incoming RPCs (local + cross-cluster). |
+| arcane_node_rpc_latency_ms | histogram | cluster_id= | RPC handling latency. |
 
 ---
 
@@ -165,10 +165,10 @@ On first join, the client connects without sending HANDOFF_CLAIM. The server mus
 
 ## 12. Open Questions
 
-- **Cluster identity at startup:** When ClusterServer starts (e.g. from pool), does it get cluster_id from env (ClusterManager passes it when allocating) or does it subscribe to cluster_topology and wait for a row where server_id = me? For pool of pre-started servers, likely server_id is known and cluster_id is created when ClusterManager first assigns players to this server (then topology row appears). Idle server may have no cluster_id until first assignment.
-- **First-connect client message:** Exact format and semantics of the first message from client to ClusterServer on first join (no handoff) — player_id, auth_token, or both — to be defined in wire protocol doc.
-- **Handoff token validation:** Where are handoff tokens issued (ClusterManager) and how does ClusterServer validate them (shared secret, SpacetimeDB table, or trust Manager)? TBD.
+- **Cluster identity at startup:** When ArcaneNode starts (e.g. from pool), does it get cluster_id from env (ClusterManager passes it when allocating) or does it subscribe to cluster_topology and wait for a row where server_id = me? For pool of pre-started servers, likely server_id is known and cluster_id is created when ClusterManager first assigns players to this server (then topology row appears). Idle server may have no cluster_id until first assignment.
+- **First-connect client message:** Exact format and semantics of the first message from client to ArcaneNode on first join (no handoff) — player_id, auth_token, or both — to be defined in wire protocol doc.
+- **Handoff token validation:** Where are handoff tokens issued (ClusterManager) and how does ArcaneNode validate them (shared secret, SpacetimeDB table, or trust Manager)? TBD.
 
 ---
 
-*Arcane Engine — IN-02 ClusterServer — Confidential*
+*Arcane Engine — IN-02 ArcaneNode — Confidential*

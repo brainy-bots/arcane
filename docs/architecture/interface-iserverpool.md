@@ -1,5 +1,5 @@
 # IF-02 — IServerPool
-**Cluster Server Allocation and Release Interface**
+**Arcane Node Allocation and Release Interface**
 
 ---
 
@@ -8,26 +8,26 @@
 | **Component ID** | IF-02 |
 | **Layer** | Infrastructure Interface |
 | **Type** | Interface — no implementation, only contract |
-| **Purpose** | Define the contract for allocating and releasing cluster server processes. Decouples the ClusterManager from the mechanism by which servers are provisioned so the local pre-provisioned pool (development) and the ECS Fargate pool (production) are interchangeable. |
-| **Implementations** | IN-07 ClusterServerPool (local dev) · ECSServerPool (production, future) |
+| **Purpose** | Define the contract for allocating and releasing Arcane Node processes. Decouples the ClusterManager from the mechanism by which servers are provisioned so the local pre-provisioned pool (development) and the ECS Fargate pool (production) are interchangeable. |
+| **Implementations** | IN-07 ArcaneNodePool (local dev) · ECSServerPool (production, future) |
 | **Language** | Rust |
 | **Depends On** | None |
-| **Required By** | IN-01 ClusterManager · IN-07 ClusterServerPool |
+| **Required By** | IN-01 ClusterManager · IN-07 ArcaneNodePool |
 
 ---
 
 ## 1. Overview
 
-IServerPool abstracts the question of where cluster servers come from. The ClusterManager needs to allocate a server when a new cluster is created and release it when a cluster is destroyed. It does not need to know whether that server is a pre-spawned local process, a Docker container on the same host, or an ECS Fargate task spinning up in AWS. IServerPool is that abstraction.
+IServerPool abstracts the question of where Arcane Nodes come from. The ClusterManager needs to allocate a server when a new cluster is created and release it when a cluster is destroyed. It does not need to know whether that server is a pre-spawned local process, a Docker container on the same host, or an ECS Fargate task spinning up in AWS. IServerPool is that abstraction.
 
-The interface is deliberately simple — three methods covering the full lifecycle of a cluster server from the ClusterManager's perspective. The complexity of container orchestration, health checking, and capacity management lives inside the implementation, invisible to the caller.
+The interface is deliberately simple — three methods covering the full lifecycle of a Arcane Node from the ClusterManager's perspective. The complexity of container orchestration, health checking, and capacity management lives inside the implementation, invisible to the caller.
 
 ---
 
 ## 2. Responsibilities
 
-- Provide cluster server instances on demand within the latency contract
-- Accept cluster server releases and return them to available capacity
+- Provide Arcane Node instances on demand within the latency contract
+- Accept Arcane Node releases and return them to available capacity
 - Report current pool capacity and health
 - Handle server failure — mark a server unavailable and provide a replacement
 - Maintain enough pre-warmed capacity to meet allocation latency requirements
@@ -36,11 +36,11 @@ The interface is deliberately simple — three methods covering the full lifecyc
 
 ## 3. What It Does NOT Do
 
-- Run the simulation on the cluster server — that is ClusterServer's job
+- Run the simulation on the Arcane Node — that is ArcaneNode's job
 - Make clustering decisions — that is IClusteringModel's job
 - Route player connections — that is ClusterManager's job
-- Monitor game-level health of a cluster server — only infrastructure health (reachable, responsive)
-- Persist any game state — cluster servers are stateless infrastructure
+- Monitor game-level health of a Arcane Node — only infrastructure health (reachable, responsive)
+- Persist any game state — Arcane Nodes are stateless infrastructure
 
 ---
 
@@ -52,7 +52,7 @@ The interface is deliberately simple — three methods covering the full lifecyc
 allocate() -> Result<ServerHandle, PoolError>
 ```
 
-**Returns:** A `ServerHandle` for an available cluster server, or a `PoolError` if none are available within the latency contract.
+**Returns:** A `ServerHandle` for an available Arcane Node, or a `PoolError` if none are available within the latency contract.
 
 **Latency contract:** Must return within 100ms for LocalPool. ECSPool may take up to 30 seconds for cold allocation — ClusterManager must handle async allocation for ECSPool.
 
@@ -92,7 +92,7 @@ Marks the server as available for future allocations. The ClusterManager calls t
 report_failure(server_id: UUID, failure_type: FailureType) -> ReplacementHandle
 ```
 
-Called by ClusterManager when a cluster server becomes unreachable or returns error responses. The pool immediately marks the server as failed, removes it from the available pool permanently, and returns a replacement server handle synchronously if one is available.
+Called by ClusterManager when a Arcane Node becomes unreachable or returns error responses. The pool immediately marks the server as failed, removes it from the available pool permanently, and returns a replacement server handle synchronously if one is available.
 
 ```
 FailureType {
@@ -132,14 +132,14 @@ PoolStatus {
 
 ## 5. Internal Structure
 
-### LocalPool (IN-07 ClusterServerPool)
+### LocalPool (IN-07 ArcaneNodePool)
 
-Pre-spawns N cluster server processes at startup. Maintains two lists: `available` and `allocated`. Allocation pops from `available`. Release pushes to `available` after a health ping confirms the server is ready. No dynamic process spawning — if the available list is empty, allocation fails immediately.
+Pre-spawns N Arcane Node processes at startup. Maintains two lists: `available` and `allocated`. Allocation pops from `available`. Release pushes to `available` after a health ping confirms the server is ready. No dynamic process spawning — if the available list is empty, allocation fails immediately.
 
 ```
 startup:
   for i in range(POOL_SIZE):
-    proc = spawn_cluster_server_process(port=BASE_PORT + i)
+    proc = spawn_arcane_node_process(port=BASE_PORT + i)
     wait_for_ready(proc, timeout=10s)
     available.append(ServerHandle(proc))
 
@@ -222,7 +222,7 @@ None at interface level. LocalPool implementation spawns Rust processes or uses 
 
 ## 11. Open Questions
 
-- **Local pool sizing for benchmark:** The demo benchmark needs enough cluster servers for 5000 simulated players at MAX_PLAYERS=20, which is 250 servers minimum. The local machine may not support 250 concurrent processes. Docker resource limits and per-process memory footprint need to be measured before the benchmark pool size is set.
+- **Local pool sizing for benchmark:** The demo benchmark needs enough Arcane Nodes for 5000 simulated players at MAX_PLAYERS=20, which is 250 servers minimum. The local machine may not support 250 concurrent processes. Docker resource limits and per-process memory footprint need to be measured before the benchmark pool size is set.
 - **ECSPool warm pool cost:** Maintaining 50 warm ECS Fargate tasks continuously is a real cost. The right warm pool size balances allocation latency against idle cost. Needs cost modeling once the per-task resource requirements are known from benchmark results.
 
 ---

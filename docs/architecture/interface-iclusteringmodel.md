@@ -19,7 +19,7 @@
 
 ## 1. Overview
 
-IClusteringModel is the pluggable brain of the clustering system. It receives a view of the current world state and returns a list of merge and split decisions to execute. It knows nothing about how those decisions are executed. It does not communicate with cluster servers, modify any state, or perform any I/O. It is a pure function from world state to decisions.
+IClusteringModel is the pluggable brain of the clustering system. It receives a view of the current world state and returns a list of merge and split decisions to execute. It knows nothing about how those decisions are executed. It does not communicate with Arcane Nodes, modify any state, or perform any I/O. It is a pure function from world state to decisions.
 
 This separation exists because the decision logic will change significantly over the system's lifetime. The MVP ships with a static rules engine — fast to implement, easy to reason about, sufficient to demonstrate the architecture. The production system replaces it with an ML model trained on player interaction signals, capable of predicting future interactions and pre-empting cluster boundaries before load concentrates. Both implement this interface. The ClusterManager calls the same methods either way.
 
@@ -51,7 +51,7 @@ The clustering model does not receive an ad-hoc snapshot assembled on demand. In
 ## 3. What It Does NOT Do
 
 - Execute merge or split operations — that is the ClusterManager's job
-- Communicate with cluster servers — no network access
+- Communicate with Arcane Nodes — no network access
 - Modify player or cluster state — read-only access to the view
 - Persist any data between calls — stateless by contract
 - Make routing decisions for individual messages — only clustering topology decisions
@@ -226,18 +226,18 @@ After a Tier 3 encounter ends, one or both entities may have left the area. The 
 
 ### Merge Handoff — No Server-Side Commit
 
-All world state lives in SpacetimeDB. There is nothing to "commit" or "merge" between cluster servers — no state transfer. Each entity has a single owning cluster; only that cluster's server writes that entity's state. All others read. Merge is a reassignment of ownership only.
+All world state lives in SpacetimeDB. There is nothing to "commit" or "merge" between Arcane Nodes — no state transfer. Each entity has a single owning cluster; only that cluster's server writes that entity's state. All others read. Merge is a reassignment of ownership only.
 
 **Handoff sequence:**
 
 1. **ClusterManager** updates SpacetimeDB: player-to-cluster assignments (and cluster topology) so that the destination cluster now owns the migrating players.
-2. **ClusterManager** notifies the **source** ClusterServer to drop those players. The source server stops simulating them at the **end of its current tick** so it never writes them again — clean handover of write ownership.
+2. **ClusterManager** notifies the **source** ArcaneNode to drop those players. The source server stops simulating them at the **end of its current tick** so it never writes them again — clean handover of write ownership.
 3. **ClusterManager** sends `CLUSTER_REASSIGN` to affected clients. Clients connect to the destination server.
-4. The **destination** ClusterServer reads current state for those players (and any entities it now owns) from SpacetimeDB — via its existing subscription or on demand — and continues simulating. No coordination with the source server's tick is required.
+4. The **destination** ArcaneNode reads current state for those players (and any entities it now owns) from SpacetimeDB — via its existing subscription or on demand — and continues simulating. No coordination with the source server's tick is required.
 
 The only coordination is: the source server must stop writing the migrated entities before the destination (and clients) treat them as belonging to the destination. Using "end of current tick" on the source gives a well-defined handover point and avoids mid-tick partial writes. Maximum additional delay for handoff is one tick (50ms at 20Hz) on the source server.
 
-The slow-tick concern — a ClusterServer under load slowing its ticks and making that one-tick wait costly — is a non-issue by design. The split logic fires before any ClusterServer accumulates enough load to slow its ticks. An overloaded ClusterServer is a bug in the clustering model, not an expected operating condition.
+The slow-tick concern — a ArcaneNode under load slowing its ticks and making that one-tick wait costly — is a non-issue by design. The split logic fires before any ArcaneNode accumulates enough load to slow its ticks. An overloaded ArcaneNode is a bug in the clustering model, not an expected operating condition.
 
 ---
 

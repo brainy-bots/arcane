@@ -12,7 +12,7 @@ Multiplayer backend library: cluster management, replication, and reference serv
 | **arcane-spatial** | SpatialIndex — 2D grid for neighbor discovery. |
 | **arcane-rules** | RulesEngine — clustering decisions. |
 | **arcane-pool** | LocalPool — server pool implementation. |
-| **arcane-infra** | ClusterManager, ClusterServer, replication; binaries `arcane-cluster` and `arcane-manager`. |
+| **arcane-infra** | ClusterManager, ArcaneNode, replication; binaries `arcane-cluster` and `arcane-manager`. |
 
 ## Build and test
 
@@ -23,7 +23,7 @@ cargo test
 
 ## Architecture
 
-See [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md) for Mermaid diagrams of the full system: component responsibilities and how data moves between clients, ClusterManager, ClusterServers, Redis, and SpacetimeDB.
+See [docs/SYSTEM_ARCHITECTURE.md](docs/SYSTEM_ARCHITECTURE.md) for Mermaid diagrams of the full system: component responsibilities and how data moves between clients, ClusterManager, Arcane Nodes, Redis, and SpacetimeDB.
 See [docs/MODULE_INTERACTIONS.md](docs/MODULE_INTERACTIONS.md) for crate/module-level responsibilities and interaction boundaries inside the Rust workspace.
 See [docs/WS_CHANNEL_BACKPRESSURE_VALIDATION.md](docs/WS_CHANNEL_BACKPRESSURE_VALIDATION.md) for WS/channel backpressure behavior and validation notes.
 

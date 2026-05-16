@@ -30,7 +30,7 @@ flowchart LR
 
   subgraph Infra["arcane-infra"]
     Manager["cluster_manager"]
-    Server["cluster_server"]
+    Server["node"]
     Runner["cluster_runner"]
     Ws["ws_server"]
     ReplMgr["replication_channel_manager"]
@@ -63,6 +63,6 @@ flowchart LR
 
 ## Runtime interaction highlights
 
-- `cluster_runner` is the integration point: it wires simulation (`cluster_server`), inbound neighbor replication (`neighbor_subscriber`), outbound client transport (`ws_server`), and optional persistence (`spacetimedb_persist`).
+- `cluster_runner` is the integration point: it wires simulation (`node`), inbound neighbor replication (`neighbor_subscriber`), outbound client transport (`ws_server`), and optional persistence (`spacetimedb_persist`).
 - `cluster_manager` is control-plane focused and depends on abstractions (`IClusteringModel`, `IServerPool`) implemented by `arcane-rules` and `arcane-pool`.
 - `arcane-core` remains dependency-root only (no transport, I/O, or process orchestration code).

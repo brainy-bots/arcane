@@ -8,7 +8,7 @@
 | **Component ID** | IN-03 |
 | **Layer** | Infrastructure |
 | **Type** | Component (library or module) |
-| **Purpose** | Maintain a 2D coarse spatial index over cluster entities (positions + cluster ownership). Expose queries for cluster centroid, spread radius, and which clusters are neighbors (effective area overlap). Feeds ClusterManager’s neighbor list and WorldStateView for the clustering model. Data that populates the index originates from SpacetimeDB (entity_state, entity_assignments) written by ClusterServers; the index is updated by the component that holds the live view (ClusterManager). |
+| **Purpose** | Maintain a 2D coarse spatial index over cluster entities (positions + cluster ownership). Expose queries for cluster centroid, spread radius, and which clusters are neighbors (effective area overlap). Feeds ClusterManager’s neighbor list and WorldStateView for the clustering model. Data that populates the index originates from SpacetimeDB (entity_state, entity_assignments) written by Arcane Nodes; the index is updated by the component that holds the live view (ClusterManager). |
 | **Document version** | 1.0 |
 
 ---
@@ -17,7 +17,7 @@
 
 SpatialIndex is a data structure and query API used to answer: (1) Where is each cluster in the world (centroid, spread)? (2) Which clusters are “neighbors” (close enough that they might need to replicate state or be merge candidates)? Neighbor definition uses the same formula as replication filtering: **centroid + spread_radius + observation_radius** (see IF-03). The index is coarse (e.g. grid cells or spatial hash buckets) to keep updates and queries cheap; it does not store full entity state, only what is needed for proximity and neighbor discovery.
 
-The index is **updated** by the process that has the live world view — in this architecture, ClusterManager, which subscribes to SpacetimeDB (entity_state, entity_assignments) and receives position updates. The **underlying position data** is written by ClusterServers (they call upsert_entity_state). So “updated by cluster servers” means the data source is cluster servers via SpacetimeDB; the SpatialIndex component itself is updated by ClusterManager when subscription callbacks fire.
+The index is **updated** by the process that has the live world view — in this architecture, ClusterManager, which subscribes to SpacetimeDB (entity_state, entity_assignments) and receives position updates. The **underlying position data** is written by Arcane Nodes (they call upsert_entity_state). So “updated by cluster servers” means the data source is cluster servers via SpacetimeDB; the SpatialIndex component itself is updated by ClusterManager when subscription callbacks fire.
 
 SpatialIndex has no external dependencies (no SpacetimeDB, no Redis). It is a pure in-memory structure. ClusterManager (or another single consumer) owns one instance and feeds it; no other process updates it.
 
@@ -38,7 +38,7 @@ SpatialIndex has no external dependencies (no SpacetimeDB, no Redis). It is a pu
 - **Fetch data from SpacetimeDB or any network** — It does not subscribe or connect. The caller (ClusterManager) feeds it.
 - **Decide merge/split** — It only answers spatial queries. IClusteringModel and ClusterManager make decisions.
 - **Manage replication subscriptions** — ReplicationChannelManager uses neighbor lists (from topology); the index only produces those lists.
-- **Store full entity state** — Only position (and cluster_id) per entity for index purposes; centroid and spread are derived. Full state lives in SpacetimeDB and in ClusterServer memory.
+- **Store full entity state** — Only position (and cluster_id) per entity for index purposes; centroid and spread are derived. Full state lives in SpacetimeDB and in ArcaneNode memory.
 
 ---
 

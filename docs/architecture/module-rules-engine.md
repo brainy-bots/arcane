@@ -16,7 +16,7 @@
 
 ## 1. Overview
 
-RulesEngine is the **static rules implementation** of `IClusteringModel` (see `if_01_iclusteringmodel.md`). It runs in-process with `ClusterManager`. On each evaluation tick, ClusterManager builds a `WorldStateView` from its live SpacetimeDB subscriptions and passes it to `RulesEngine.evaluate(view)`. The RulesEngine applies a set of **hand-written rules** (player count, CPU load, spatial proximity, interaction rate, social graph, game-layer signals) and returns an ordered list of `ClusterDecision`s (merge or split). It never writes to SpacetimeDB, never talks to ClusterServers, and keeps no state between calls; it is a pure, deterministic function from `WorldStateView` to decisions. A future ML model will implement the same interface; ClusterManager does not change when that swap happens.
+RulesEngine is the **static rules implementation** of `IClusteringModel` (see `if_01_iclusteringmodel.md`). It runs in-process with `ClusterManager`. On each evaluation tick, ClusterManager builds a `WorldStateView` from its live SpacetimeDB subscriptions and passes it to `RulesEngine.evaluate(view)`. The RulesEngine applies a set of **hand-written rules** (player count, CPU load, spatial proximity, interaction rate, social graph, game-layer signals) and returns an ordered list of `ClusterDecision`s (merge or split). It never writes to SpacetimeDB, never talks to Arcane Nodes, and keeps no state between calls; it is a pure, deterministic function from `WorldStateView` to decisions. A future ML model will implement the same interface; ClusterManager does not change when that swap happens.
 
 ---
 
@@ -166,7 +166,7 @@ All static-rule decisions set `confidence = 1.0` to signal “rules are certain;
 | SpatialIndex (IN-03) | Indirectly, via fields like `centroid`, `spread_radius`, and cluster topology computed by ClusterManager | If ClusterManager stops populating geometry in `WorldStateView`, spatial rules must be adjusted or disabled. |
 | ClusterManager (IN-01) | Calls `evaluate()` on a cadence; applies guardrails; executes decisions | If guardrail behavior changes, decision priorities or confidence usage may need tuning. |
 
-RulesEngine itself has **no runtime dependencies on SpacetimeDB, Redis, or ClusterServers**; it only depends on the shapes of the view and decision types.
+RulesEngine itself has **no runtime dependencies on SpacetimeDB, Redis, or Arcane Nodes**; it only depends on the shapes of the view and decision types.
 
 ---
 
