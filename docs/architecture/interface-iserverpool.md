@@ -8,19 +8,19 @@
 | **Component ID** | IF-02 |
 | **Layer** | Infrastructure Interface |
 | **Type** | Interface — no implementation, only contract |
-| **Purpose** | Define the contract for allocating and releasing Arcane Node processes. Decouples the ClusterManager from the mechanism by which servers are provisioned so the local pre-provisioned pool (development) and the ECS Fargate pool (production) are interchangeable. |
+| **Purpose** | Define the contract for allocating and releasing Arcane Node processes. Decouples the ArcaneManager from the mechanism by which servers are provisioned so the local pre-provisioned pool (development) and the ECS Fargate pool (production) are interchangeable. |
 | **Implementations** | IN-07 ArcaneNodePool (local dev) · ECSServerPool (production, future) |
 | **Language** | Rust |
 | **Depends On** | None |
-| **Required By** | IN-01 ClusterManager · IN-07 ArcaneNodePool |
+| **Required By** | IN-01 ArcaneManager · IN-07 ArcaneNodePool |
 
 ---
 
 ## 1. Overview
 
-IServerPool abstracts the question of where Arcane Nodes come from. The ClusterManager needs to allocate a server when a new cluster is created and release it when a cluster is destroyed. It does not need to know whether that server is a pre-spawned local process, a Docker container on the same host, or an ECS Fargate task spinning up in AWS. IServerPool is that abstraction.
+IServerPool abstracts the question of where Arcane Nodes come from. The ArcaneManager needs to allocate a server when a new cluster is created and release it when a cluster is destroyed. It does not need to know whether that server is a pre-spawned local process, a Docker container on the same host, or an ECS Fargate task spinning up in AWS. IServerPool is that abstraction.
 
-The interface is deliberately simple — three methods covering the full lifecycle of a Arcane Node from the ClusterManager's perspective. The complexity of container orchestration, health checking, and capacity management lives inside the implementation, invisible to the caller.
+The interface is deliberately simple — three methods covering the full lifecycle of a Arcane Node from the ArcaneManager's perspective. The complexity of container orchestration, health checking, and capacity management lives inside the implementation, invisible to the caller.
 
 ---
 
@@ -38,7 +38,7 @@ The interface is deliberately simple — three methods covering the full lifecyc
 
 - Run the simulation on the Arcane Node — that is ArcaneNode's job
 - Make clustering decisions — that is IClusteringModel's job
-- Route player connections — that is ClusterManager's job
+- Route player connections — that is ArcaneManager's job
 - Monitor game-level health of a Arcane Node — only infrastructure health (reachable, responsive)
 - Persist any game state — Arcane Nodes are stateless infrastructure
 
@@ -54,7 +54,7 @@ allocate() -> Result<ServerHandle, PoolError>
 
 **Returns:** A `ServerHandle` for an available Arcane Node, or a `PoolError` if none are available within the latency contract.
 
-**Latency contract:** Must return within 100ms for LocalPool. ECSPool may take up to 30 seconds for cold allocation — ClusterManager must handle async allocation for ECSPool.
+**Latency contract:** Must return within 100ms for LocalPool. ECSPool may take up to 30 seconds for cold allocation — ArcaneManager must handle async allocation for ECSPool.
 
 ```
 ServerHandle {
@@ -80,7 +80,7 @@ PoolError {
 release(server_id: UUID) -> Result<void, PoolError>
 ```
 
-Marks the server as available for future allocations. The ClusterManager calls this after a cluster is destroyed and all players have been migrated away. The pool implementation is responsible for resetting any server-side state before making the server available again.
+Marks the server as available for future allocations. The ArcaneManager calls this after a cluster is destroyed and all players have been migrated away. The pool implementation is responsible for resetting any server-side state before making the server available again.
 
 **Post-condition:** Within 5 seconds of release(), the server must be ready to accept a new `allocate()` call. If the server cannot be reset within 5 seconds, it must be removed from the pool and a fresh server used instead.
 
@@ -92,7 +92,7 @@ Marks the server as available for future allocations. The ClusterManager calls t
 report_failure(server_id: UUID, failure_type: FailureType) -> ReplacementHandle
 ```
 
-Called by ClusterManager when a Arcane Node becomes unreachable or returns error responses. The pool immediately marks the server as failed, removes it from the available pool permanently, and returns a replacement server handle synchronously if one is available.
+Called by ArcaneManager when a Arcane Node becomes unreachable or returns error responses. The pool immediately marks the server as failed, removes it from the available pool permanently, and returns a replacement server handle synchronously if one is available.
 
 ```
 FailureType {
@@ -115,7 +115,7 @@ ReplacementHandle {
 get_status() -> PoolStatus
 ```
 
-Returns current pool capacity for monitoring and ClusterManager planning.
+Returns current pool capacity for monitoring and ArcaneManager planning.
 
 ```
 PoolStatus {
@@ -159,7 +159,7 @@ release(server_id):
 
 ### ECSPool (production, future)
 
-Maintains a warm pool of ECS Fargate tasks. Allocation claims a warm task and registers it with the ClusterManager. A background process continuously monitors the warm pool size and spawns new tasks when it drops below the minimum threshold. Cold allocation (no warm tasks available) returns a handle with an ETA and triggers async task creation.
+Maintains a warm pool of ECS Fargate tasks. Allocation claims a warm task and registers it with the ArcaneManager. A background process continuously monitors the warm pool size and spawns new tasks when it drops below the minimum threshold. Cold allocation (no warm tasks available) returns a handle with an ETA and triggers async task creation.
 
 ---
 
@@ -212,10 +212,10 @@ None at interface level. LocalPool implementation spawns Rust processes or uses 
 
 | Failure | Detection | Response |
 |---|---|---|
-| Pool exhausted | `available` list empty on allocate() | Return POOL_EXHAUSTED error. ClusterManager blocks new cluster creation. Log warning. |
+| Pool exhausted | `available` list empty on allocate() | Return POOL_EXHAUSTED error. ArcaneManager blocks new cluster creation. Log warning. |
 | Server fails health check during idle | Periodic ping fails | Remove from available pool. Mark failed. Spawn replacement (LocalPool: skip, ECSPool: trigger). |
-| Server crashes during allocation | report_failure() called by ClusterManager | Mark failed permanently. Return ReplacementHandle with next available. |
-| All servers fail simultaneously | Pool exhausted after mass failure | ClusterManager enters degraded mode — no new clusters, existing clusters continue. Alert fires. |
+| Server crashes during allocation | report_failure() called by ArcaneManager | Mark failed permanently. Return ReplacementHandle with next available. |
+| All servers fail simultaneously | Pool exhausted after mass failure | ArcaneManager enters degraded mode — no new clusters, existing clusters continue. Alert fires. |
 | Release fails (server unresponsive) | reset_server() timeout | Mark server failed. Do not return to pool. Spawn replacement. Log incident. |
 
 ---

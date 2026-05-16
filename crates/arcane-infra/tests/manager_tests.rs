@@ -1,7 +1,7 @@
-//! Tests for ClusterManager (IN-01). Define expected behavior; implementation must satisfy these.
+//! Tests for ArcaneManager (IN-01). Define expected behavior; implementation must satisfy these.
 
 use arcane_core::Vec3;
-use arcane_infra::ClusterManager;
+use arcane_infra::ArcaneManager;
 use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
@@ -10,19 +10,19 @@ fn uuid(i: u8) -> Uuid {
 
 #[test]
 fn with_defaults_creates_manager() {
-    let _manager = ClusterManager::with_defaults();
+    let _manager = ArcaneManager::with_defaults();
 }
 
 #[test]
 fn active_cluster_count_initially_zero() {
-    let manager = ClusterManager::with_defaults();
+    let manager = ArcaneManager::with_defaults();
     let count = manager.active_cluster_count();
     assert_eq!(count, 0, "no clusters before run or any assignment");
 }
 
 #[test]
 fn get_neighbors_for_cluster_returns_neighbors_from_spatial_index() {
-    let mut manager = ClusterManager::with_defaults();
+    let mut manager = ArcaneManager::with_defaults();
     manager.set_observation_radius(100.0);
     // Cluster A: entities at (0,0,0) and (100,0,0) -> centroid ~(50,0,0), spread ~50
     manager.update_entity(uuid(10), uuid(1), Vec3::new(0.0, 0.0, 0.0));

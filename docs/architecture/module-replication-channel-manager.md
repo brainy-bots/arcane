@@ -8,21 +8,21 @@
 | **Component ID** | IN-06 |
 | **Layer** | Infrastructure |
 | **Type** | Component |
-| **Purpose** | Runs on each ArcaneNode. Subscribes to SpacetimeDB cluster_topology to get this cluster’s neighbor list; opens and closes IReplicationChannel instances (one per neighbor). Delivers outbound deltas from ArcaneNode to each channel and inbound deltas from channels to ArcaneNode. Does not decide who is a neighbor — topology comes from ClusterManager via SpacetimeDB. |
+| **Purpose** | Runs on each ArcaneNode. Subscribes to SpacetimeDB cluster_topology to get this cluster’s neighbor list; opens and closes IReplicationChannel instances (one per neighbor). Delivers outbound deltas from ArcaneNode to each channel and inbound deltas from channels to ArcaneNode. Does not decide who is a neighbor — topology comes from ArcaneManager via SpacetimeDB. |
 | **Document version** | 1.0 |
 
 ---
 
 ## 1. Overview
 
-ReplicationChannelManager is the component that keeps replication subscriptions in sync with cluster topology. It does not run as a separate process; it runs inside each ArcaneNode process. It reads the neighbor list (and optionally per-neighbor centroid/spread for observation-radius filtering) from SpacetimeDB `cluster_topology`; when the topology changes (merge, split, or ClusterManager refresh), it opens new IReplicationChannel instances for new neighbors and closes channels for neighbors that are no longer in the list. ArcaneNode calls ReplicationChannelManager to send outbound deltas and receives inbound deltas via a callback or queue. See IF-03 for the IReplicationChannel contract and Redis pub/sub behavior; see `in_02_arcane_node.md` for how ArcaneNode uses replication.
+ReplicationChannelManager is the component that keeps replication subscriptions in sync with cluster topology. It does not run as a separate process; it runs inside each ArcaneNode process. It reads the neighbor list (and optionally per-neighbor centroid/spread for observation-radius filtering) from SpacetimeDB `cluster_topology`; when the topology changes (merge, split, or ArcaneManager refresh), it opens new IReplicationChannel instances for new neighbors and closes channels for neighbors that are no longer in the list. ArcaneNode calls ReplicationChannelManager to send outbound deltas and receives inbound deltas via a callback or queue. See IF-03 for the IReplicationChannel contract and Redis pub/sub behavior; see `in_02_arcane_node.md` for how ArcaneNode uses replication.
 
 ---
 
 ## 2. Responsibilities
 
-- **Subscribe to SpacetimeDB cluster_topology:** Subscribe to the row(s) that define this cluster’s identity and neighbors — e.g. the row where `cluster_id = my_cluster_id` (and optionally the rows for each neighbor to get endpoint info and centroid/spread). When ClusterManager updates `cluster_topology.neighbor_ids` (or neighbor rows), the subscription delivers the new state.
-- **Maintain the set of IReplicationChannel instances:** One channel per current neighbor. When the topology says “neighbors = [A, B, C]” and the previous set was [A, B], open a channel for C and close none. When the topology says “neighbors = [A]” (e.g. after a merge), close channels for B and C. When a cluster is dissolved (e.g. B merged into A), ClusterManager removes B from topology and all servers that had B as neighbor see the update and close the channel to B.
+- **Subscribe to SpacetimeDB cluster_topology:** Subscribe to the row(s) that define this cluster’s identity and neighbors — e.g. the row where `cluster_id = my_cluster_id` (and optionally the rows for each neighbor to get endpoint info and centroid/spread). When ArcaneManager updates `cluster_topology.neighbor_ids` (or neighbor rows), the subscription delivers the new state.
+- **Maintain the set of IReplicationChannel instances:** One channel per current neighbor. When the topology says “neighbors = [A, B, C]” and the previous set was [A, B], open a channel for C and close none. When the topology says “neighbors = [A]” (e.g. after a merge), close channels for B and C. When a cluster is dissolved (e.g. B merged into A), ArcaneManager removes B from topology and all servers that had B as neighbor see the update and close the channel to B.
 - **Open channels:** For each new neighbor, call `IReplicationChannel.open(source_cluster_id = my_cluster_id, destination = neighbor’s ServerHandle, config)`. The implementation (e.g. RedisPubSubReplication) subscribes to that neighbor’s topic; this cluster’s state is published to its own topic (neighbors subscribe to us). Store the channel and the neighbor’s cluster_id and endpoint (host/port for TCP, or topic name for Redis).
 - **Close channels:** When a neighbor is removed from the list or the cluster is shutting down, call `IReplicationChannel.close(reason)`. Reason can be NEIGHBOR_DEPARTED, CLUSTERS_MERGED, or SHUTDOWN. Flush and unsubscribe; do not leave orphan subscriptions.
 - **Provide destination geometry to channels:** For observation-radius filtering (IF-03), each channel needs the destination cluster’s centroid and spread_radius. ReplicationChannelManager obtains these from cluster_topology if stored (optional columns), or from a separate subscription/view, or from a default. Push updates to each channel when topology or geometry changes so the send path can filter entities correctly.
@@ -35,7 +35,7 @@ ReplicationChannelManager is the component that keeps replication subscriptions 
 
 ## 3. What It Does NOT Do
 
-- **Decide which clusters are neighbors** — ClusterManager (and IClusteringModel / SpatialIndex) decide; ClusterManager writes cluster_topology. ReplicationChannelManager only reads and applies.
+- **Decide which clusters are neighbors** — ArcaneManager (and IClusteringModel / SpatialIndex) decide; ArcaneManager writes cluster_topology. ReplicationChannelManager only reads and applies.
 - **Build entity state deltas** — ArcaneNode builds the delta from simulation state; ReplicationChannelManager only passes it to channels.
 - **Simulate or write to SpacetimeDB** — That is ArcaneNode. ReplicationChannelManager only manages replication transport.
 - **Authenticate or encrypt replication traffic** — Assumed private network (VPC). See IF-03.
@@ -84,7 +84,7 @@ Called by ReplicationChannelManager when an inbound delta is decoded from a subs
 set_neighbor_geometry(neighbor_cluster_id: ID, centroid: (x,y,z), spread_radius: float) -> void
 ```
 
-Update the geometry used for observation-radius filtering when sending to that neighbor. Called when topology subscription delivers new or updated neighbor data. If cluster_topology does not store centroid/spread, ClusterManager or another component must push this via another path (e.g. a table or reducer); otherwise use defaults (e.g. large radius) so we do not over-filter.
+Update the geometry used for observation-radius filtering when sending to that neighbor. Called when topology subscription delivers new or updated neighbor data. If cluster_topology does not store centroid/spread, ArcaneManager or another component must push this via another path (e.g. a table or reducer); otherwise use defaults (e.g. large radius) so we do not over-filter.
 
 ### 4.5 Status (optional)
 
@@ -122,7 +122,7 @@ For metrics and debugging. ChannelStatus can include source_cluster_id, dest_clu
 | IReplicationChannel (IF-03) | open(), close(), send(), subscription callback | ReplicationChannelManager creates and holds channels; IF-03 defines lifecycle and delta shape. |
 | ArcaneNode (IN-02) | Calls send_to_neighbors(delta); implements or registers on_receive(source_cluster_id, delta) | ArcaneNode must build delta with correct source_cluster_id and seq; handle gap detection on receive. |
 
-ReplicationChannelManager does not depend on ClusterManager directly; it only reads from SpacetimeDB, which ClusterManager writes.
+ReplicationChannelManager does not depend on ArcaneManager directly; it only reads from SpacetimeDB, which ArcaneManager writes.
 
 ---
 
@@ -175,8 +175,8 @@ Per-channel metrics (send rate, drops, latency) are defined in IF-03 and exposed
 ## 12. Open Questions
 
 - **Topic naming:** Exact Redis topic format (e.g. `arcane:replication:{cluster_id}`) to be defined in a wire/Redis doc. ReplicationChannelManager must use the same convention when opening channels (subscribe to neighbor’s topic; our topic is where we publish).
-- **Neighbor geometry source:** If cluster_topology does not store centroid/spread per cluster, how does ReplicationChannelManager get destination geometry for filtering? Options: ClusterManager writes it to topology; a separate table or view; or default to “send all” (no filter) until we add the columns.
-- **Ordering of close vs. ClusterManager release:** When ClusterManager merges B into A and releases B’s server, it should update topology first (remove B from all neighbor lists), so all ReplicationChannelManagers close the channel to B before ClusterManager calls IServerPool.release(B). So no ordering issue if topology is updated before release.
+- **Neighbor geometry source:** If cluster_topology does not store centroid/spread per cluster, how does ReplicationChannelManager get destination geometry for filtering? Options: ArcaneManager writes it to topology; a separate table or view; or default to “send all” (no filter) until we add the columns.
+- **Ordering of close vs. ArcaneManager release:** When ArcaneManager merges B into A and releases B’s server, it should update topology first (remove B from all neighbor lists), so all ReplicationChannelManagers close the channel to B before ArcaneManager calls IServerPool.release(B). So no ordering issue if topology is updated before release.
 
 ---
 

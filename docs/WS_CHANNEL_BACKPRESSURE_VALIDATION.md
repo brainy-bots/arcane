@@ -5,7 +5,7 @@ This note documents current backpressure behavior in `arcane-infra` and how it i
 ## Scope
 
 - `crates/arcane-infra/src/ws_server.rs`
-- Cluster loop handoff path: `cluster_runner` tick output -> mpsc sender -> ws broadcast channel -> client socket writes
+- Cluster loop handoff path: `node_runner` tick output -> mpsc sender -> ws broadcast channel -> client socket writes
 
 ## Current policy
 
@@ -24,7 +24,7 @@ This note documents current backpressure behavior in `arcane-infra` and how it i
 - Unit tests in `ws_server.rs` validate:
   - `PLAYER_STATE` parse success/failure behavior.
   - Backpressure error policy (`Lagged` continues, `Closed` stops).
-- Cluster merge/cadence seam tests in `cluster_runner.rs` and `spacetimedb_persist.rs` validate:
+- Cluster merge/cadence seam tests in `node_runner.rs` and `spacetimedb_persist.rs` validate:
   - merged-delta composition from local + neighbor snapshots.
   - persistence cadence gate logic (`tick % interval == 0` and non-empty updates).
 

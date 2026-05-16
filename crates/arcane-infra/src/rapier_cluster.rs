@@ -2,7 +2,7 @@
 //!
 //! [`RapierClusterSim`] wraps a user's [`ClusterSimulation`] and inserts a Rapier
 //! [`PhysicsPipeline::step`] after the user's `on_tick`. Drop into the existing
-//! [`crate::cluster_runner::run_cluster_loop`] in place of a bare user simulation —
+//! [`crate::node_runner::run_cluster_loop`] in place of a bare user simulation —
 //! all networking, replication, neighbor merge, and persistence are unchanged.
 //!
 //! # Contract

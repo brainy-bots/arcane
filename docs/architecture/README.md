@@ -29,7 +29,7 @@ This folder contains interface and module responsibility specs for the `arcane` 
 
 ## Modules
 
-- `module-cluster-manager.md`
+- `module-arcane-manager.md`
 - `module-arcane-node.md`
 - `module-spatial-index.md`
 - `module-rules-engine.md`

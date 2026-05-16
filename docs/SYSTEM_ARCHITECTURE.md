@@ -1,6 +1,6 @@
 # Arcane system architecture
 
-High-level view of how the system works, who is responsible for what, and how data moves between components. See the interface and component specs in the umbrella repo (e.g. `in_01_cluster_manager.md`, `in_02_arcane_node.md`, `in_06_replication_channel_manager.md`) for details.
+High-level view of how the system works, who is responsible for what, and how data moves between components. See the interface and component specs in the umbrella repo (e.g. `in_01_manager.md`, `in_02_arcane_node.md`, `in_06_replication_channel_manager.md`) for details.
 
 ---
 
@@ -13,7 +13,7 @@ flowchart TB
         C2[Client 2]
     end
 
-    subgraph manager["ClusterManager (IN-01)"]
+    subgraph manager["ArcaneManager (IN-01)"]
         M[Manager]
     end
 
@@ -44,7 +44,7 @@ flowchart TB
 | Component | Responsibility |
 |-----------|----------------|
 | **Client** | Connect to Manager for join/leave and cluster assignment; connect to Arcane Node for game session; send PLAYER_INPUT; receive STATE_UPDATE, RPC_RESULT, CLUSTER_ASSIGN/REASSIGN. |
-| **ClusterManager** | Single coordinator: assign players to clusters, maintain spatial index and neighbor topology, run clustering model (merge/split), write assignments and topology to SpacetimeDB; send CLUSTER_ASSIGN/REASSIGN to clients. Does not simulate or replicate. |
+| **ArcaneManager** | Single coordinator: assign players to clusters, maintain spatial index and neighbor topology, run clustering model (merge/split), write assignments and topology to SpacetimeDB; send CLUSTER_ASSIGN/REASSIGN to clients. Does not simulate or replicate. |
 | **ArcaneNode** | One per cluster: run simulation (movement, physics, AI) for owned entities; accept client Cluster WebSocket; send STATE_UPDATE each tick; receive PLAYER_INPUT; publish entity state to Redis for neighbors; subscribe to neighbors via Redis; read assignments/topology from SpacetimeDB; write entity state to SpacetimeDB at throttled rate; call SpacetimeDB reducers for discrete events (e.g. attack hit). |
 | **ReplicationChannelManager** | Runs inside each ArcaneNode: subscribe to SpacetimeDB cluster_topology; open/close one IReplicationChannel per neighbor; deliver outbound deltas to Redis and inbound deltas from Redis to ArcaneNode. Does not decide neighbors (Manager does). |
 | **Redis** | Pub/sub transport for real-time entity state between neighboring clusters. Each cluster publishes to its topic; neighbors subscribe. Fire-and-forget; no delivery guarantee. |
@@ -57,7 +57,7 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant M as ClusterManager
+    participant M as ArcaneManager
     participant SDB as SpacetimeDB
     participant S as ArcaneNode
 
@@ -144,7 +144,7 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant M as ClusterManager
+    participant M as ArcaneManager
     participant SDB as SpacetimeDB
     participant S1 as ArcaneNode A
     participant S2 as ArcaneNode B
@@ -161,7 +161,7 @@ sequenceDiagram
     Note over S2: Stops; replication channels closed; pool release
 ```
 
-- **ClusterManager** is the only writer of assignments and topology. **ReplicationChannelManager** on each ArcaneNode subscribes to **cluster_topology** and opens/closes **IReplicationChannel** (Redis subscriptions) when neighbors change.
+- **ArcaneManager** is the only writer of assignments and topology. **ReplicationChannelManager** on each ArcaneNode subscribes to **cluster_topology** and opens/closes **IReplicationChannel** (Redis subscriptions) when neighbors change.
 
 ---
 
@@ -169,8 +169,8 @@ sequenceDiagram
 
 | Data | Written by | Read by | Transport / store |
 |------|------------|---------|--------------------|
-| Player → cluster assignment | ClusterManager | Arcane Nodes, clients (via Manager) | SpacetimeDB |
-| Cluster topology (neighbors) | ClusterManager | ReplicationChannelManager (per node) | SpacetimeDB |
+| Player → cluster assignment | ArcaneManager | Arcane Nodes, clients (via Manager) | SpacetimeDB |
+| Cluster topology (neighbors) | ArcaneManager | ReplicationChannelManager (per node) | SpacetimeDB |
 | Entity state (high-frequency) | ArcaneNode (per tick) | Neighbor Arcane Nodes | Redis (pub/sub) |
 | Entity state (persistent) | ArcaneNode (throttled) | Arcane Nodes (gap recovery, load) | SpacetimeDB |
 | Discrete game outcomes | ArcaneNode → reducer | Client (RPC_RESULT), SpacetimeDB tables | SpacetimeDB reducers |

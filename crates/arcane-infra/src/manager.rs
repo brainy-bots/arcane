@@ -1,4 +1,4 @@
-//! ClusterManager (IN-01) — central coordinator.
+//! ArcaneManager (IN-01) — central coordinator.
 
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// Central coordinator: assignments, topology, clustering model.
-pub struct ClusterManager {
+pub struct ArcaneManager {
     model: Arc<dyn IClusteringModel>,
     pool: Arc<dyn IServerPool>,
     spatial_index: SpatialIndex,
-    /// Allocated cluster servers. active_count = allocated_servers.len().
+    /// Allocated nodes. active_count = allocated_servers.len().
     allocated_servers: Vec<ServerHandle>,
 }
 
-impl ClusterManager {
+impl ArcaneManager {
     pub fn new(
         model: Arc<dyn IClusteringModel>,
         pool: Arc<dyn IServerPool>,

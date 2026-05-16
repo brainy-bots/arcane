@@ -3,19 +3,19 @@
 //! Runtime orchestration and transport implementations on top of `arcane-core` contracts.
 //!
 //! ## Module responsibilities
-//! - `cluster_manager`: assignment/topology orchestration and control-plane decisions.
+//! - `manager`: assignment/topology orchestration and control-plane decisions (ArcaneManager).
 //! - `node`: per-cluster simulation and state-delta production (ArcaneNode).
 //! - `replication_channel_manager` + `redis_channel`: neighbor transport plumbing.
 //! - `neighbor_subscriber`: inbound Redis subscriber loop for neighbor deltas.
 //! - `ws_server`: client-facing WebSocket transport.
 //! - `spacetimedb_persist`: throttled persistence adapter for state snapshots.
-//! - `cluster_runner`: loop composition that wires server, replication, ws, and persistence.
+//! - `node_runner`: loop composition that wires node, replication, ws, and persistence.
 //! - `rapier_cluster`: Rapier-backed authoritative physics wrapped as a `ClusterSimulation`
 //!   (feature `rapier-cluster`).
 
 #[cfg(feature = "cluster-ws")]
 pub mod broadcast_channel_cap;
-pub mod cluster_manager;
+pub mod manager;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
 pub mod node;
@@ -27,15 +27,23 @@ pub mod spacetimedb_persist;
 pub mod tick_rate;
 
 #[cfg(feature = "cluster-ws")]
-pub mod cluster_runner;
-#[cfg(feature = "cluster-ws")]
 pub mod cluster_stats;
+#[cfg(feature = "cluster-ws")]
+pub mod node_runner;
 #[cfg(feature = "cluster-ws")]
 pub mod physics_events_channel;
 #[cfg(feature = "cluster-ws")]
 pub mod startup;
 #[cfg(feature = "cluster-ws")]
 pub mod ws_server;
+
+// Compatibility aliases — downstream crates (benchmarks, demos) import these module paths.
+// Remove in Phase 2 when all repos are updated simultaneously.
+#[deprecated(note = "renamed to manager")]
+pub use manager as cluster_manager;
+#[cfg(feature = "cluster-ws")]
+#[deprecated(note = "renamed to node_runner")]
+pub use node_runner as cluster_runner;
 
 #[cfg(feature = "rapier-cluster")]
 pub mod rapier_cluster;
@@ -47,7 +55,9 @@ pub use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp
 #[cfg(feature = "cluster-ws")]
 pub use physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 
-pub use cluster_manager::ClusterManager;
+pub use manager::ArcaneManager;
+#[deprecated(note = "renamed to ArcaneManager")]
+pub use manager::ArcaneManager as ClusterManager;
 pub use node::ArcaneNode;
 pub use redis_channel::RedisReplicationChannel;
 pub use replication_channel_manager::ReplicationChannelManager;

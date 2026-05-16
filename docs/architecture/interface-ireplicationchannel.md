@@ -31,7 +31,7 @@ Replication carries **simulation state** (position, movement) only. **Discrete g
 - Subscribe to one neighboring cluster's state topic (and publish this cluster's state to a topic that neighbor subscribes to)
 - Accept entity state deltas and publish them with minimal latency; receive deltas from subscriptions
 - Report subscription/transport health (connected, latency, drop rate) to the ReplicationChannelManager
-- Reconnect or resubscribe automatically on broker or subscription failure without intervention from the ClusterManager
+- Reconnect or resubscribe automatically on broker or subscription failure without intervention from the ArcaneManager
 - Apply observation-radius filtering — only publish entities within the configured radius of the destination cluster's centroid (centroid + spread_radius + observation_radius)
 
 ---
@@ -158,7 +158,7 @@ fn should_send(entity: &EntityStateEntry, dest: &DestClusterState) -> bool {
 }
 ```
 
-The destination centroid and spread_radius are pushed by the ReplicationChannelManager each time the ClusterManager updates neighbor topology (who subscribes to whom). Not fetched per-send.
+The destination centroid and spread_radius are pushed by the ReplicationChannelManager each time the ArcaneManager updates neighbor topology (who subscribes to whom). Not fetched per-send.
 
 ### Tradeoff: False Positives Are Acceptable, False Negatives Are Not
 
@@ -269,7 +269,7 @@ None at interface level. RedisPubSubReplication depends on Redis client availabi
 | Queue full | Queue depth > max_queue_depth | Drop oldest item. Increment drops counter. Log warning if drop rate > 5% sustained. |
 | Destination cluster merged away | ReplicationChannelManager calls close() | Flush publish queue. Unsubscribe. No further action. |
 | High latency (p99 > 30ms) | Heartbeat or round-trip measurement | Emit metric. Log warning. Do not unsubscribe — high latency replication is still better than no replication. |
-| Sustained drop rate > 20% | metrics check | ReplicationChannelManager may signal ClusterManager to consider merging the two clusters — high drop rate indicates heavy interaction that may warrant co-location. |
+| Sustained drop rate > 20% | metrics check | ReplicationChannelManager may signal ArcaneManager to consider merging the two clusters — high drop rate indicates heavy interaction that may warrant co-location. |
 
 ---
 

@@ -1,4 +1,4 @@
-//! Integration tests: ClusterManager + LocalPool + SpatialIndex + RulesEngine (no SpacetimeDB).
+//! Integration tests: ArcaneManager + LocalPool + SpatialIndex + RulesEngine (no SpacetimeDB).
 //! Plus Redis: smoke test and RedisReplicationChannel publish/subscribe (run with `docker compose up -d`).
 
 use std::sync::mpsc;
@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry, IReplicationChannel};
 use arcane_core::Vec3;
-use arcane_infra::{
-    ArcaneNode, ClusterManager, RedisReplicationChannel, ReplicationChannelManager,
-};
+use arcane_infra::{ArcaneManager, ArcaneNode, RedisReplicationChannel, ReplicationChannelManager};
 use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
@@ -19,7 +17,7 @@ fn uuid(i: u8) -> Uuid {
 
 #[test]
 fn manager_cycle_allocates_one_cluster_when_entities_present() {
-    let mut manager = ClusterManager::with_defaults();
+    let mut manager = ArcaneManager::with_defaults();
     assert_eq!(manager.active_cluster_count(), 0);
 
     manager.update_entity(uuid(10), uuid(1), Vec3::new(100.0, 0.0, 200.0));
@@ -36,7 +34,7 @@ fn manager_cycle_allocates_one_cluster_when_entities_present() {
 
 #[test]
 fn manager_empty_spatial_does_not_allocate() {
-    let mut manager = ClusterManager::with_defaults();
+    let mut manager = ArcaneManager::with_defaults();
     manager
         .run_evaluation_cycle()
         .expect("cycle should succeed");
@@ -45,7 +43,7 @@ fn manager_empty_spatial_does_not_allocate() {
 
 #[test]
 fn manager_multiple_entities_same_cluster_still_one_allocated_server() {
-    let mut manager = ClusterManager::with_defaults();
+    let mut manager = ArcaneManager::with_defaults();
     let cluster_a = uuid(1);
     manager.update_entity(uuid(10), cluster_a, Vec3::new(0.0, 0.0, 0.0));
     manager.update_entity(uuid(11), cluster_a, Vec3::new(10.0, 0.0, 0.0));
@@ -198,7 +196,7 @@ fn manager_replication_node_integration() {
     let cluster_a = uuid(1);
     let cluster_b = uuid(2);
 
-    let mut manager = ClusterManager::with_defaults();
+    let mut manager = ArcaneManager::with_defaults();
     manager.set_observation_radius(100.0);
     manager.update_entity(uuid(10), cluster_a, Vec3::new(0.0, 0.0, 0.0));
     manager.update_entity(uuid(11), cluster_a, Vec3::new(100.0, 0.0, 0.0));

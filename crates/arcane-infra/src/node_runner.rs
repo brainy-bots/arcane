@@ -1,4 +1,4 @@
-//! Node run loop — library entry point for running a cluster with optional per-tick entity injection.
+//! Node run loop — library entry point for running a node with optional per-tick entity injection.
 //! Used by the arcane-cluster binary (no demo) and by arcane-demo's cluster-demo binary (with demo agents).
 //! Keeps infrastructure (this crate) free of game/demo logic.
 //!
