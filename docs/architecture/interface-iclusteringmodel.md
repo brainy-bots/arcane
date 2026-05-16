@@ -8,11 +8,11 @@
 | **Component ID** | IF-01 |
 | **Layer** | Infrastructure Interface |
 | **Type** | Interface — no implementation, only contract |
-| **Purpose** | Define the contract for evaluating merge and split decisions. Decouples the decision logic from the ClusterManager so the MVP static rules implementation can be swapped for the ML model without touching calling code. |
+| **Purpose** | Define the contract for evaluating merge and split decisions. Decouples the decision logic from the ArcaneManager so the MVP static rules implementation can be swapped for the ML model without touching calling code. |
 | **Implementations** | IN-04 RulesEngine (MVP static rules) · MLClusteringModel (production, future) |
 | **Language** | Rust |
 | **Depends On** | None |
-| **Required By** | IN-01 ClusterManager · IN-04 RulesEngine |
+| **Required By** | IN-01 ArcaneManager · IN-04 RulesEngine |
 | **System-level companion** | [SYS-01 clustering-system-requirements.md](clustering-system-requirements.md) — describes what the full clustering system must eventually do end-to-end (capability-aware placement, market signals, temporal prediction, cost optimization). This interface is one piece of that system. |
 
 ---
@@ -21,17 +21,17 @@
 
 IClusteringModel is the pluggable brain of the clustering system. It receives a view of the current world state and returns a list of merge and split decisions to execute. It knows nothing about how those decisions are executed. It does not communicate with Arcane Nodes, modify any state, or perform any I/O. It is a pure function from world state to decisions.
 
-This separation exists because the decision logic will change significantly over the system's lifetime. The MVP ships with a static rules engine — fast to implement, easy to reason about, sufficient to demonstrate the architecture. The production system replaces it with an ML model trained on player interaction signals, capable of predicting future interactions and pre-empting cluster boundaries before load concentrates. Both implement this interface. The ClusterManager calls the same methods either way.
+This separation exists because the decision logic will change significantly over the system's lifetime. The MVP ships with a static rules engine — fast to implement, easy to reason about, sufficient to demonstrate the architecture. The production system replaces it with an ML model trained on player interaction signals, capable of predicting future interactions and pre-empting cluster boundaries before load concentrates. Both implement this interface. The ArcaneManager calls the same methods either way.
 
 ### Clustering goals and design intent
 
-Neighbor topology (who replicates with whom) and merge/split decisions are not determined by a fixed formula. They are driven by **graph and machine-learning optimization**. The goal is to prioritize keeping players who are already related (guild, party, social graph) or who interact frequently in the same cluster or in neighboring clusters, while also considering physical position in the world and other factors. There is no single "clear logic" — the clustering model (whether static rules for MVP or ML for production) optimizes for this. ClusterManager uses the model's output to maintain neighbor sets and trigger merge/split; replication (e.g. via Redis pub/sub) then follows that topology.
+Neighbor topology (who replicates with whom) and merge/split decisions are not determined by a fixed formula. They are driven by **graph and machine-learning optimization**. The goal is to prioritize keeping players who are already related (guild, party, social graph) or who interact frequently in the same cluster or in neighboring clusters, while also considering physical position in the world and other factors. There is no single "clear logic" — the clustering model (whether static rules for MVP or ML for production) optimizes for this. ArcaneManager uses the model's output to maintain neighbor sets and trigger merge/split; replication (e.g. via Redis pub/sub) then follows that topology.
 
 Cluster size has **no hard lower bound**. The architecture allows clusters to go as low as **one player per server** if needed to keep up with interaction load — for example when many players are concentrated in a small space. In practice, resource and cost tradeoffs may favor larger clusters, but the system can scale down to 1-player clusters when the optimization demands it.
 
 ### State Source — SpacetimeDB Live View
 
-The clustering model does not receive an ad-hoc snapshot assembled on demand. Instead, the ClusterManager maintains a live in-memory view of all relevant tables, kept current by SpacetimeDB's subscription mechanism. Changes to cluster assignments, player positions, interaction records, and RPC failure rates are pushed in real time, and SpacetimeDB reducers pre-filter this view to surface only clusters and players that look interesting (near thresholds, high cross-cluster interaction, etc.).
+The clustering model does not receive an ad-hoc snapshot assembled on demand. Instead, the ArcaneManager maintains a live in-memory view of all relevant tables, kept current by SpacetimeDB's subscription mechanism. Changes to cluster assignments, player positions, interaction records, and RPC failure rates are pushed in real time, and SpacetimeDB reducers pre-filter this view to surface only clusters and players that look interesting (near thresholds, high cross-cluster interaction, etc.).
 
 **Evaluation cadence:** `evaluate()` is called on a **fixed cadence**, as fast as it makes sense (e.g. every 50–200 ms, limited only by inference latency and resource budget). Whether or not something "changed" since the last run is irrelevant — we sample the live view at that cadence and the model returns decisions. Merge and split are not symmetric: the thresholds for merging and splitting can be completely different and far apart, and the model considers many variables (server load, performance, interactions, spatial distribution, etc.). So we do not get merge/split/merge/split from players moving back and forth; the decision space itself provides stability. We could require X consecutive evaluations to agree before executing a decision, but the model can be smart enough to be stable without that. Inference can run on a separate service if needed; there is no requirement to co-locate or to slow down evaluation to avoid thrashing. The exact cadence is a tunable parameter (operational hyperparameter) that can be optimized later based on real metrics — the architecture only assumes \"periodic on a live view,\" not a specific frequency.
 
@@ -50,7 +50,7 @@ The clustering model does not receive an ad-hoc snapshot assembled on demand. In
 
 ## 3. What It Does NOT Do
 
-- Execute merge or split operations — that is the ClusterManager's job
+- Execute merge or split operations — that is the ArcaneManager's job
 - Communicate with Arcane Nodes — no network access
 - Modify player or cluster state — read-only access to the view
 - Persist any data between calls — stateless by contract
@@ -67,9 +67,9 @@ The clustering model does not receive an ad-hoc snapshot assembled on demand. In
 fn evaluate(view: &WorldStateView) -> Vec<ClusterDecision>
 ```
 
-**Returns:** Ordered list of ClusterDecisions. Empty means no action required. Decisions are returned in priority order — the ClusterManager executes them in sequence, skipping any whose clusters no longer exist.
+**Returns:** Ordered list of ClusterDecisions. Empty means no action required. Decisions are returned in priority order — the ArcaneManager executes them in sequence, skipping any whose clusters no longer exist.
 
-**Latency contract:** Must return within `view.evaluation_budget_ms` (default 50ms). If the model cannot complete within budget it must return partial results covering highest-priority candidates first. Must never block the ClusterManager's main loop.
+**Latency contract:** Must return within `view.evaluation_budget_ms` (default 50ms). If the model cannot complete within budget it must return partial results covering highest-priority candidates first. Must never block the ArcaneManager's main loop.
 
 ---
 
@@ -216,7 +216,7 @@ Two hostile guilds converging on each other. No combat yet — purely positional
 
 **Tier 2 — Game layer signal** (game-defined lead time)
 
-The game layer has detected that combat is imminent or interaction is about to become heavy. It emits a `MergeHintSignal` via the signal interface. The clustering model treats this as a high-confidence merge recommendation. Uses `GAME_LAYER_HINT` reason code. The ClusterManager has no knowledge of what produced the signal.
+The game layer has detected that combat is imminent or interaction is about to become heavy. It emits a `MergeHintSignal` via the signal interface. The clustering model treats this as a high-confidence merge recommendation. Uses `GAME_LAYER_HINT` reason code. The ArcaneManager has no knowledge of what produced the signal.
 
 **Tier 3 — Reactive density threshold** (no prediction)
 
@@ -230,9 +230,9 @@ All world state lives in SpacetimeDB. There is nothing to "commit" or "merge" be
 
 **Handoff sequence:**
 
-1. **ClusterManager** updates SpacetimeDB: player-to-cluster assignments (and cluster topology) so that the destination cluster now owns the migrating players.
-2. **ClusterManager** notifies the **source** ArcaneNode to drop those players. The source server stops simulating them at the **end of its current tick** so it never writes them again — clean handover of write ownership.
-3. **ClusterManager** sends `CLUSTER_REASSIGN` to affected clients. Clients connect to the destination server.
+1. **ArcaneManager** updates SpacetimeDB: player-to-cluster assignments (and cluster topology) so that the destination cluster now owns the migrating players.
+2. **ArcaneManager** notifies the **source** ArcaneNode to drop those players. The source server stops simulating them at the **end of its current tick** so it never writes them again — clean handover of write ownership.
+3. **ArcaneManager** sends `CLUSTER_REASSIGN` to affected clients. Clients connect to the destination server.
 4. The **destination** ArcaneNode reads current state for those players (and any entities it now owns) from SpacetimeDB — via its existing subscription or on demand — and continues simulating. No coordination with the source server's tick is required.
 
 The only coordination is: the source server must stop writing the migrated entities before the destination (and clients) treat them as belonging to the destination. Using "end of current tick" on the source gives a well-defined handover point and avoids mid-tick partial writes. Maximum additional delay for handoff is one tick (50ms at 20Hz) on the source server.
@@ -243,7 +243,7 @@ The slow-tick concern — a ArcaneNode under load slowing its ticks and making t
 
 ## 6. Game Layer Signal Interface
 
-The ClusterManager exposes a signal endpoint that game layer components push `MergeHintSignal` events to. The clustering model consumes these signals alongside infrastructure signals.
+The ArcaneManager exposes a signal endpoint that game layer components push `MergeHintSignal` events to. The clustering model consumes these signals alongside infrastructure signals.
 
 ```rust
 struct MergeHintSignal {
@@ -256,7 +256,7 @@ struct MergeHintSignal {
 }
 ```
 
-**The ClusterManager and clustering model are entirely ignorant of what produced a signal.** They see confidence, urgency, and expiry — nothing game-specific. This is the extension point for any game system that wants to influence clustering decisions.
+**The ArcaneManager and clustering model are entirely ignorant of what produced a signal.** They see confidence, urgency, and expiry — nothing game-specific. This is the extension point for any game system that wants to influence clustering decisions.
 
 ### ADS Demo Implementation
 
@@ -270,7 +270,7 @@ The ML clustering model learns from signal patterns regardless of which game sys
 
 ### Model output and guardrails (caller responsibility)
 
-The clustering model only **returns recommendations** (ideal clustering according to the model). It is an **optimization layer**: the system could use a conditional tree of static rules and work perfectly fine, with a lower player-scale ceiling. The component that **actually modifies state in SpacetimeDB** (ClusterManager or a dedicated decision-executor layer) **decides whether to agree or not** with each recommendation. Guardrails live there, not inside the model.
+The clustering model only **returns recommendations** (ideal clustering according to the model). It is an **optimization layer**: the system could use a conditional tree of static rules and work perfectly fine, with a lower player-scale ceiling. The component that **actually modifies state in SpacetimeDB** (ArcaneManager or a dedicated decision-executor layer) **decides whether to agree or not** with each recommendation. Guardrails live there, not inside the model.
 
 **Guardrails the executor should enforce:** confidence threshold (do not execute decisions below ML_CONFIDENCE_THRESHOLD); rate limits (cap merges/splits per minute); resource limits (e.g. do not merge any server above 80% CPU or GPU usage); cooldowns (MERGE_COOLDOWN_S, SPLIT_COOLDOWN_S). Flag instances where the executor **disagreed** with the model (overrode or skipped a recommendation) for analysis, so the model can be improved from real data. Do not rely on the model alone; production guardrails are required. Early access or beta, where server stability is not guaranteed, can be used to let the model learn from real player interaction patterns before tightening guardrails further.
 
@@ -303,7 +303,7 @@ fn evaluate(view: &WorldStateView) -> Vec<ClusterDecision> {
 
 ### MLClusteringModel (future)
 
-Converts the WorldStateView into a feature vector, runs inference through a trained model, maps output scores above the confidence threshold to ClusterDecisions. Loaded at startup, hot-reloaded without restarting ClusterManager.
+Converts the WorldStateView into a feature vector, runs inference through a trained model, maps output scores above the confidence threshold to ClusterDecisions. Loaded at startup, hot-reloaded without restarting ArcaneManager.
 
 ---
 
@@ -356,10 +356,10 @@ None. IClusteringModel is a root interface. MLClusteringModel loads a model file
 
 | Failure | Detection | Response |
 |---|---|---|
-| evaluate() exceeds budget | Wall clock check in ClusterManager | Return partial results. Log warning. Increment budget_exceeded counter. |
-| View missing required fields | validate_view() returns errors | ClusterManager skips evaluation cycle. Logs error. |
+| evaluate() exceeds budget | Wall clock check in ArcaneManager | Return partial results. Log warning. Increment budget_exceeded counter. |
+| View missing required fields | validate_view() returns errors | ArcaneManager skips evaluation cycle. Logs error. |
 | ML model file corrupt or missing | Load error at startup | Fall back to static_rules. Emit startup warning. Never panic. |
-| ML inference error | Caught in evaluate() | Log error with view hash. Return empty vec. ClusterManager continues. |
+| ML inference error | Caught in evaluate() | Log error with view hash. Return empty vec. ArcaneManager continues. |
 | Thrashing — same pair repeatedly merged and split | recent_merges / recent_splits in view | Cooldown enforcement prevents re-decision within cooldown window. |
 | MergeHintSignal flood from game layer | Signal queue depth | Cap signal queue at 1000. Drop oldest on overflow. Log warning. |
 

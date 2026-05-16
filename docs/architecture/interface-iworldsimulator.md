@@ -8,7 +8,7 @@
 | **Component ID** | IF-04 |
 | **Layer** | Infrastructure Interface |
 | **Type** | Interface — no implementation, only contract |
-| **Purpose** | Define the contract for managing entity state when no players are nearby to observe it. Allows three implementations — Static, FastForward, and MLPredictive — to be selected per entity type at runtime without changing the EntityInstantiationManager or ClusterManager. |
+| **Purpose** | Define the contract for managing entity state when no players are nearby to observe it. Allows three implementations — Static, FastForward, and MLPredictive — to be selected per entity type at runtime without changing the EntityInstantiationManager or ArcaneManager. |
 | **Implementations** | StaticSimulator · FastForwardSimulator · MLPredictiveSimulator |
 | **Language** | Rust |
 | **Depends On** | None |

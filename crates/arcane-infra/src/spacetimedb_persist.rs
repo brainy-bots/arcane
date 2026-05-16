@@ -16,7 +16,7 @@
 //! Level-2+ (explicit flush trigger, custom reducer, typed schemas) is deferred until a real
 //! game-driven use case demands it.
 //!
-//! This module does not own simulation timing; `cluster_runner` decides when to call it.
+//! This module does not own simulation timing; `node_runner` decides when to call it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;

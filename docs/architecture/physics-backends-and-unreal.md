@@ -24,7 +24,7 @@ This document describes how to integrate **authoritative physics** with Arcane: 
 
 Read in order:
 
-1. [`crates/arcane-infra/src/cluster_runner.rs`](../../crates/arcane-infra/src/cluster_runner.rs) — `run_cluster_loop`: drain client updates → optional injected entities → neighbor deltas → **`simulate_before_tick`** → **`tick`** → persist → WebSocket send.
+1. [`crates/arcane-infra/src/node_runner.rs`](../../crates/arcane-infra/src/node_runner.rs) — `run_cluster_loop`: drain client updates → optional injected entities → neighbor deltas → **`simulate_before_tick`** → **`tick`** → persist → WebSocket send.
 2. [`crates/arcane-infra/src/node.rs`](../../crates/arcane-infra/src/node.rs) — `simulate_before_tick` calls [`ClusterSimulation::on_tick`](../../crates/arcane-core/src/cluster_simulation.rs).
 3. [`crates/arcane-core/src/cluster_simulation.rs`](../../crates/arcane-core/src/cluster_simulation.rs) — trait + `ClusterTickContext` (`entities`, `dt_seconds`, `tick`, `pending_removals`).
 
@@ -57,7 +57,7 @@ Choose only if Unreal-native WebSocket + replication proves infeasible for your 
 
 - **UE5 authoritative physics:** use **Chaos** rigid bodies / scene queries as appropriate for your game. PhysX legacy paths exist; **do not** anchor v1 on deprecated paths without an explicit reason.
 - **API surface:** Chaos APIs evolve by UE minor version — **pin the engine version** in the demo README and verify compile steps on that version.
-- **Tick alignment:** Arcane reference loop uses **20 Hz** (`TICK_RATE_HZ` in `cluster_runner.rs`). Physics often wants **fixed sub-steps** (e.g. 60 Hz): run `n` Chaos steps inside one `on_tick` (or one UE frame) using `ctx.dt_seconds` or a fixed `1/60` substep until accumulated time is consumed. Document chosen policy in the demo.
+- **Tick alignment:** Arcane reference loop uses **20 Hz** (`TICK_RATE_HZ` in `node_runner.rs`). Physics often wants **fixed sub-steps** (e.g. 60 Hz): run `n` Chaos steps inside one `on_tick` (or one UE frame) using `ctx.dt_seconds` or a fixed `1/60` substep until accumulated time is consumed. Document chosen policy in the demo.
 
 ---
 
@@ -130,7 +130,7 @@ Minimum fields for an entry (see `EntityStateEntry`): `entity_id`, `cluster_id`,
 
 **Phase A — Read and freeze decisions**
 
-- [ ] Read `cluster_runner.rs`, `node.rs`, `cluster_simulation.rs`, `replication_channel.rs`.
+- [ ] Read `node_runner.rs`, `node.rs`, `cluster_simulation.rs`, `replication_channel.rs`.
 - [ ] Read [four-bucket-state-model.md](four-bucket-state-model.md).
 - [ ] Write ADR: integration shape + UE version + tick/substep policy.
 
@@ -159,6 +159,6 @@ Minimum fields for an entry (see `EntityStateEntry`): `entity_id`, `cluster_id`,
 |------|------|
 | `arcane-core/src/cluster_simulation.rs` | Trait to implement (Rust backend) or mirror semantically (UE). |
 | `arcane-core/src/replication_channel.rs` | `EntityStateEntry`, delta shape. |
-| `arcane-infra/src/cluster_runner.rs` | Tick order and `dt_seconds`. |
+| `arcane-infra/src/node_runner.rs` | Tick order and `dt_seconds`. |
 | `arcane-infra/src/ws_server.rs` | Inbound `PLAYER_STATE` JSON. |
 | `arcane-infra/src/bin/arcane_cluster.rs` | Today passes `None` for simulation — Rust games pass `Some(...)`. |

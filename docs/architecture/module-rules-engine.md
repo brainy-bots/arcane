@@ -16,7 +16,7 @@
 
 ## 1. Overview
 
-RulesEngine is the **static rules implementation** of `IClusteringModel` (see `if_01_iclusteringmodel.md`). It runs in-process with `ClusterManager`. On each evaluation tick, ClusterManager builds a `WorldStateView` from its live SpacetimeDB subscriptions and passes it to `RulesEngine.evaluate(view)`. The RulesEngine applies a set of **hand-written rules** (player count, CPU load, spatial proximity, interaction rate, social graph, game-layer signals) and returns an ordered list of `ClusterDecision`s (merge or split). It never writes to SpacetimeDB, never talks to Arcane Nodes, and keeps no state between calls; it is a pure, deterministic function from `WorldStateView` to decisions. A future ML model will implement the same interface; ClusterManager does not change when that swap happens.
+RulesEngine is the **static rules implementation** of `IClusteringModel` (see `if_01_iclusteringmodel.md`). It runs in-process with `ArcaneManager`. On each evaluation tick, ArcaneManager builds a `WorldStateView` from its live SpacetimeDB subscriptions and passes it to `RulesEngine.evaluate(view)`. The RulesEngine applies a set of **hand-written rules** (player count, CPU load, spatial proximity, interaction rate, social graph, game-layer signals) and returns an ordered list of `ClusterDecision`s (merge or split). It never writes to SpacetimeDB, never talks to Arcane Nodes, and keeps no state between calls; it is a pure, deterministic function from `WorldStateView` to decisions. A future ML model will implement the same interface; ArcaneManager does not change when that swap happens.
 
 ---
 
@@ -44,9 +44,9 @@ RulesEngine is the **static rules implementation** of `IClusteringModel` (see `i
 
 ## 3. What It Does NOT Do
 
-- **Execute** merge/split operations or write to SpacetimeDB — that is `ClusterManager`’s job.
+- **Execute** merge/split operations or write to SpacetimeDB — that is `ArcaneManager`’s job.
 - **Communicate with cluster servers** — no network access.
-- **Manage guardrails or cooldowns** — confidence thresholds, rate limits, and cooldowns live in the executor (`ClusterManager`) per IF-01 § Model output and guardrails.
+- **Manage guardrails or cooldowns** — confidence thresholds, rate limits, and cooldowns live in the executor (`ArcaneManager`) per IF-01 § Model output and guardrails.
 - **Hold state between evaluations** — no internal memory of prior decisions or history; all history comes from the view (`recent_merges`, `recent_splits`, `interaction_history`, etc.).
 - **Know about engine or game mechanics** — works only with the infrastructure-level signals defined in `WorldStateView` and `MergeHintSignal`.
 - **Run ML or load models** — this is explicitly the non-ML implementation.
@@ -59,7 +59,7 @@ RulesEngine implements the IF-01 interface; no additional public methods are req
 
 ### 4.1 `evaluate(view: &WorldStateView) -> Vec<ClusterDecision>`
 
-- Called by `ClusterManager` on its evaluation cadence (e.g. every 50–200 ms).
+- Called by `ArcaneManager` on its evaluation cadence (e.g. every 50–200 ms).
 - Must:
   - Treat `view` as **read-only**.
   - Generate decisions using only the data in `view`.
@@ -154,7 +154,7 @@ All static-rule decisions set `confidence = 1.0` to signal “rules are certain;
 
 - **Owns:** In-memory rule configuration (thresholds, weights, priority ordering), immutable rule set (`RULES_BY_PRIORITY`).
 - **Reads:** Only `WorldStateView` passed into `evaluate()` and configuration loaded at startup.
-- **Writes:** Nothing external. Returns `Vec<ClusterDecision>`; logs may be written via ClusterManager’s logging facility but are implementation detail.
+- **Writes:** Nothing external. Returns `Vec<ClusterDecision>`; logs may be written via ArcaneManager’s logging facility but are implementation detail.
 
 ---
 
@@ -163,8 +163,8 @@ All static-rule decisions set `confidence = 1.0` to signal “rules are certain;
 | Dependency | What is used | If it changes |
 |------------|--------------|----------------|
 | IF-01 IClusteringModel | `WorldStateView`, `ClusterDecision`, `ModelInfo`, `ValidationResult` types and semantics | RulesEngine must track any structural changes to the view or decision types; reason codes must stay in sync. |
-| SpatialIndex (IN-03) | Indirectly, via fields like `centroid`, `spread_radius`, and cluster topology computed by ClusterManager | If ClusterManager stops populating geometry in `WorldStateView`, spatial rules must be adjusted or disabled. |
-| ClusterManager (IN-01) | Calls `evaluate()` on a cadence; applies guardrails; executes decisions | If guardrail behavior changes, decision priorities or confidence usage may need tuning. |
+| SpatialIndex (IN-03) | Indirectly, via fields like `centroid`, `spread_radius`, and cluster topology computed by ArcaneManager | If ArcaneManager stops populating geometry in `WorldStateView`, spatial rules must be adjusted or disabled. |
+| ArcaneManager (IN-01) | Calls `evaluate()` on a cadence; applies guardrails; executes decisions | If guardrail behavior changes, decision priorities or confidence usage may need tuning. |
 
 RulesEngine itself has **no runtime dependencies on SpacetimeDB, Redis, or Arcane Nodes**; it only depends on the shapes of the view and decision types.
 
@@ -197,7 +197,7 @@ These values are **tuning parameters** for the demo, not fixed API contracts.
 
 ## 10. Metrics
 
-RulesEngine itself may not expose metrics directly; ClusterManager can instrument `evaluate()` calls. Typical metrics (exported under ClusterManager’s metrics namespace):
+RulesEngine itself may not expose metrics directly; ArcaneManager can instrument `evaluate()` calls. Typical metrics (exported under ArcaneManager’s metrics namespace):
 
 | Metric | Type | Labels | Measures |
 |--------|------|--------|----------|
@@ -211,18 +211,18 @@ RulesEngine itself may not expose metrics directly; ClusterManager can instrumen
 
 | Failure | Detection | Response |
 |---------|-----------|----------|
-| View inconsistent (missing clusters/players) | `validate_view` returns warnings/errors | Log via ClusterManager; still attempt evaluation but avoid panics and skip obviously broken data. |
-| Evaluation exceeds budget | Wall-clock measurement around `evaluate()` | Stop evaluating lower-priority rules; return whatever decisions were found so far. ClusterManager’s guardrails and metrics detect chronic budget overruns. |
+| View inconsistent (missing clusters/players) | `validate_view` returns warnings/errors | Log via ArcaneManager; still attempt evaluation but avoid panics and skip obviously broken data. |
+| Evaluation exceeds budget | Wall-clock measurement around `evaluate()` | Stop evaluating lower-priority rules; return whatever decisions were found so far. ArcaneManager’s guardrails and metrics detect chronic budget overruns. |
 | Misconfigured thresholds (e.g. no decisions ever) | Observed via metrics (decisions_total = 0) | Tune thresholds; not a runtime crash. |
 
-RulesEngine must never panic or crash the ClusterManager; worst-case behavior is “return no decisions this tick and log a warning.”
+RulesEngine must never panic or crash the ArcaneManager; worst-case behavior is “return no decisions this tick and log a warning.”
 
 ---
 
 ## 12. Open Questions
 
 - **Threshold tuning:** Initial threshold values are guesses. Tuning will be based on synthetic load tests; later the ML model can learn better decision boundaries from telemetry. Until then, thresholds are config-driven and may change frequently during demo development.
-- **Rule ordering vs. guardrails:** Priority ordering of rules and executor guardrails (cooldowns, rate limits) interact. For example, multiple high-priority merges in a single tick may be throttled by guardrails. Need to document recommended defaults in `in_01_cluster_manager.md` once thresholds are stable.
+- **Rule ordering vs. guardrails:** Priority ordering of rules and executor guardrails (cooldowns, rate limits) interact. For example, multiple high-priority merges in a single tick may be throttled by guardrails. Need to document recommended defaults in `in_01_manager.md` once thresholds are stable.
 - **Transition to ML:** When the ML model is introduced, does RulesEngine remain as a fallback (e.g. when ML is disabled) or as a hybrid (ML + rules)? Design favors: keep RulesEngine as a simple, always-available implementation; MLClusteringModel becomes a second implementation selectable via config.
 
 ---

@@ -7,7 +7,7 @@
 | **Component ID** | SYS-01 |
 | **Layer** | System requirements spec |
 | **Type** | Requirements — defines *what* the clustering system must do, not *how* |
-| **Relates to** | [IF-01 IClusteringModel](interface-iclusteringmodel.md) · [IN-01 ClusterManager](module-cluster-manager.md) · [IN-04 RulesEngine](module-rules-engine.md) · [WHY_ARCANE](../../WHY_ARCANE.md) |
+| **Relates to** | [IF-01 IClusteringModel](interface-iclusteringmodel.md) · [IN-01 ArcaneManager](module-arcane-manager.md) · [IN-04 RulesEngine](module-rules-engine.md) · [WHY_ARCANE](../../WHY_ARCANE.md) |
 | **Language** | System-level English |
 | **Status** | Current as of 2026-04-21 |
 
@@ -15,7 +15,7 @@
 
 ## 1. Purpose
 
-This spec defines the **requirements and capabilities** of Arcane's clustering system at the system level. It is the system-level companion to [IF-01](interface-iclusteringmodel.md), which defines the interface contract for the model plugged into the ClusterManager.
+This spec defines the **requirements and capabilities** of Arcane's clustering system at the system level. It is the system-level companion to [IF-01](interface-iclusteringmodel.md), which defines the interface contract for the model plugged into the ArcaneManager.
 
 IF-01 answers *"what is the Rust trait the model implements?"* This spec answers *"what must the clustering system eventually do, end-to-end, to deliver the value proposition in [WHY_ARCANE](../../WHY_ARCANE.md)?"* It frames the responsibilities, input signals, outputs, and non-goals so contributors working on individual clustering epics can see how their work composes into the whole.
 
@@ -290,7 +290,7 @@ This is also the strongest empirical argument for why affinity clustering is a n
 ## 15. References
 
 - [IF-01 IClusteringModel](interface-iclusteringmodel.md) — interface contract the model implements.
-- [IN-01 ClusterManager](module-cluster-manager.md) — the component that calls the model.
+- [IN-01 ArcaneManager](module-arcane-manager.md) — the component that calls the model.
 - [IN-04 RulesEngine](module-rules-engine.md) — MVP static-rules implementation of IF-01.
 - [progressive-api.md](progressive-api.md) — design pillar this system respects.
 - [WHY_ARCANE.md](../../WHY_ARCANE.md) — external-facing positioning that pillar #1 (AI-driven affinity clustering) directly corresponds to.

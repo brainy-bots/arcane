@@ -1,12 +1,12 @@
 //! IClusteringModel (IF-01) — merge/split decision interface.
 //!
-//! Consumed by `arcane-infra::ClusterManager` to turn a `WorldStateView` into ordered actions.
+//! Consumed by `arcane-infra::ArcaneManager` to turn a `WorldStateView` into ordered actions.
 //! This module only models decision data; execution belongs to infra orchestration code.
 
 use crate::types::Vec2;
 use uuid::Uuid;
 
-/// View of world state passed to the clustering model. ClusterManager maintains this from SpacetimeDB subscriptions.
+/// View of world state passed to the clustering model. ArcaneManager maintains this from SpacetimeDB subscriptions.
 #[derive(Clone, Debug)]
 pub struct WorldStateView {
     /// Monotonic timestamp (seconds since epoch) of the snapshot.

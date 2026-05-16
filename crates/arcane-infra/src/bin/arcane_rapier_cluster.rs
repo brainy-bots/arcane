@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use arcane_core::ClusterSimulation;
-use arcane_infra::cluster_runner::{self, ClusterEnv};
+use arcane_infra::node_runner::{self, ClusterEnv};
 use arcane_infra::{RapierClusterSim, RapierConfig};
 
 fn main() -> Result<(), String> {
@@ -26,7 +26,7 @@ fn main() -> Result<(), String> {
     let rapier_sim: Arc<dyn ClusterSimulation> =
         Arc::new(RapierClusterSim::new(user_sim, RapierConfig::default()));
 
-    cluster_runner::run_cluster_loop(
+    node_runner::run_cluster_loop(
         env.cluster_id,
         env.redis_url,
         env.neighbor_ids,

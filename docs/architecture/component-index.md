@@ -24,7 +24,7 @@ Every component follows six principles that must not be violated when implementi
 The server has no knowledge of the client engine. It speaks TCP and WebSocket, exchanges structured binary or JSON messages, and exposes HTTP endpoints. The client adapter layer is the only place where engine-specific code lives. Adding a new engine means implementing the IClientAdapter interface — nothing else changes.
 
 ### Single Responsibility
-Each component owns exactly one concern. The Cluster Manager assigns players to servers. It does not simulate physics. The Arcane Node simulates physics. It does not make clustering decisions. Violations of this boundary are architectural debt that compounds over time.
+Each component owns exactly one concern. The ArcaneManager assigns players to servers. It does not simulate physics. The Arcane Node simulates physics. It does not make clustering decisions. Violations of this boundary are architectural debt that compounds over time.
 
 ### Interface-First
 Every component that has more than one possible implementation — the clustering model, the world simulator, the client adapter, the server pool — is defined by an interface before any implementation is written. This is how the MVP static rules are swapped for the ML model later without touching calling code.
@@ -36,7 +36,7 @@ Cross-cluster interactions are a real cost. Documents describe both the capabili
 Neighbor topology and merge/split are not fixed rules. They are driven by graph and ML optimization (relationships, interaction frequency, position, other factors). Cluster size has no hard lower bound — clusters can go as low as one player per server when needed to keep up with interaction load.
 
 ### SpacetimeDB write ownership
-Each entity has a single owning cluster at any time. Only that cluster's server may write that entity's state to SpacetimeDB; all other clusters (and the ClusterManager) only read. Ownership is stored and updated in SpacetimeDB; merge/split and handoff transfer ownership so there is exactly one writer per entity at all times.
+Each entity has a single owning cluster at any time. Only that cluster's server may write that entity's state to SpacetimeDB; all other clusters (and the ArcaneManager) only read. Ownership is stored and updated in SpacetimeDB; merge/split and handoff transfer ownership so there is exactly one writer per entity at all times.
 
 ### Terminology: cluster
 **Cluster** means one ArcaneNode (one node). The name refers to the cluster of *players* (or entities) assigned to that server — not a group of servers. So "cluster" = one server; "clustering" = how we assign players to clusters (and when to merge or split those assignments).
@@ -66,7 +66,7 @@ Components are grouped into four layers. Documents within each layer are written
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE LAYER                                                           │
 │  IClusteringModel · IServerPool · IReplicationChannel · IWorldSimulator        │
-│  ClusterManager · ArcaneNode · SpatialIndex · RulesEngine                   │
+│  ArcaneManager · ArcaneNode · SpatialIndex · RulesEngine                    │
 │  RPCHandler (optional) · ReplicationChannelManager · ArcaneNodePool       │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  AI LAYER                                                                       │
@@ -111,12 +111,12 @@ Components are grouped into four layers. Documents within each layer are written
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
-| IN-01 | ClusterManager | `in_01_cluster_manager.md` | Central coordinator. Assigns players to Arcane Nodes, maintains spatial index, publishes neighbor lists, invokes clustering model. |
+| IN-01 | ArcaneManager | `in_01_manager.md` | Central coordinator. Assigns players to Arcane Nodes, maintains spatial index, publishes neighbor lists, invokes clustering model. |
 | IN-02 | ArcaneNode | `in_02_arcane_node.md` | Simulation unit per cluster. Runs physics tick, AI, movement; publishes state to replication (Redis); subscribes to neighbors; calls SpacetimeDB reducers for discrete events (e.g. attack hit). Optional RPCHandler for non-game use. |
 | IN-03 | SpatialIndex | `in_03_spatial_index.md` | 2D coarse grid hash updated by Arcane Nodes. Drives proximity merge triggers and which clusters subscribe to which (neighbor discovery). |
 | IN-04 | RulesEngine | `in_04_rules_engine.md` | Evaluates merge and split conditions. Implements IClusteringModel. Stateless — pure function from world state to decisions. |
 | IN-05 | RPCHandler | `in_05_rpc_handler.md` | **Optional.** TCP endpoint for non-game server-to-server RPC (admin, tools). Game logic (attack, inventory) uses SpacetimeDB reducers, not TCP RPC. |
-| IN-06 | ReplicationChannelManager | `in_06_replication_channel_manager.md` | Manages which clusters each server subscribes to (and publishes to); replication transport is Redis pub/sub. Receives neighbor list updates from ClusterManager. |
+| IN-06 | ReplicationChannelManager | `in_06_replication_channel_manager.md` | Manages which clusters each server subscribes to (and publishes to); replication transport is Redis pub/sub. Receives neighbor list updates from ArcaneManager. |
 | IN-07 | ArcaneNodePool | `in_07_arcane_node_pool.md` | Implements IServerPool. Pre-provisioned local pool for development; ECS Fargate pool for production. |
 
 ### 3.5 AI Layer
@@ -150,7 +150,7 @@ A `·` means the row component depends on the column component.
 
 | | IF-01 | IF-02 | IF-03 | IF-04 | IN-01 | IN-02 | IN-03 | IN-04 | IN-05 | IN-06 | IN-07 | AI-02 | AI-03 | CA-01 |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **IN-01** ClusterManager | · | · | · | · | | | · | · | | | · | | | |
+| **IN-01** ArcaneManager | · | · | · | · | | | · | · | | | · | | | |
 | **IN-02** ArcaneNode | | | · | | · | | · | | · | · | | | | |
 | **IN-03** SpatialIndex | | | | | | | | | | | | | | |
 | **IN-04** RulesEngine | · | | | | | | · | | | | | | | |
@@ -171,12 +171,12 @@ A `·` means the row component depends on the column component.
 
 | Document | Purpose |
 |----------|---------|
-| `docs/END_TO_END_FLOWS.md` | Step-by-step flows: player join, merge, split. Order of operations and messages; references interfaces and components. Use when implementing ClusterManager, ArcaneNode, or client adapter. |
+| `docs/END_TO_END_FLOWS.md` | Step-by-step flows: player join, merge, split. Order of operations and messages; references interfaces and components. Use when implementing ArcaneManager, ArcaneNode, or client adapter. |
 | `ca_02_unreal_adapter.md` | CA-02 UnrealAdapter: UE5 implementation of IClientAdapter for the demo. Mass Entity for crowd rendering, WebSocket (Manager + Cluster), msgpack/JSON, threading, interpolation, validation checklist. |
-| `in_01_cluster_manager.md` | IN-01 ClusterManager: responsibilities, main loop, Manager WebSocket, SpacetimeDB subscribe/write, IClusteringModel cadence, guardrails, neighbor list, config, metrics, failure modes. |
+| `in_01_manager.md` | IN-01 ArcaneManager: responsibilities, main loop, Manager WebSocket, SpacetimeDB subscribe/write, IClusteringModel cadence, guardrails, neighbor list, config, metrics, failure modes. |
 | `docs/SPACETIMEDB_SCHEMA.md` | Base schema (cluster_assignments, entity_assignments, cluster_topology, entity_state) and base reducers; extension points for game-specific tables and columns. Who writes what, who subscribes to what. |
 | `in_02_arcane_node.md` | IN-02 ArcaneNode: tick loop, SpacetimeDB subscribe/write, replication publish/subscribe, Cluster WebSocket (STATE_UPDATE, PLAYER_INPUT, HANDOFF), RPC host, config, metrics, failure modes. |
-| `in_03_spatial_index.md` | IN-03 SpatialIndex: 2D coarse grid/hash, centroid + spread_radius, neighbor discovery (centroid + spread + observation_radius), API for ClusterManager; data from SpacetimeDB (entity_state) written by ArcaneNodes. |
+| `in_03_spatial_index.md` | IN-03 SpatialIndex: 2D coarse grid/hash, centroid + spread_radius, neighbor discovery (centroid + spread + observation_radius), API for ArcaneManager; data from SpacetimeDB (entity_state) written by ArcaneNodes. |
 | `in_06_replication_channel_manager.md` | IN-06 ReplicationChannelManager: runs on each ArcaneNode; subscribes to cluster_topology; opens/closes IReplicationChannel per neighbor; send_to_neighbors, on_receive, neighbor geometry for filtering; config, metrics, failure modes. |
 | `in_04_rules_engine.md` | IN-04 RulesEngine: static, non-ML implementation of IClusteringModel; evaluates WorldStateView with hand-written rules to propose merge/split decisions; config, thresholds, metrics, failure modes. |
 | `docs/BEST_PRACTICES_SPACETIMEDB_AND_CLUSTERS.md` | Best practices for game devs: simulation vs world state, what goes in clusters vs SpacetimeDB reducers, AI on cluster, recommended folder structure. |
@@ -215,7 +215,7 @@ Every component document follows this structure exactly.
 ### Interface Naming
 - All interfaces prefixed with `I` — `IClientAdapter`, `IClusteringModel`, `IServerPool`
 - Interface methods use present-tense verbs — `assign_player()`, `evaluate()`, `broadcast()`
-- Error types are component-scoped — `ClusterManagerError`, `RPCError`, not generic `Exception`
+- Error types are component-scoped — `ArcaneManagerError`, `RPCError`, not generic `Exception`
 
 ### Message Type Naming
 - All message types `UPPER_SNAKE_CASE` — `PLAYER_JOIN`, `CLUSTER_STATE_UPDATE`, `RPC_ATTACK`
@@ -223,7 +223,7 @@ Every component document follows this structure exactly.
 - Every message includes `sender_id`, `timestamp`, and `message_id` (UUID) for tracing
 
 ### Metric Naming
-- All metrics prefixed with `arcane_` — e.g. `arcane_cluster_manager_active_clusters`
+- All metrics prefixed with `arcane_` — e.g. `arcane_manager_active_clusters`
 - Label `component=` identifies the emitting component
 - Label `cluster_id=` on all cluster server metrics
 
@@ -235,12 +235,12 @@ Every server component binds to a fixed port offset from a base. All ports are o
 
 | Component | Port | Protocol | Purpose |
 |---|---|---|---|
-| ClusterManager | 8081 | WebSocket (JSON) | Player join/leave, cluster assignment, merge/split signals |
+| ArcaneManager | 8081 | WebSocket (JSON) | Player join/leave, cluster assignment, merge/split signals |
 | ArcaneNode | 8080 + n | WebSocket (msgpack) | Player state stream and input |
 | ArcaneNode RPC | 9200 + n | TCP | Cross-cluster RPC between servers |
 | ArcaneNode Replication | — | Redis pub/sub | Entity state broadcast; no direct cluster-to-cluster ports (TCP implementation optional: 9201 + n) |
 | ArcaneNode Metrics | 9090 + n | HTTP | Prometheus scrape endpoint |
-| ClusterManager Metrics | 9100 | HTTP | Prometheus scrape endpoint |
+| ArcaneManager Metrics | 9100 | HTTP | Prometheus scrape endpoint |
 
 > `n` is the server index assigned by ArcaneNodePool at startup. Port ranges must not overlap — confirm against POOL_SIZE before deployment.
 
@@ -248,11 +248,11 @@ Every server component binds to a fixed port offset from a base. All ports are o
 
 ## 9. Known Limitations and Production Path
 
-### ClusterManager Single Point of Failure
+### ArcaneManager Single Point of Failure
 
-The ClusterManager is a single process by design for the MVP. This is a known SPOF. Every client connection, cluster assignment, merge, and split flows through it.
+The ArcaneManager is a single process by design for the MVP. This is a known SPOF. Every client connection, cluster assignment, merge, and split flows through it.
 
-**How it works:** The ClusterManager only **updates state in SpacetimeDB** (assignments, topology). There is no transactional in-flight state: it reads the live view, runs the clustering model, and writes the result. Arcane Nodes read the new state from SpacetimeDB and adapt (subscribe/unsubscribe, etc.). If the ClusterManager dies before writing an update, that update simply never happened — state stays consistent. On failover, the new instance reads the current state from SpacetimeDB, re-evaluates with the model, and recomputes; no orphaned in-flight operations to recover.
+**How it works:** The ArcaneManager only **updates state in SpacetimeDB** (assignments, topology). There is no transactional in-flight state: it reads the live view, runs the clustering model, and writes the result. Arcane Nodes read the new state from SpacetimeDB and adapt (subscribe/unsubscribe, etc.). If the ArcaneManager dies before writing an update, that update simply never happened — state stays consistent. On failover, the new instance reads the current state from SpacetimeDB, re-evaluates with the model, and recomputes; no orphaned in-flight operations to recover.
 
 **Production path:** Warm standby process running continuously alongside the primary, connected to the same SpacetimeDB instance. Because all critical state lives in SpacetimeDB, a standby has full state at all times and can be promoted in seconds with no state transfer. A health check + automatic promotion script is sufficient for the first production deployment. Full Raft consensus or leader election is a later milestone.
 

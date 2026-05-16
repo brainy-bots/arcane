@@ -15,14 +15,14 @@ use std::sync::Arc;
 use arcane_core::ClusterSimulation;
 
 #[cfg(feature = "cluster-ws")]
-use arcane_infra::cluster_runner::{self, ClusterEnv};
+use arcane_infra::node_runner::{self, ClusterEnv};
 
 fn main() -> Result<(), String> {
     #[cfg(feature = "cluster-ws")]
     {
         arcane_infra::startup::raise_and_assert_fd_limit()?;
         let env = ClusterEnv::from_env()?;
-        cluster_runner::run_cluster_loop(
+        node_runner::run_cluster_loop(
             env.cluster_id,
             env.redis_url,
             env.neighbor_ids,

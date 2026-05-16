@@ -1,6 +1,6 @@
 //! Resolved cluster simulation tick rate, sourced from the environment.
 //!
-//! Single source of truth for `cluster_runner` (drives the tick loop) and
+//! Single source of truth for `node_runner` (drives the tick loop) and
 //! `spacetimedb_persist` (computes the persist cadence in ticks). Reading the
 //! env var in one place keeps the two from drifting if a future change moves
 //! the default.

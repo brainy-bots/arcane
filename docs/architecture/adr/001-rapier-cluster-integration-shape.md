@@ -137,7 +137,7 @@ The 38 `rapier_cluster::tests` cover every documented contract:
 
 ### Positive
 
-- Same `cluster_runner::run_cluster_loop` powers both vanilla and Rapier clusters; networking, replication, neighbor merge, persist are guaranteed identical (literally the same code).
+- Same `node_runner::run_cluster_loop` powers both vanilla and Rapier clusters; networking, replication, neighbor merge, persist are guaranteed identical (literally the same code).
 - Vanilla builds remain Rapier-free; existing benchmarks unaffected.
 - The wrapper composition pattern is the template for the next backend. The Unreal Cluster Node epic ([`#124`](https://github.com/brainy-bots/arcane/issues/124)) explicitly inherits the composition shape, the entity-keyed in-tick ops convention, and the spawn-time-hook pattern.
 

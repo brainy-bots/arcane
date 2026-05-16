@@ -18,7 +18,7 @@
 **What RPCHandler is:** An **optional** TCP endpoint (port 9200 + n per server) for **non-game** request–response calls (e.g. admin, tooling, stats). **Not** for game actions (combat, inventory). For those: ArcaneNode calls a SpacetimeDB reducer and sends RPC_RESULT to the client from the reducer return (IN-02, CA-01). Example (non-game): tooling asks cluster B for stats. B’s RPCHandler returns (request_id, result, payload). B’s RPCHandler returns (request_id, result, payload). No client RPC_RESULT flows through RPCHandler; game actions use SpacetimeDB reducers (IN-02, CA-01).
 
 **What RPCHandler is not:** It does **not** talk to SpacetimeDB. SpacetimeDB is used for:
-- **ClusterManager:** subscriptions (live view) and reducers (assignments, topology).
+- **ArcaneManager:** subscriptions (live view) and reducers (assignments, topology).
 - **ArcaneNode:** subscriptions (assignments, entity_state) and reducers (upsert_entity_state, delete_entity_state).
 
 RPC is for **immediate, request–response game actions** that change state on the **target cluster’s simulation**; that state is then persisted by the ArcaneNode’s normal tick (writes to SpacetimeDB). So: RPC → execute on cluster B → B’s simulation and SpacetimeDB writes are separate; the handler only triggers the local game logic and returns the outcome.
@@ -37,7 +37,7 @@ RPC is for **immediate, request–response game actions** that change state on t
 
 ## 3. What It Does NOT Do
 
-- **Communicate with SpacetimeDB** — No subscriptions, no reducers. SpacetimeDB is used by ClusterManager and by the ArcaneNode’s main loop (subscribe + write entity state). RPCHandler only triggers in-process game logic.
+- **Communicate with SpacetimeDB** — No subscriptions, no reducers. SpacetimeDB is used by ArcaneManager and by the ArcaneNode’s main loop (subscribe + write entity state). RPCHandler only triggers in-process game logic.
 - **Replicate entity state** — Replication (Redis pub/sub) is handled by ReplicationChannelManager and IReplicationChannel. RPC is request–response; replication is fire-and-forget state broadcast.
 - **Decide which cluster owns an entity** — Ownership comes from SpacetimeDB (entity_assignments). The **caller** server uses that (or a local cache) to decide “target is in cluster B” and thus to send the RPC to B’s RPCHandler.
 - **Send RPC_RESULT to the client** — The caller ArcaneNode sends RPC_RESULT over the client’s WebSocket. RPCHandler only returns the result to the caller server.

@@ -1,7 +1,7 @@
-//! IServerPool (IF-02) — cluster server allocation and release.
+//! IServerPool (IF-02) — node allocation and release.
 //!
-//! Consumed by manager orchestration (`arcane-infra::ClusterManager`) to provision and reclaim
-//! cluster hosts. Implementations live in crates like `arcane-pool`.
+//! Consumed by manager orchestration (`arcane-infra::ArcaneManager`) to provision and reclaim
+//! nodes. Implementations live in crates like `arcane-pool`.
 
 use uuid::Uuid;
 
@@ -59,12 +59,12 @@ pub struct PoolStatus {
     pub allocation_p99_ms: f32,
 }
 
-/// Contract for allocating and releasing cluster servers. Implemented by LocalPool and ECSPool.
+/// Contract for allocating and releasing nodes. Implemented by LocalPool and ECSPool.
 pub trait IServerPool: Send + Sync {
     /// Allocate an available server. Must return within latency contract (e.g. 100ms for LocalPool).
     fn allocate(&self) -> Result<ServerHandle, PoolError>;
 
-    /// Release a server back to the pool. ClusterManager calls after cluster is destroyed.
+    /// Release a server back to the pool. ArcaneManager calls after cluster is destroyed.
     fn release(&self, server_id: Uuid) -> Result<(), PoolError>;
 
     /// Report a failed server and optionally get a replacement.
