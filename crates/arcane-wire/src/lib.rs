@@ -130,6 +130,7 @@ pub struct EntityState {
     pub position: Vec3Q,
     pub velocity: Vec3Q,
     pub user_data: Vec<u8>,
+    pub client_seq: u64,
 }
 
 /// Server -> client: entity updates + removals for one tick.
@@ -150,6 +151,7 @@ pub struct PlayerStatePayload {
     pub position: Vec3Q,
     pub velocity: Vec3Q,
     pub user_data: Vec<u8>,
+    pub client_seq: u64,
 }
 
 /// Client -> server: game action routed through the cluster's action channel.
@@ -236,6 +238,7 @@ pub fn encode_entity_state(entity: &EntityState) -> Vec<u8> {
             position: Some(&pos),
             velocity: Some(&vel),
             user_data: ud,
+            client_seq: entity.client_seq,
         },
     );
 
@@ -259,6 +262,7 @@ fn entity_state_from_fb(es: &fb::EntityState) -> EntityState {
             .user_data()
             .map(|v| v.bytes().to_vec())
             .unwrap_or_default(),
+        client_seq: es.client_seq(),
     }
 }
 
@@ -284,6 +288,7 @@ pub fn encode_client(frame: &ClientFrame) -> Vec<u8> {
                     position: Some(&pos),
                     velocity: Some(&vel),
                     user_data: ud,
+                    client_seq: ps.client_seq,
                 },
             );
 
@@ -342,6 +347,7 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientFrame, Error> {
                     .user_data()
                     .map(|v| v.bytes().to_vec())
                     .unwrap_or_default(),
+                client_seq: ps.client_seq(),
             }))
         }
         fb::ClientPayload::Action => {
@@ -531,6 +537,7 @@ mod tests {
             position: q3(1.5, 2.0, -3.25),
             velocity: q3(0.0, 0.1, 0.0),
             user_data: b"{\"hp\":42}".to_vec(),
+            client_seq: 0xCAFE_BABE_DEAD_BEEF,
         }
     }
 
@@ -541,10 +548,55 @@ mod tests {
             position: q3(1.0, 2.0, 3.0),
             velocity: q3(0.5, 0.0, -0.5),
             user_data: Vec::new(),
+            client_seq: 0,
         });
         let bytes = encode_client(&frame);
         let back = decode_client(&bytes).unwrap();
         assert_eq!(frame, back);
+    }
+
+    #[test]
+    fn client_seq_nonzero_roundtrip_client_frame() {
+        let seq = 0xDEAD_BEEF_1234_5678_u64;
+        let frame = ClientFrame::PlayerState(PlayerStatePayload {
+            entity_id: Uuid::from_u128(42),
+            position: q3(10.0, 20.0, 30.0),
+            velocity: q3(1.0, 0.0, -1.0),
+            user_data: Vec::new(),
+            client_seq: seq,
+        });
+        let bytes = encode_client(&frame);
+        let back = decode_client(&bytes).unwrap();
+        let ClientFrame::PlayerState(p) = back else {
+            panic!("expected PlayerState");
+        };
+        assert_eq!(p.client_seq, seq);
+    }
+
+    #[test]
+    fn client_seq_nonzero_roundtrip_entity_state() {
+        let e = sample_entity();
+        assert_ne!(e.client_seq, 0, "sample_entity must use non-zero client_seq");
+        let bytes = encode_entity_state(&e);
+        let back = decode_entity_state(&bytes).unwrap();
+        assert_eq!(back.client_seq, e.client_seq);
+    }
+
+    #[test]
+    fn client_seq_nonzero_roundtrip_server_delta() {
+        let e = sample_entity();
+        let frame = ServerFrame::Delta(DeltaPayload {
+            source_cluster_id: Uuid::nil(),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: vec![e.clone()],
+            removed: vec![],
+        });
+        let bytes = encode_server(&frame);
+        let back = decode_server(&bytes).unwrap();
+        let ServerFrame::Delta(payload) = back;
+        assert_eq!(payload.updated[0].client_seq, e.client_seq);
     }
 
     #[test]
@@ -581,6 +633,7 @@ mod tests {
             position: q3(0.0, 0.0, 0.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         });
         let bytes = encode_client(&frame);
         let back = decode_client(&bytes).unwrap();
@@ -601,6 +654,7 @@ mod tests {
             position: q3(1.0, 2.0, 3.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: json_bytes,
+            client_seq: 0,
         });
 
         let wire_bytes = encode_client(&frame);
@@ -636,6 +690,7 @@ mod tests {
             position: q3(0.0, 0.0, 0.0),
             velocity: q3(0.25, -0.5, 0.75),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let removed = vec![Uuid::from_u128(0xdead), Uuid::from_u128(0xbeef)];
 
@@ -708,6 +763,7 @@ mod tests {
                 position: q3(i as f64, 0.0, 0.0),
                 velocity: q3(0.0, 0.0, 0.0),
                 user_data: Vec::new(),
+                client_seq: 0,
             };
             chunks.push(encode_entity_state(&e));
             entities.push(e);
@@ -742,6 +798,7 @@ mod tests {
             position: q3(1.0, 0.0, 0.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let e2 = EntityState {
             entity_id: Uuid::from_u128(2),
@@ -749,6 +806,7 @@ mod tests {
             position: q3(2.0, 0.0, 0.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let e3 = EntityState {
             entity_id: Uuid::from_u128(3),
@@ -756,6 +814,7 @@ mod tests {
             position: q3(3.0, 0.0, 0.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let c1 = encode_entity_state(&e1);
         let c2 = encode_entity_state(&e2);
@@ -782,6 +841,7 @@ mod tests {
             position: q3(1.0, 2.0, 3.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: br#"{"hp":99,"status":"poisoned"}"#.to_vec(),
+            client_seq: 0,
         };
         let chunk = encode_entity_state(&e);
 
@@ -838,6 +898,7 @@ mod tests {
             position: q3(1.0, 2.0, 3.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         });
         let bytes = encode_client(&frame);
         let truncated = &bytes[..bytes.len() - 1];
@@ -881,6 +942,7 @@ mod tests {
             position: q3(1.0, 2.0, 3.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         });
         let payload = encode_client(&frame);
         let checked = encode_with_checksum(&payload);
@@ -898,6 +960,7 @@ mod tests {
             position: q3(0.0, 0.0, 0.0),
             velocity: q3(0.0, 0.0, 0.0),
             user_data: b"hello".to_vec(),
+            client_seq: 0,
         }));
         let mut checked = encode_with_checksum(&payload);
         checked[5] ^= 0x01;

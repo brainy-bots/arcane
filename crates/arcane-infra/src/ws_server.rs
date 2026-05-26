@@ -96,6 +96,7 @@ fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntitySt
         Vec3::new(vel.x, vel.y, vel.z),
     );
     entry.user_data = user_data;
+    entry.client_seq = payload.client_seq;
     Some(entry)
 }
 
@@ -147,6 +148,7 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
             entity.velocity.z,
         )),
         user_data: user_data_bytes,
+        client_seq: entity.client_seq,
     };
     arcane_wire::encode_entity_state(&wire)
 }
@@ -667,6 +669,7 @@ mod tests {
             position: wire_q3(1.0, 2.0, 3.0),
             velocity: wire_q3(0.0, 0.1, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
         assert_eq!(entry.entity_id, id);
@@ -681,6 +684,7 @@ mod tests {
             position: wire_q3(0.0, 0.0, 0.0),
             velocity: wire_q3(0.0, 0.0, 0.0),
             user_data: serde_json::to_vec(&serde_json::json!({"hp": 99})).unwrap(),
+            client_seq: 0,
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
         assert_eq!(entry.user_data, serde_json::json!({"hp": 99}));
@@ -710,6 +714,7 @@ mod tests {
             position: wire_q3(1.25, 2.5, 3.75),
             velocity: wire_q3(0.1, 0.0, -0.1),
             user_data: Vec::new(),
+            client_seq: 0,
         });
         let bytes = arcane_wire::encode_client(&frame);
         let decoded = arcane_wire::decode_client(&bytes).unwrap();
@@ -894,6 +899,7 @@ mod tests {
                         e.velocity.z,
                     )),
                     user_data,
+                    client_seq: e.client_seq,
                 }
             })
             .collect();

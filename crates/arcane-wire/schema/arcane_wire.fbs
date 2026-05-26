@@ -33,6 +33,9 @@ table EntityState {
   /// Opaque application-replicated state (typically JSON bytes).
   /// Absent or empty means "no user_data set."
   user_data: [ubyte];
+  /// Client-assigned sequence number echoed back for round-trip latency.
+  /// Out-of-band — not part of the four-bucket entity model.
+  client_seq: uint64;
 }
 
 /// Server -> client: snapshot of entity updates + removals for one tick.
@@ -64,6 +67,8 @@ table PlayerStatePayload {
   position: Vec3Q;
   velocity: Vec3Q;
   user_data: [ubyte];
+  /// Client-assigned sequence number for round-trip latency measurement.
+  client_seq: uint64;
 }
 
 /// Client -> server: game action routed through the cluster's action channel.

@@ -74,6 +74,10 @@ pub struct EntityStateEntry {
     /// Redis, or crafted payloads). Only this process may set `local_data` in memory after deserialize.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub local_data: serde_json::Value,
+    /// Client-assigned sequence number echoed back for round-trip latency measurement.
+    /// Out-of-band — not part of the four-bucket model, never replicated via Redis.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub client_seq: u64,
 }
 
 impl EntityStateEntry {
@@ -87,6 +91,7 @@ impl EntityStateEntry {
             velocity,
             user_data: serde_json::Value::Null,
             local_data: serde_json::Value::Null,
+            client_seq: 0,
         }
     }
 }
