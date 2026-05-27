@@ -78,6 +78,11 @@ pub struct EntityStateEntry {
     /// Out-of-band — not part of the four-bucket model, never replicated via Redis.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub client_seq: u64,
+    /// Raw wire bytes of `user_data`, cached to avoid re-serialization on broadcast.
+    /// Set at the wire boundary (`entry_from_wire_player_state`); empty when the
+    /// entry was created programmatically (demo agents, tests).
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub user_data_bytes: Vec<u8>,
 }
 
 impl EntityStateEntry {
@@ -92,6 +97,7 @@ impl EntityStateEntry {
             user_data: serde_json::Value::Null,
             local_data: serde_json::Value::Null,
             client_seq: 0,
+            user_data_bytes: Vec::new(),
         }
     }
 }

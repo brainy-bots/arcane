@@ -134,6 +134,11 @@ impl ArcaneNode {
                 game_actions,
                 neighbor_entities,
             });
+            // Simulation may have mutated user_data without updating the
+            // cached wire bytes. Clear so encode_entity_chunk re-serializes.
+            for entry in entities.values_mut() {
+                entry.user_data_bytes.clear();
+            }
         }
         for id in pending_removals {
             self.remove_entity(id);

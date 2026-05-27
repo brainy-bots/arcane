@@ -82,10 +82,11 @@ fn should_backoff_on_accept_error(e: &std::io::Error) -> bool {
 /// code stays in continuous f64. Quantized i16 is always finite by
 /// construction, so the previous NaN/inf gate is unnecessary.
 fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntityStateEntry> {
-    let user_data = if payload.user_data.is_empty() {
-        serde_json::Value::Null
+    let (user_data, user_data_bytes) = if payload.user_data.is_empty() {
+        (serde_json::Value::Null, Vec::new())
     } else {
-        serde_json::from_slice(&payload.user_data).ok()?
+        let val = serde_json::from_slice(&payload.user_data).ok()?;
+        (val, payload.user_data.clone())
     };
     let pos = payload.position.to_vec3();
     let vel = payload.velocity.to_vec3();
@@ -96,6 +97,7 @@ fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntitySt
         Vec3::new(vel.x, vel.y, vel.z),
     );
     entry.user_data = user_data;
+    entry.user_data_bytes = user_data_bytes;
     entry.client_seq = payload.client_seq;
     Some(entry)
 }
@@ -125,10 +127,11 @@ fn game_action_from_wire(payload: &GameActionPayload) -> Option<GameAction> {
 /// that can fail to serialize), so this is a defensive fallback rather than
 /// a meaningful error path.
 fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
-    let user_data_bytes = if entity.user_data.is_null() {
+    let user_data_bytes = if !entity.user_data_bytes.is_empty() {
+        entity.user_data_bytes.clone()
+    } else if entity.user_data.is_null() {
         Vec::new()
     } else {
-        // Shouldn't fail for any valid Value; log-and-drop is fine if it does.
         serde_json::to_vec(&entity.user_data).unwrap_or_default()
     };
     // Quantize at the wire boundary: continuous f64 sim positions become i16
@@ -160,11 +163,17 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
 ///
 /// Entity chunks are `Arc<Vec<u8>>` so N subscribers share one allocation per
 /// entity per tick — the whole point of this struct and of Shape B.
+///
+/// `shared_full_frame` is the pre-assembled wire frame containing ALL
+/// entities. Subscribers with no visibility filter send this directly,
+/// avoiding per-subscriber chunk concatenation entirely. With N subscribers
+/// and E entities this reduces fan-out from O(N×E) to O(E).
 struct PreEncodedTick {
     header: DeltaHeader,
     entity_chunks: Vec<Arc<Vec<u8>>>,
     removed: Vec<Uuid>,
     entity_metadata: Vec<(Uuid, Vec3)>,
+    shared_full_frame: Arc<Vec<u8>>,
 }
 
 /// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
@@ -204,16 +213,24 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
         .iter()
         .map(|e| (e.entity_id, e.position))
         .collect();
+    let header = DeltaHeader {
+        source_cluster_id: delta.source_cluster_id,
+        seq: delta.seq,
+        tick: delta.tick,
+        timestamp: delta.timestamp,
+    };
+    let chunk_refs: Vec<&[u8]> = entity_chunks.iter().map(|c| c.as_slice()).collect();
+    let shared_full_frame = Arc::new(arcane_wire::encode_server_delta_from_chunks(
+        &header,
+        &chunk_refs,
+        &delta.removed,
+    ));
     PreEncodedTick {
-        header: DeltaHeader {
-            source_cluster_id: delta.source_cluster_id,
-            seq: delta.seq,
-            tick: delta.tick,
-            timestamp: delta.timestamp,
-        },
+        header,
         entity_chunks,
         removed: delta.removed.clone(),
         entity_metadata,
+        shared_full_frame,
     }
 }
 
@@ -537,14 +554,19 @@ async fn ws_loop(
                     result = recv.recv() => {
                         match result {
                             Ok(broadcast_arc) => {
-                                // Subscriber-side work: look up precomputed mask
-                                // (if any), and assemble a wire-compatible frame.
-                                // No per-entity re-serialization or per-entity
-                                // filter calls happen here.
-                                let mask = broadcast_arc.masks.get(&subscriber_id).map(|m| m.as_slice());
-                                let bytes = assemble_outbound_frame(&broadcast_arc.tick, mask);
-                                let byte_len = bytes.len() as u64;
-                                if ws_stream.send(Message::Binary(bytes)).await.is_err() {
+                                let mask = broadcast_arc.masks.get(&subscriber_id);
+                                let (bytes, byte_len) = match mask {
+                                    Some(m) => {
+                                        let b = assemble_outbound_frame(&broadcast_arc.tick, Some(m.as_slice()));
+                                        let len = b.len() as u64;
+                                        (Message::Binary(b), len)
+                                    }
+                                    None => {
+                                        let len = broadcast_arc.tick.shared_full_frame.len() as u64;
+                                        (Message::Binary((*broadcast_arc.tick.shared_full_frame).clone()), len)
+                                    }
+                                };
+                                if ws_stream.send(bytes).await.is_err() {
                                     stats.ws_send_errors.fetch_add(1, Ordering::Relaxed);
                                     break;
                                 }
@@ -765,6 +787,32 @@ mod tests {
         let chunk = encode_entity_chunk(&entry);
         let wire = arcane_wire::decode_entity_state(&chunk).unwrap();
         assert!(wire.user_data.is_empty());
+    }
+
+    /// Encoding via cached `user_data_bytes` must produce identical wire output
+    /// to encoding via `serde_json::to_vec(&user_data)` (the uncached path).
+    #[test]
+    fn encode_entity_chunk_cached_vs_uncached_byte_parity() {
+        let json = serde_json::json!({"hp": 42, "name": "test"});
+        let json_bytes = serde_json::to_vec(&json).unwrap();
+
+        let mut cached = EntityStateEntry::new(
+            Uuid::from_u128(55),
+            Uuid::from_u128(1),
+            Vec3::new(10.0, 20.0, 30.0),
+            Vec3::new(1.0, 0.0, -1.0),
+        );
+        cached.user_data = json.clone();
+        cached.user_data_bytes = json_bytes;
+
+        let mut uncached = cached.clone();
+        uncached.user_data_bytes = Vec::new();
+
+        assert_eq!(
+            encode_entity_chunk(&cached),
+            encode_entity_chunk(&uncached),
+            "cached user_data_bytes path must produce identical wire bytes to uncached path"
+        );
     }
 
     /// Producer path end-to-end: build a delta, pre-encode it into chunks,
@@ -1181,5 +1229,42 @@ mod tests {
         let bytes_none_mask = assemble_outbound_frame(&pre_tick, None);
 
         assert_eq!(bytes_no_mask, bytes_none_mask);
+    }
+
+    /// The pre-built `shared_full_frame` must be byte-identical to what
+    /// `assemble_outbound_frame(tick, None)` produces on demand.
+    #[test]
+    fn shared_full_frame_equals_assemble_no_mask() {
+        let mut entities = Vec::new();
+        for i in 0..20_u128 {
+            let mut e = EntityStateEntry::new(
+                Uuid::from_u128(i),
+                Uuid::from_u128(77),
+                Vec3::new(i as f64, (i as f64) * 0.5, 0.0),
+                Vec3::new(1.0, 0.0, -1.0),
+            );
+            if i % 3 == 0 {
+                e.user_data = serde_json::json!({"kind": "npc", "idx": i});
+            }
+            entities.push(e);
+        }
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(77),
+            seq: 42,
+            tick: 500,
+            timestamp: 12345.678,
+            updated: entities,
+            removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+        let assembled = assemble_outbound_frame(&pre_tick, None);
+
+        assert_eq!(
+            assembled,
+            pre_tick.shared_full_frame.as_slice(),
+            "shared_full_frame must be byte-identical to assemble_outbound_frame(tick, None)"
+        );
     }
 }
