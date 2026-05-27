@@ -185,11 +185,7 @@ where
             server.add_entity(entry);
         }
         while let Ok(delta) = neighbor_rx.try_recv() {
-            for mut entry in delta.updated {
-                if entry.user_data_bytes.is_empty() && !entry.user_data.is_null() {
-                    entry.user_data_bytes =
-                        serde_json::to_vec(&entry.user_data).unwrap_or_default();
-                }
+            for entry in delta.updated {
                 neighbor_last_seen.insert(entry.entity_id, tick_count);
                 neighbor_entities.insert(entry.entity_id, entry);
             }
@@ -534,59 +530,5 @@ mod tests {
         assert_eq!(neighbor_entities.len(), 2);
         assert!(neighbor_entities.contains_key(&e1.entity_id));
         assert!(neighbor_entities.contains_key(&e2.entity_id));
-    }
-
-    #[test]
-    fn neighbor_ingest_populates_user_data_bytes() {
-        let mut entry = mk_entry(Uuid::from_u128(500), Uuid::from_u128(2), 5.0);
-        entry.user_data = serde_json::json!({"hp": 100, "armor": "iron"});
-        assert!(
-            entry.user_data_bytes.is_empty(),
-            "precondition: skip_deserializing leaves bytes empty"
-        );
-
-        let delta = EntityStateDelta {
-            source_cluster_id: Uuid::from_u128(2),
-            seq: 1,
-            tick: 1,
-            timestamp: 0.0,
-            updated: vec![entry],
-            removed: vec![],
-        };
-
-        let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
-        for mut e in delta.updated {
-            if e.user_data_bytes.is_empty() && !e.user_data.is_null() {
-                e.user_data_bytes = serde_json::to_vec(&e.user_data).unwrap_or_default();
-            }
-            neighbor_entities.insert(e.entity_id, e);
-        }
-
-        let stored = &neighbor_entities[&Uuid::from_u128(500)];
-        assert!(
-            !stored.user_data_bytes.is_empty(),
-            "user_data_bytes must be populated at neighbor ingest"
-        );
-        let recovered: serde_json::Value = serde_json::from_slice(&stored.user_data_bytes).unwrap();
-        assert_eq!(recovered, serde_json::json!({"hp": 100, "armor": "iron"}));
-    }
-
-    #[test]
-    fn neighbor_ingest_skips_bytes_for_null_user_data() {
-        let entry = mk_entry(Uuid::from_u128(501), Uuid::from_u128(2), 5.0);
-        assert!(entry.user_data.is_null());
-
-        let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
-        let mut e = entry;
-        if e.user_data_bytes.is_empty() && !e.user_data.is_null() {
-            e.user_data_bytes = serde_json::to_vec(&e.user_data).unwrap_or_default();
-        }
-        neighbor_entities.insert(e.entity_id, e);
-
-        let stored = &neighbor_entities[&Uuid::from_u128(501)];
-        assert!(
-            stored.user_data_bytes.is_empty(),
-            "null user_data should not populate user_data_bytes"
-        );
     }
 }

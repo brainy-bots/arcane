@@ -82,11 +82,10 @@ fn should_backoff_on_accept_error(e: &std::io::Error) -> bool {
 /// code stays in continuous f64. Quantized i16 is always finite by
 /// construction, so the previous NaN/inf gate is unnecessary.
 fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntityStateEntry> {
-    let (user_data, user_data_bytes) = if payload.user_data.is_empty() {
-        (serde_json::Value::Null, Vec::new())
+    let user_data = if payload.user_data.is_empty() {
+        serde_json::Value::Null
     } else {
-        let val = serde_json::from_slice(&payload.user_data).ok()?;
-        (val, payload.user_data.clone())
+        serde_json::from_slice(&payload.user_data).ok()?
     };
     let pos = payload.position.to_vec3();
     let vel = payload.velocity.to_vec3();
@@ -97,7 +96,6 @@ fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntitySt
         Vec3::new(vel.x, vel.y, vel.z),
     );
     entry.user_data = user_data;
-    entry.user_data_bytes = user_data_bytes;
     entry.client_seq = payload.client_seq;
     Some(entry)
 }
@@ -127,9 +125,7 @@ fn game_action_from_wire(payload: &GameActionPayload) -> Option<GameAction> {
 /// that can fail to serialize), so this is a defensive fallback rather than
 /// a meaningful error path.
 fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
-    let user_data_bytes = if !entity.user_data_bytes.is_empty() {
-        entity.user_data_bytes.clone()
-    } else if entity.user_data.is_null() {
+    let user_data_bytes = if entity.user_data.is_null() {
         Vec::new()
     } else {
         serde_json::to_vec(&entity.user_data).unwrap_or_default()
@@ -787,32 +783,6 @@ mod tests {
         let chunk = encode_entity_chunk(&entry);
         let wire = arcane_wire::decode_entity_state(&chunk).unwrap();
         assert!(wire.user_data.is_empty());
-    }
-
-    /// Encoding via cached `user_data_bytes` must produce identical wire output
-    /// to encoding via `serde_json::to_vec(&user_data)` (the uncached path).
-    #[test]
-    fn encode_entity_chunk_cached_vs_uncached_byte_parity() {
-        let json = serde_json::json!({"hp": 42, "name": "test"});
-        let json_bytes = serde_json::to_vec(&json).unwrap();
-
-        let mut cached = EntityStateEntry::new(
-            Uuid::from_u128(55),
-            Uuid::from_u128(1),
-            Vec3::new(10.0, 20.0, 30.0),
-            Vec3::new(1.0, 0.0, -1.0),
-        );
-        cached.user_data = json.clone();
-        cached.user_data_bytes = json_bytes;
-
-        let mut uncached = cached.clone();
-        uncached.user_data_bytes = Vec::new();
-
-        assert_eq!(
-            encode_entity_chunk(&cached),
-            encode_entity_chunk(&uncached),
-            "cached user_data_bytes path must produce identical wire bytes to uncached path"
-        );
     }
 
     /// Producer path end-to-end: build a delta, pre-encode it into chunks,
