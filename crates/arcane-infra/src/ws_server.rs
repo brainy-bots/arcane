@@ -8,7 +8,7 @@
 //!
 //! ## Wire format
 //!
-//! All client/server framing is **postcard binary** via the [`arcane_wire`]
+//! All client/server framing is **FlatBuffer binary** via the [`arcane_wire`]
 //! crate. JSON was supported historically but has been removed — the cluster
 //! speaks one wire format end-to-end, which makes broadcast fan-out cheap
 //! (pre-encode once at the producer, share bytes via Arc across subscribers)
@@ -19,7 +19,7 @@
 //!
 //! ## Broadcast fan-out — Shape B
 //!
-//! Each tick the producer serializes every entity **once** to a postcard byte
+//! Each tick the producer serializes every entity **once** to a FlatBuffer byte
 //! chunk, builds a [`PreEncodedTick`] holding `Arc<Vec<u8>>` chunks plus the
 //! delta header and removed-id list, and broadcasts that to all subscribers.
 //! Per-client tasks assemble their outbound frame by selecting which entity
@@ -96,6 +96,7 @@ fn entry_from_wire_player_state(payload: &PlayerStatePayload) -> Option<EntitySt
         Vec3::new(vel.x, vel.y, vel.z),
     );
     entry.user_data = user_data;
+    entry.client_seq = payload.client_seq;
     Some(entry)
 }
 
@@ -114,7 +115,7 @@ fn game_action_from_wire(payload: &GameActionPayload) -> Option<GameAction> {
     })
 }
 
-/// Convert one cluster-internal [`EntityStateEntry`] to a postcard-encoded
+/// Convert one cluster-internal [`EntityStateEntry`] to a FlatBuffer-encoded
 /// [`WireEntityState`] byte chunk. Producer calls this once per entity per
 /// tick; the resulting bytes are shared across all subscribers via
 /// [`PreEncodedTick`].
@@ -127,7 +128,6 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
     let user_data_bytes = if entity.user_data.is_null() {
         Vec::new()
     } else {
-        // Shouldn't fail for any valid Value; log-and-drop is fine if it does.
         serde_json::to_vec(&entity.user_data).unwrap_or_default()
     };
     // Quantize at the wire boundary: continuous f64 sim positions become i16
@@ -147,8 +147,9 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
             entity.velocity.z,
         )),
         user_data: user_data_bytes,
+        client_seq: entity.client_seq,
     };
-    arcane_wire::encode_entity_state(&wire).unwrap_or_default()
+    arcane_wire::encode_entity_state(&wire)
 }
 
 /// Per-tick snapshot assembled once by the producer and broadcast to all
@@ -158,11 +159,17 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
 ///
 /// Entity chunks are `Arc<Vec<u8>>` so N subscribers share one allocation per
 /// entity per tick — the whole point of this struct and of Shape B.
+///
+/// `shared_full_frame` is the pre-assembled wire frame containing ALL
+/// entities. Subscribers with no visibility filter send this directly,
+/// avoiding per-subscriber chunk concatenation entirely. With N subscribers
+/// and E entities this reduces fan-out from O(N×E) to O(E).
 struct PreEncodedTick {
     header: DeltaHeader,
     entity_chunks: Vec<Arc<Vec<u8>>>,
     removed: Vec<Uuid>,
     entity_metadata: Vec<(Uuid, Vec3)>,
+    shared_full_frame: Arc<Vec<u8>>,
 }
 
 /// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
@@ -202,26 +209,31 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
         .iter()
         .map(|e| (e.entity_id, e.position))
         .collect();
+    let header = DeltaHeader {
+        source_cluster_id: delta.source_cluster_id,
+        seq: delta.seq,
+        tick: delta.tick,
+        timestamp: delta.timestamp,
+    };
+    let chunk_refs: Vec<&[u8]> = entity_chunks.iter().map(|c| c.as_slice()).collect();
+    let shared_full_frame = Arc::new(arcane_wire::encode_server_delta_from_chunks(
+        &header,
+        &chunk_refs,
+        &delta.removed,
+    ));
     PreEncodedTick {
-        header: DeltaHeader {
-            source_cluster_id: delta.source_cluster_id,
-            seq: delta.seq,
-            tick: delta.tick,
-            timestamp: delta.timestamp,
-        },
+        header,
         entity_chunks,
         removed: delta.removed.clone(),
         entity_metadata,
+        shared_full_frame,
     }
 }
 
 /// Assemble the outbound wire frame for one subscriber from a shared
 /// [`PreEncodedTick`] and a precomputed visibility mask.
 /// The mask is a boolean vector where `true` means the entity is visible.
-fn assemble_outbound_frame(
-    tick: &PreEncodedTick,
-    mask: Option<&[bool]>,
-) -> Result<Vec<u8>, arcane_wire::Error> {
+fn assemble_outbound_frame(tick: &PreEncodedTick, mask: Option<&[bool]>) -> Vec<u8> {
     let chunk_refs: Vec<&[u8]> = match mask {
         Some(m) => tick
             .entity_chunks
@@ -431,7 +443,7 @@ async fn ws_loop(
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
 ) {
-    // Broadcast carries a TickBroadcast — per-entity postcard chunks plus
+    // Broadcast carries a TickBroadcast — per-entity FlatBuffer chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
     // Subscribers assemble their outbound frame from the shared chunks via
     // arcane_wire::encode_server_delta_from_chunks with a precomputed mask.
@@ -538,17 +550,19 @@ async fn ws_loop(
                     result = recv.recv() => {
                         match result {
                             Ok(broadcast_arc) => {
-                                // Subscriber-side work: look up precomputed mask
-                                // (if any), and assemble a wire-compatible frame.
-                                // No per-entity re-serialization or per-entity
-                                // filter calls happen here.
-                                let mask = broadcast_arc.masks.get(&subscriber_id).map(|m| m.as_slice());
-                                let bytes = match assemble_outbound_frame(&broadcast_arc.tick, mask) {
-                                    Ok(b) => b,
-                                    Err(_) => continue,
+                                let mask = broadcast_arc.masks.get(&subscriber_id);
+                                let (bytes, byte_len) = match mask {
+                                    Some(m) => {
+                                        let b = assemble_outbound_frame(&broadcast_arc.tick, Some(m.as_slice()));
+                                        let len = b.len() as u64;
+                                        (Message::Binary(b), len)
+                                    }
+                                    None => {
+                                        let len = broadcast_arc.tick.shared_full_frame.len() as u64;
+                                        (Message::Binary((*broadcast_arc.tick.shared_full_frame).clone()), len)
+                                    }
                                 };
-                                let byte_len = bytes.len() as u64;
-                                if ws_stream.send(Message::Binary(bytes)).await.is_err() {
+                                if ws_stream.send(bytes).await.is_err() {
                                     stats.ws_send_errors.fetch_add(1, Ordering::Relaxed);
                                     break;
                                 }
@@ -673,6 +687,7 @@ mod tests {
             position: wire_q3(1.0, 2.0, 3.0),
             velocity: wire_q3(0.0, 0.1, 0.0),
             user_data: Vec::new(),
+            client_seq: 0,
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
         assert_eq!(entry.entity_id, id);
@@ -687,6 +702,7 @@ mod tests {
             position: wire_q3(0.0, 0.0, 0.0),
             velocity: wire_q3(0.0, 0.0, 0.0),
             user_data: serde_json::to_vec(&serde_json::json!({"hp": 99})).unwrap(),
+            client_seq: 0,
         };
         let entry = entry_from_wire_player_state(&payload).expect("parse");
         assert_eq!(entry.user_data, serde_json::json!({"hp": 99}));
@@ -716,8 +732,9 @@ mod tests {
             position: wire_q3(1.25, 2.5, 3.75),
             velocity: wire_q3(0.1, 0.0, -0.1),
             user_data: Vec::new(),
+            client_seq: 0,
         });
-        let bytes = arcane_wire::encode_client(&frame).unwrap();
+        let bytes = arcane_wire::encode_client(&frame);
         let decoded = arcane_wire::decode_client(&bytes).unwrap();
         let ClientFrame::PlayerState(payload) = decoded else {
             panic!("expected PlayerState variant");
@@ -732,7 +749,7 @@ mod tests {
     //    assemble_outbound_frame ─────────────────────────────────────────
 
     /// A chunk produced by `encode_entity_chunk` must be a valid standalone
-    /// postcard encoding of a `WireEntityState` — i.e. decode round-trip
+    /// FlatBuffer encoding of a `WireEntityState` — i.e. decode round-trip
     /// succeeds through `arcane_wire`'s primitives.
     #[test]
     fn encode_entity_chunk_produces_decodable_wire_entity_state() {
@@ -803,7 +820,7 @@ mod tests {
         assert_eq!(pre_tick.header.seq, 7);
         assert_eq!(pre_tick.header.tick, 42);
 
-        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
 
@@ -835,7 +852,7 @@ mod tests {
             removed: Vec::new(),
         };
         let pre_tick = pre_encode_tick(&delta);
-        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         assert!(payload.updated.is_empty());
@@ -873,8 +890,7 @@ mod tests {
             removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
 
-        let via_shape_b =
-            assemble_outbound_frame(&pre_encode_tick(&delta), None).expect("shape-b bytes");
+        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta), None);
 
         // Reference: build the wire DeltaPayload by materializing every
         // WireEntityState inline, encode as one ServerFrame::Delta — the
@@ -901,6 +917,7 @@ mod tests {
                         e.velocity.z,
                     )),
                     user_data,
+                    client_seq: e.client_seq,
                 }
             })
             .collect();
@@ -912,8 +929,7 @@ mod tests {
             updated: wire_updated,
             removed: delta.removed.clone(),
         };
-        let via_reference =
-            arcane_wire::encode_server(&ServerFrame::Delta(reference_payload)).expect("ref bytes");
+        let via_reference = arcane_wire::encode_server(&ServerFrame::Delta(reference_payload));
 
         assert_eq!(
             via_shape_b, via_reference,
@@ -971,7 +987,7 @@ mod tests {
 
         // Also verify end-to-end frame decodes identically to what a
         // serial encode would have produced.
-        let bytes = assemble_outbound_frame(&pre_tick, None).expect("assemble");
+        let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded;
         for (i, e) in payload.updated.iter().enumerate() {
@@ -1093,7 +1109,7 @@ mod tests {
         let observer_pos = Vec3::new(0.0, 0.0, 0.0);
         let filter = MockRadiusFilter::new(10.0);
         let mask = filter.filter(observer_pos, &pre_tick.entity_metadata);
-        let bytes_filtered = assemble_outbound_frame(&pre_tick, Some(&mask)).expect("filtered");
+        let bytes_filtered = assemble_outbound_frame(&pre_tick, Some(&mask));
 
         // Decode the filtered frame
         let decoded_filtered =
@@ -1141,7 +1157,7 @@ mod tests {
         let pre_tick = pre_encode_tick(&delta);
 
         // No filter (None)
-        let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None).expect("unfiltered");
+        let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None);
 
         // Decode the unfiltered frame
         let decoded_unfiltered =
@@ -1179,9 +1195,46 @@ mod tests {
         let pre_tick = pre_encode_tick(&delta);
 
         // Both should produce identical bytes when mask is None
-        let bytes_no_mask = assemble_outbound_frame(&pre_tick, None).expect("no mask");
-        let bytes_none_mask = assemble_outbound_frame(&pre_tick, None).expect("none mask");
+        let bytes_no_mask = assemble_outbound_frame(&pre_tick, None);
+        let bytes_none_mask = assemble_outbound_frame(&pre_tick, None);
 
         assert_eq!(bytes_no_mask, bytes_none_mask);
+    }
+
+    /// The pre-built `shared_full_frame` must be byte-identical to what
+    /// `assemble_outbound_frame(tick, None)` produces on demand.
+    #[test]
+    fn shared_full_frame_equals_assemble_no_mask() {
+        let mut entities = Vec::new();
+        for i in 0..20_u128 {
+            let mut e = EntityStateEntry::new(
+                Uuid::from_u128(i),
+                Uuid::from_u128(77),
+                Vec3::new(i as f64, (i as f64) * 0.5, 0.0),
+                Vec3::new(1.0, 0.0, -1.0),
+            );
+            if i % 3 == 0 {
+                e.user_data = serde_json::json!({"kind": "npc", "idx": i});
+            }
+            entities.push(e);
+        }
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(77),
+            seq: 42,
+            tick: 500,
+            timestamp: 12345.678,
+            updated: entities,
+            removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+        let assembled = assemble_outbound_frame(&pre_tick, None);
+
+        assert_eq!(
+            assembled,
+            pre_tick.shared_full_frame.as_slice(),
+            "shared_full_frame must be byte-identical to assemble_outbound_frame(tick, None)"
+        );
     }
 }

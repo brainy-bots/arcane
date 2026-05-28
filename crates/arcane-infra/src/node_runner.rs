@@ -274,7 +274,7 @@ where
                                  // Extended ArcaneServerStats: adds ws_accepts / msgs / parse_failures so log-only
                                  // analysis (no /stats query) can still surface silent failures.
             eprintln!(
-                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={}",
+                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={} bytes_out={} lagged_events={} lagged_frames={} send_err={}",
                 entities,
                 clusters,
                 tick_elapsed_ms,
@@ -283,6 +283,10 @@ where
                 stats.msgs_game_action.load(Ordering::Relaxed),
                 stats.parse_failures.load(Ordering::Relaxed),
                 stats.bytes_in.load(Ordering::Relaxed),
+                stats.bytes_out.load(Ordering::Relaxed),
+                stats.broadcast_lagged_events.load(Ordering::Relaxed),
+                stats.broadcast_lagged_frames.load(Ordering::Relaxed),
+                stats.ws_send_errors.load(Ordering::Relaxed),
             );
         }
         thread::sleep(interval);
