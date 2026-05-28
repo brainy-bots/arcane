@@ -576,7 +576,10 @@ mod tests {
     #[test]
     fn client_seq_nonzero_roundtrip_entity_state() {
         let e = sample_entity();
-        assert_ne!(e.client_seq, 0, "sample_entity must use non-zero client_seq");
+        assert_ne!(
+            e.client_seq, 0,
+            "sample_entity must use non-zero client_seq"
+        );
         let bytes = encode_entity_state(&e);
         let back = decode_entity_state(&bytes).unwrap();
         assert_eq!(back.client_seq, e.client_seq);
