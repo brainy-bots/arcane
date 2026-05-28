@@ -1823,7 +1823,9 @@ pub mod arcane_wire {
     /// catch every error, or be maximally performant. For the
     /// previous, unchecked, behavior use
     /// `root_as_server_frame_unchecked`.
-    pub fn root_as_server_frame(buf: &[u8]) -> Result<ServerFrame, flatbuffers::InvalidFlatbuffer> {
+    pub fn root_as_server_frame(
+        buf: &[u8],
+    ) -> Result<ServerFrame<'_>, flatbuffers::InvalidFlatbuffer> {
         flatbuffers::root::<ServerFrame>(buf)
     }
     #[inline]
@@ -1835,7 +1837,7 @@ pub mod arcane_wire {
     /// `size_prefixed_root_as_server_frame_unchecked`.
     pub fn size_prefixed_root_as_server_frame(
         buf: &[u8],
-    ) -> Result<ServerFrame, flatbuffers::InvalidFlatbuffer> {
+    ) -> Result<ServerFrame<'_>, flatbuffers::InvalidFlatbuffer> {
         flatbuffers::size_prefixed_root::<ServerFrame>(buf)
     }
     #[inline]
@@ -1868,14 +1870,14 @@ pub mod arcane_wire {
     /// Assumes, without verification, that a buffer of bytes contains a ServerFrame and returns it.
     /// # Safety
     /// Callers must trust the given bytes do indeed contain a valid `ServerFrame`.
-    pub unsafe fn root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame {
+    pub unsafe fn root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame<'_> {
         flatbuffers::root_unchecked::<ServerFrame>(buf)
     }
     #[inline]
     /// Assumes, without verification, that a buffer of bytes contains a size prefixed ServerFrame and returns it.
     /// # Safety
     /// Callers must trust the given bytes do indeed contain a valid size prefixed `ServerFrame`.
-    pub unsafe fn size_prefixed_root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame {
+    pub unsafe fn size_prefixed_root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame<'_> {
         flatbuffers::size_prefixed_root_unchecked::<ServerFrame>(buf)
     }
     #[inline]
