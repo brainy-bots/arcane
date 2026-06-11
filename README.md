@@ -1,6 +1,6 @@
 # Arcane — Rust library
 
-Multiplayer backend library: cluster management, replication, and reference server. Use this crate for your game server or backend; use **arcane-client-unreal** for the Unreal Engine client plugin.
+Multiplayer backend library: affinity clustering, node management, and replication, plus a reference server. Use this workspace for your game server or backend. Engine client plugins (Unreal Engine first) are developed in separate repositories.
 
 **New readers:** for the positioning story — what Arcane is, who it's for, and how it compares to SpacetimeDB, Unreal/Unity dedicated servers, and traditional MMO backends — see [`WHY_ARCANE.md`](WHY_ARCANE.md).
 
@@ -8,11 +8,13 @@ Multiplayer backend library: cluster management, replication, and reference serv
 
 | Crate | Description |
 |-------|-------------|
-| **arcane-core** | Traits and shared types (no I/O). |
-| **arcane-spatial** | SpatialIndex — 2D grid for neighbor discovery. |
-| **arcane-rules** | RulesEngine — clustering decisions. |
+| **arcane-core** | Traits and shared types — `IClusteringModel`, `IServerPool`, `IReplicationChannel` (no I/O). |
+| **arcane-affinity** | AffinityEngine — interaction-weighted clustering: interaction graph, cluster scoring, migration hysteresis. Integration into the live manager loop is in progress. |
+| **arcane-wire** | FlatBuffers wire format — single `.fbs` schema shared by the Rust server and all engine client plugins. |
+| **arcane-spatial** | SpatialIndex — in-memory entity/cluster index for neighbor and geometry queries (flat linear-scan implementation; a spatial-grid index is planned). |
+| **arcane-rules** | RulesEngine — minimal rule-based `IClusteringModel` stub. |
 | **arcane-pool** | LocalPool — server pool implementation. |
-| **arcane-infra** | ArcaneManager, ArcaneNode, replication; binaries `arcane-cluster` and `arcane-manager`. |
+| **arcane-infra** | ArcaneManager, ArcaneNode, Rapier physics nodes, replication; binaries `arcane-node`, `arcane-manager`, `arcane-rapier-node`. |
 
 ## Build and test
 
@@ -30,47 +32,18 @@ See [docs/WS_CHANNEL_BACKPRESSURE_VALIDATION.md](docs/WS_CHANNEL_BACKPRESSURE_VA
 ## Reference server
 
 - **Manager** (HTTP join): `cargo run -p arcane-infra --bin arcane-manager --features manager`
-- **Cluster** (WebSocket + Redis): `cargo run -p arcane-infra --bin arcane-cluster --features cluster-ws`
+- **Node** (WebSocket + Redis): `cargo run -p arcane-infra --bin arcane-node --features cluster-ws`
+- **Rapier physics node**: `cargo run -p arcane-infra --bin arcane-rapier-node --features rapier-cluster`
 
-See [arcane-demos](https://github.com/brainy-bots/arcane-demos) for a full demo (backend + Unreal client and scripts).
+See [arcane-demos](https://github.com/brainy-bots/arcane-demos) for a full demo (backend + client and scripts).
 
-## Unreal client
+## Engine plugins
 
-The Unreal Engine client plugin lives in a separate repo: **arcane-client-unreal**. Add it to your project's `Plugins/` folder.
+Engine client plugins expose Arcane through each engine's native idioms (the wire format and conceptual model are shared; the API surface is engine-native). The Unreal Engine plugin is in active development and will be published separately.
 
-## Development vault
+## Benchmarks
 
-The [`arcane-vault/`](arcane-vault/) directory is an [Obsidian](https://obsidian.md/) knowledge vault that documents how Arcane was built. It was generated from the full history of AI coding sessions (Cursor IDE + Claude Code) using an LLM-powered pipeline inspired by [Karpathy's LLM-wiki approach](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
-
-**Contents:**
-
-| Folder | What's in it |
-|--------|-------------|
-| `conversations/` | One distilled note per coding session — summary, key decisions, problems solved, entities mentioned |
-| `entities/` | Concept pages for every system, interface, and component — cross-linked with `[[wikilinks]]` |
-| `timeline.md` | Chronological narrative of the project from first spec to current state |
-| `00-INDEX.md` | Master navigation table |
-| `SCHEMA.md` | Vault conventions and how to update |
-
-**Opening in Obsidian:**
-
-1. Install [Obsidian](https://obsidian.md/) (free for local use)
-2. **Open folder as vault** → select `arcane-vault/`
-3. Open **Graph view** (left sidebar) to explore the concept map — 20 conversation nodes + 99 entity nodes, all interconnected
-
-**Regenerating the vault:**
-
-The vault is built by `arcane-vault-builder.py` in the repo root. It reads chat exports from `arcane-scaling-benchmarks/` and READMEs from all Arcane repos, then calls the Anthropic API to summarize and cross-link everything.
-
-```bash
-pip install anthropic
-export ANTHROPIC_API_KEY=<your-key>
-python arcane-vault-builder.py            # estimate cost
-python arcane-vault-builder.py --sample   # process one file (sanity check)
-python arcane-vault-builder.py --confirm  # full build (~$10, ~20 min)
-```
-
-Intermediate results are cached in `.vault-build/` (gitignored). Re-runs skip already-processed files.
+Published, reproducible scaling benchmarks live in [arcane-scaling-benchmarks](https://github.com/brainy-bots/arcane-scaling-benchmarks) — one documented command provisions, runs, and destroys the full AWS fleet.
 
 ## Star History
 
