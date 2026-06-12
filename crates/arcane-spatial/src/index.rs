@@ -159,7 +159,7 @@ impl SpatialIndex {
         // Add to new cell
         self.grid
             .entry(new_cell)
-            .or_insert_with(std::collections::HashSet::new)
+            .or_insert_with(Default::default)
             .insert(cluster_id);
     }
 
@@ -208,8 +208,8 @@ impl SpatialIndex {
         // Search radius must include spread of this cluster and max possible spread of others
         let max_spread = self
             .clusters
-            .iter()
-            .filter_map(|(cid, _)| self.get_cluster_geometry(*cid).map(|g| g.spread_radius))
+            .keys()
+            .filter_map(|cid| self.get_cluster_geometry(*cid).map(|g| g.spread_radius))
             .fold(0.0_f64, f64::max);
         let search_radius = effective_self + max_spread + self.observation_radius;
         let nearby_cells = query_cell.cells_within_radius(search_radius, self.grid_cell_size);
@@ -284,8 +284,8 @@ impl SpatialIndex {
     pub fn snapshot_for_view(&self) -> Vec<ClusterGeometry> {
         let mut result: Vec<ClusterGeometry> = self
             .clusters
-            .iter()
-            .filter_map(|(cluster_id, _)| self.get_cluster_geometry(*cluster_id))
+            .keys()
+            .filter_map(|cluster_id| self.get_cluster_geometry(*cluster_id))
             .collect();
         result.sort_by_key(|g| g.cluster_id);
         result
