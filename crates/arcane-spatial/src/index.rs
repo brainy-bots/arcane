@@ -157,10 +157,7 @@ impl SpatialIndex {
         }
         self.grid.retain(|_, clusters| !clusters.is_empty());
         // Add to new cell
-        self.grid
-            .entry(new_cell)
-            .or_insert_with(Default::default)
-            .insert(cluster_id);
+        self.grid.entry(new_cell).or_default().insert(cluster_id);
     }
 
     /// Remove an entity (despawn or reassignment). Updates that cluster's centroid and spread.
