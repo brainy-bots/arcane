@@ -7,13 +7,15 @@
 //! Internally uses per-cluster entity buckets and a grid over cluster centroids.
 
 use arcane_core::types::{ClusterGeometry, Vec3};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Per-cluster entity bucket: stores entity data.
+/// Per-cluster entity bucket: stores entity data with cached geometry.
 struct ClusterBucket {
     entities: HashMap<Uuid, Vec3>,
     position_sum: Vec3,
+    cached_geometry: RefCell<Option<ClusterGeometry>>,
 }
 
 impl ClusterBucket {
@@ -21,6 +23,7 @@ impl ClusterBucket {
         Self {
             entities: HashMap::new(),
             position_sum: Vec3::new(0.0, 0.0, 0.0),
+            cached_geometry: RefCell::new(None),
         }
     }
 
@@ -29,6 +32,7 @@ impl ClusterBucket {
         self.position_sum.x += position.x;
         self.position_sum.y += position.y;
         self.position_sum.z += position.z;
+        *self.cached_geometry.borrow_mut() = None; // Mark cache invalid
     }
 
     fn remove_entity(&mut self, entity_id: Uuid) -> Option<Vec3> {
@@ -36,17 +40,20 @@ impl ClusterBucket {
             self.position_sum.x -= position.x;
             self.position_sum.y -= position.y;
             self.position_sum.z -= position.z;
+            *self.cached_geometry.borrow_mut() = None; // Mark cache invalid
             Some(position)
         } else {
             None
         }
     }
 
-    fn compute_geometry(&self, cluster_id: Uuid) -> Option<ClusterGeometry> {
+    fn compute_and_cache_geometry(&mut self, cluster_id: Uuid) -> Option<ClusterGeometry> {
         let count = self.entities.len();
         if count == 0 {
+            *self.cached_geometry.borrow_mut() = None;
             return None;
         }
+
         let n = count as f64;
         let centroid = Vec3 {
             x: self.position_sum.x / n,
@@ -58,12 +65,19 @@ impl ClusterBucket {
             .values()
             .map(|p| p.distance_sq_to(&centroid).sqrt())
             .fold(0.0_f64, f64::max);
-        Some(ClusterGeometry {
+
+        let geom = ClusterGeometry {
             cluster_id,
             centroid,
             spread_radius,
             entity_count: count as u32,
-        })
+        };
+        *self.cached_geometry.borrow_mut() = Some(geom.clone());
+        Some(geom)
+    }
+
+    fn get_cached_geometry(&self) -> Option<ClusterGeometry> {
+        self.cached_geometry.borrow().clone()
     }
 }
 
@@ -102,6 +116,8 @@ pub struct SpatialIndex {
     entity_to_cluster: HashMap<Uuid, Uuid>,
     /// grid_cell -> set of cluster_ids in that cell
     grid: HashMap<GridCell, std::collections::HashSet<Uuid>>,
+    /// cluster_id -> current grid_cell (reverse map for O(1) cell lookup on move)
+    cluster_to_cell: HashMap<Uuid, GridCell>,
 }
 
 impl SpatialIndex {
@@ -118,6 +134,7 @@ impl SpatialIndex {
             clusters: HashMap::new(),
             entity_to_cluster: HashMap::new(),
             grid: HashMap::new(),
+            cluster_to_cell: HashMap::new(),
         }
     }
 
@@ -130,34 +147,48 @@ impl SpatialIndex {
                     bucket.remove_entity(entity_id);
                     if bucket.entities.is_empty() {
                         self.clusters.remove(&old_cluster_id);
-                        // Remove old cluster from all grid cells
-                        for cell_clusters in self.grid.values_mut() {
-                            cell_clusters.remove(&old_cluster_id);
+                        // Remove from grid using reverse map (O(1) instead of O(grid cells))
+                        if let Some(old_cell) = self.cluster_to_cell.remove(&old_cluster_id) {
+                            if let Some(cell_clusters) = self.grid.get_mut(&old_cell) {
+                                cell_clusters.remove(&old_cluster_id);
+                                if cell_clusters.is_empty() {
+                                    self.grid.remove(&old_cell);
+                                }
+                            }
                         }
-                        // Clean up empty cells
-                        self.grid.retain(|_, clusters| !clusters.is_empty());
                     }
                 }
             }
         }
 
-        // Add/update entity in new cluster
-        let bucket = self
-            .clusters
-            .entry(cluster_id)
-            .or_insert_with(ClusterBucket::new);
-        bucket.add_entity(entity_id, position);
-        self.entity_to_cluster.insert(entity_id, cluster_id);
+        // Add/update entity in new cluster and update grid position based on centroid
+        let old_cell = self.cluster_to_cell.get(&cluster_id).copied();
+        {
+            let bucket = self
+                .clusters
+                .entry(cluster_id)
+                .or_insert_with(ClusterBucket::new);
+            bucket.add_entity(entity_id, position);
+            // Compute and cache geometry immediately after modifying bucket
+            if let Some(geom) = bucket.compute_and_cache_geometry(cluster_id) {
+                let new_cell = GridCell::from_position(geom.centroid, self.grid_cell_size);
 
-        // Update grid: move cluster from old cells to new cell
-        let new_cell = GridCell::from_position(position, self.grid_cell_size);
-        // Find and remove from old cells
-        for cell_clusters in self.grid.values_mut() {
-            cell_clusters.remove(&cluster_id);
+                // Move cluster from old cell to new cell if cell changed (O(1) per move)
+                if old_cell != Some(new_cell) {
+                    if let Some(old) = old_cell {
+                        if let Some(cell_clusters) = self.grid.get_mut(&old) {
+                            cell_clusters.remove(&cluster_id);
+                            if cell_clusters.is_empty() {
+                                self.grid.remove(&old);
+                            }
+                        }
+                    }
+                    self.grid.entry(new_cell).or_default().insert(cluster_id);
+                    self.cluster_to_cell.insert(cluster_id, new_cell);
+                }
+            }
         }
-        self.grid.retain(|_, clusters| !clusters.is_empty());
-        // Add to new cell
-        self.grid.entry(new_cell).or_default().insert(cluster_id);
+        self.entity_to_cluster.insert(entity_id, cluster_id);
     }
 
     /// Remove an entity (despawn or reassignment). Updates that cluster's centroid and spread.
@@ -167,11 +198,15 @@ impl SpatialIndex {
                 bucket.remove_entity(entity_id);
                 if bucket.entities.is_empty() {
                     self.clusters.remove(&cluster_id);
-                    // Remove empty cluster from grid
-                    for cell_clusters in self.grid.values_mut() {
-                        cell_clusters.remove(&cluster_id);
+                    // Remove empty cluster from grid using reverse map (O(1))
+                    if let Some(old_cell) = self.cluster_to_cell.remove(&cluster_id) {
+                        if let Some(cell_clusters) = self.grid.get_mut(&old_cell) {
+                            cell_clusters.remove(&cluster_id);
+                            if cell_clusters.is_empty() {
+                                self.grid.remove(&old_cell);
+                            }
+                        }
                     }
-                    self.grid.retain(|_, clusters| !clusters.is_empty());
                 }
             }
             self.entity_to_cluster.remove(&entity_id);
@@ -185,9 +220,39 @@ impl SpatialIndex {
 
     /// Return centroid, spread_radius, and entity_count for a cluster, or None if not in index.
     pub fn get_cluster_geometry(&self, cluster_id: Uuid) -> Option<ClusterGeometry> {
-        self.clusters
-            .get(&cluster_id)
-            .and_then(|bucket| bucket.compute_geometry(cluster_id))
+        self.clusters.get(&cluster_id).and_then(|bucket| {
+            // Return cached geometry if available
+            if let Some(cached) = bucket.get_cached_geometry() {
+                return Some(cached);
+            }
+
+            // Compute geometry on-demand if not cached (fallback for clusters not yet updated via update_entity)
+            let count = bucket.entities.len();
+            if count == 0 {
+                return None;
+            }
+
+            let n = count as f64;
+            let centroid = Vec3 {
+                x: bucket.position_sum.x / n,
+                y: bucket.position_sum.y / n,
+                z: bucket.position_sum.z / n,
+            };
+            let spread_radius = bucket
+                .entities
+                .values()
+                .map(|p| p.distance_sq_to(&centroid).sqrt())
+                .fold(0.0_f64, f64::max);
+
+            let geom = ClusterGeometry {
+                cluster_id,
+                centroid,
+                spread_radius,
+                entity_count: count as u32,
+            };
+            *bucket.cached_geometry.borrow_mut() = Some(geom.clone());
+            Some(geom)
+        })
     }
 
     /// Return cluster_ids whose effective area (centroid + spread_radius + observation_radius) overlaps this cluster's.
@@ -449,5 +514,55 @@ mod tests {
                 cell_size
             );
         }
+    }
+
+    #[test]
+    fn grid_placement_by_centroid_not_last_entity() {
+        // Regression test: old code placed clusters by last-updated entity position,
+        // not centroid. This could cause clusters to be placed far from their actual center,
+        // leading to missing neighbors.
+        let mut index = SpatialIndex::with_cell_size(50.0);
+        index.set_observation_radius(10.0);
+
+        let cluster_a = uuid(1);
+        let cluster_b = uuid(2);
+
+        // Cluster A: centered at (100, 0, 100) but last entity updated at far edge (150, 0, 150)
+        index.update_entity(uuid(10), cluster_a, Vec3::new(100.0, 0.0, 100.0));
+        index.update_entity(uuid(11), cluster_a, Vec3::new(110.0, 0.0, 110.0)); // Update at edge
+        index.update_entity(uuid(12), cluster_a, Vec3::new(150.0, 0.0, 150.0)); // Last update at far edge
+
+        // Cluster B: centered at (130, 0, 130), overlaps with A's centroid but not with A's last-updated position
+        index.update_entity(uuid(20), cluster_b, Vec3::new(130.0, 0.0, 130.0));
+        index.update_entity(uuid(21), cluster_b, Vec3::new(140.0, 0.0, 140.0));
+
+        // If code placed cluster A by last-updated position (150, 0, 150), it would be in a different cell
+        // and might miss cluster B as a neighbor. But with centroid-based placement, they should be neighbors.
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            cluster_a,
+            vec![
+                Vec3::new(100.0, 0.0, 100.0),
+                Vec3::new(110.0, 0.0, 110.0),
+                Vec3::new(150.0, 0.0, 150.0),
+            ],
+        );
+        clusters.insert(
+            cluster_b,
+            vec![Vec3::new(130.0, 0.0, 130.0), Vec3::new(140.0, 0.0, 140.0)],
+        );
+
+        let brute_force_a = brute_force_neighbors(&clusters, 10.0, cluster_a);
+        let grid_a = index.get_neighbors(cluster_a);
+
+        // B should be in A's neighbors
+        assert!(
+            brute_force_a.contains(&cluster_b),
+            "brute force must find B as neighbor of A"
+        );
+        assert_eq!(
+            grid_a, brute_force_a,
+            "grid must match brute force (B must be A's neighbor)"
+        );
     }
 }
