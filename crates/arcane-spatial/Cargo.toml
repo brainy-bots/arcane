@@ -7,3 +7,7 @@ description = "Arcane Engine — SpatialIndex (IN-03), 2D coarse grid for neighb
 [dependencies]
 arcane-core = { path = "../arcane-core" }
 uuid = { version = "1.0", features = ["v4"] }
+
+[[bench]]
+name = "spatial_grid_bench"
+harness = false
