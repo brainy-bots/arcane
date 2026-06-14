@@ -4,6 +4,45 @@
 //! ownership and timing to the driver. `NodeCore::new()` runs all setup (Redis start,
 //! channel creation, I/O thread spawning); `NodeCore::tick()` executes one iteration of
 //! the loop body (drain inputs, simulate, tick, broadcast).
+//!
+//! ## Frozen pump-mode contract (E2 boundary)
+//!
+//! The following surface is **frozen** and forms the C-ABI boundary for E2 (`arcane#175`):
+//! one batched `submit_entities()` per tick, non-blocking `pump()`, and `drain_inputs()`
+//! carrying everything a `ClusterTickContext` needs.
+//!
+//! **Methods:**
+//! - `drain_inputs(&mut self, out: &mut NodeInputs)` — driver → core. Non-blocking drain of client updates,
+//!   game actions, inbound physics events, and neighbor state. Populates `NodeInputs` (which contains
+//!   `client_updates`, `game_actions`, `neighbor_entities`, `inbound_physics`).
+//! - `submit_entities(&mut self, spine: &[EntityStateEntry], removed: &[Uuid])` — driver → core.
+//!   Writes the tick's authoritative spine (position, velocity, owned entities) and explicit removals
+//!   into the node map. Call once per tick before `pump()`.
+//! - `pump(&mut self) -> PumpOutcome` — core work cycle. Non-blocking. Publishes routed physics ops,
+//!   ticks the server (`server.tick()` → `EntityStateDelta`), merges with neighbor snapshot,
+//!   persists (if configured), broadcasts to clients, and updates stats. Returns `PumpOutcome`
+//!   (tick, seq, entity_count).
+//! - `submit_routed_physics_ops(&mut self, Vec<(Uuid, PhysicsEvent)>)` — driver → core.
+//!   Buffers routed physics ops for publication in `pump()`.
+//!
+//! **Data structures:**
+//! - `NodeInputs` — buffer for `drain_inputs()` output: client updates, game actions, neighbor entities, inbound physics.
+//! - `PumpOutcome` — observation struct: tick, seq, entity_count at the moment of production.
+//!
+//! **Iteration pattern (driver responsibility):**
+//! ```text
+//! loop {
+//!   core.drain_inputs(&mut inputs);
+//!   // driver processes inputs via its own ClusterSimulation
+//!   core.submit_entities(&spine, &removed);
+//!   core.submit_routed_physics_ops(ops);
+//!   core.pump();
+//! }
+//! ```
+//!
+//! This contract pins the inversion: the driver owns the simulation loop and iteration,
+//! the core handles I/O plumbing and state publication. No live `NodeCore` or Redis in tests;
+//! the `ArcaneNode` and `NodeInputs` suffice for determinism verification (see `tests/arcane_node_determinism.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
