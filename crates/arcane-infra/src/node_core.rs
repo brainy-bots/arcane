@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
-use arcane_core::cluster_simulation::{ClusterSimulation, GameAction};
+use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -100,11 +100,8 @@ pub struct NodeCore {
     stats: Arc<NodeStats>,
     tick_count: u64,
     cluster_id: Uuid,
+    #[allow(dead_code)]
     dt_seconds: f64,
-    #[allow(dead_code)]
-    submitted_entities: Vec<EntityStateEntry>,
-    #[allow(dead_code)]
-    submitted_removals: Vec<Uuid>,
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
@@ -180,148 +177,19 @@ impl NodeCore {
             tick_count: 0,
             cluster_id: cfg.cluster_id,
             dt_seconds,
-            submitted_entities: Vec::new(),
-            submitted_removals: Vec::new(),
             submitted_routed_physics: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
         })
     }
 
-    /// Execute one iteration of the node loop body: drain inputs, simulate, tick, broadcast.
-    /// Does NOT sleep or own the loop. `tick_count` is pre-incremented (current iteration's count
-    /// before the increment) — this matches the existing semantics where logging and neighbor
-    /// bookkeeping use the pre-increment value.
-    ///
-    /// ⚠️ **TRANSITIONAL**: This method's signature and semantics are not frozen. The `submit/pump/drain`
-    /// surface introduced in sub-issue #2 will replace this interface and resolve where `ClusterSimulation`
-    /// runs (today it runs inside `ArcaneNode::simulate_before_tick`; ownership may shift).
-    /// For this sub-issue, keeping the sim call inside `tick` preserves today's behavior exactly.
-    pub fn tick(
-        &mut self,
-        simulation: Option<&dyn ClusterSimulation>,
-        extra_entities: Vec<EntityStateEntry>,
-    ) {
-        while let Ok(mut entry) = self.client_updates_rx.try_recv() {
-            entry.cluster_id = self.cluster_id;
-            self.server.add_entity(entry);
-        }
-        for mut entry in extra_entities {
-            entry.cluster_id = self.cluster_id;
-            self.server.add_entity(entry);
-        }
-        while let Ok(delta) = self.neighbor_rx.try_recv() {
-            for entry in delta.updated {
-                self.neighbor_last_seen
-                    .insert(entry.entity_id, self.tick_count);
-                self.neighbor_entities.insert(entry.entity_id, entry);
-            }
-            for removed_id in &delta.removed {
-                self.neighbor_entities.remove(removed_id);
-                self.neighbor_last_seen.remove(removed_id);
-            }
-        }
-        const PRUNE_INTERVAL_TICKS: u64 = 60;
-        if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
-            self.neighbor_last_seen.retain(|id, last_seen| {
-                let keep = self.tick_count - *last_seen <= NEIGHBOR_STALE_TICKS;
-                if !keep {
-                    self.neighbor_entities.remove(id);
-                }
-                keep
-            });
-        }
-        let mut tick_actions = Vec::new();
-        while let Ok(action) = self.game_actions_rx.try_recv() {
-            tick_actions.push(action);
-        }
-        let mut inbound_physics = Vec::new();
-        while let Ok(batch) = self.physics_events_rx.try_recv() {
-            inbound_physics.push(batch);
-        }
-        if let Some(sim) = simulation {
-            if !inbound_physics.is_empty() {
-                sim.apply_inbound_physics_events(inbound_physics);
-            }
-        }
-
-        let tick_start = Instant::now();
-        let upcoming_tick = self.server.current_tick() + 1;
-        self.server.simulate_before_tick(
-            self.dt_seconds,
-            upcoming_tick,
-            simulation,
-            &tick_actions,
-            &self.neighbor_entities,
-        );
-
-        if let Some(sim) = simulation {
-            let routed = sim.drain_routed_physics_ops();
-            if !routed.is_empty() {
-                if let Err(e) = self.physics_publisher.publish(self.cluster_id, routed) {
-                    eprintln!("physics events publish error: {}", e);
-                }
-            }
-        }
-
-        let our_delta = self.server.tick();
-        let tick_elapsed = tick_start.elapsed();
-        let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
-        let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
-        #[cfg(feature = "spacetimedb-persist")]
-        if let Some(ref persist) = self.persist {
-            persist.maybe_persist(self.tick_count, &merged_delta.updated);
-        }
-
-        let _ = self.state_tx.send(merged_delta);
-
-        self.stats.set_entities(self.server.entity_count() as u64);
-        self.stats
-            .tick
-            .store(self.server.current_tick(), Ordering::Relaxed);
-        self.stats
-            .seq
-            .store(self.server.current_seq() as u64, Ordering::Relaxed);
-        self.stats
-            .last_tick_us
-            .store(tick_elapsed.as_micros() as u64, Ordering::Relaxed);
-
-        self.tick_count += 1;
-        if self.tick_count.is_multiple_of(LOG_EVERY_TICKS) {
-            eprintln!(
-                "tick {} seq {}",
-                self.server.current_tick(),
-                self.server.current_seq()
-            );
-        }
-        if self.tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
-            let entities = self.server.entity_count();
-            let clusters = 1u32;
-            eprintln!(
-                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={} bytes_out={} lagged_events={} lagged_frames={} send_err={}",
-                entities,
-                clusters,
-                tick_elapsed_ms,
-                self.stats.ws_accepts.load(Ordering::Relaxed),
-                self.stats.msgs_player_state.load(Ordering::Relaxed),
-                self.stats.msgs_game_action.load(Ordering::Relaxed),
-                self.stats.parse_failures.load(Ordering::Relaxed),
-                self.stats.bytes_in.load(Ordering::Relaxed),
-                self.stats.bytes_out.load(Ordering::Relaxed),
-                self.stats.broadcast_lagged_events.load(Ordering::Relaxed),
-                self.stats.broadcast_lagged_frames.load(Ordering::Relaxed),
-                self.stats.ws_send_errors.load(Ordering::Relaxed),
-            );
-        }
-    }
-
     /// Current tick count (pre-increment value, before this iteration's increment).
-    /// The driver calls `extra_entities_for_tick(tick_count())` before `tick()` to allow
+    /// The driver calls `extra_entities_for_tick(current_tick())` before the simulation loop to allow
     /// the driver to generate entities for this iteration.
     ///
-    /// **Query method.** Reads the atomic tick counter; no I/O, no side effects.
-    pub fn tick_count(&self) -> u64 {
-        self.tick_count
+    /// **Query method.** Reads the tick counter; no I/O, no side effects.
+    pub fn current_tick(&self) -> u64 {
+        self.server.current_tick()
     }
 
     /// Core → driver. Drains client updates, game actions, inbound physics; accumulates & prunes
