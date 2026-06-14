@@ -8,16 +8,18 @@
 //! - publishes merged state to `ws_server`
 //! - optionally persists snapshots through `spacetimedb_persist`
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use arcane_core::cluster_simulation::ClusterSimulation;
+use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext};
+use arcane_core::physics_events::PhysicsEvent;
 use arcane_core::replication_channel::EntityStateEntry;
 use uuid::Uuid;
 
 #[cfg(feature = "cluster-ws")]
-use crate::node_core::{NodeConfig, NodeCore};
+use crate::node_core::{NodeConfig, NodeCore, NodeInputs};
 
 /// Node-binary environment configuration (NODE_ID, REDIS_URL,
 /// NEIGHBOR_IDS, NODE_WS_PORT). Shared by every node-binary entry point
@@ -66,7 +68,7 @@ impl NodeEnv {
 /// Each tick, after applying client updates, calls `extra_entities_for_tick(tick_count)` and pushes any returned entries into the server (e.g. demo agents from arcane-demo).
 ///
 /// When `simulation` is `Some`, [`ClusterSimulation::on_tick`] runs after those steps and before
-/// [`ArcaneNode::tick`], using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
+/// publishing the spine, using `1 / tick_rate_hz()` as `dt_seconds` (env-driven, see
 /// [`crate::tick_rate`]). Never returns on success (infinite loop); returns Err only if setup fails.
 #[cfg(feature = "cluster-ws")]
 pub fn run_node_loop<F>(
@@ -89,10 +91,63 @@ where
 
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     let interval = Duration::from_millis(1000 / tick_rate_hz);
+    let dt_seconds = interval.as_secs_f64();
+
+    // Driver owns the authoritative world map (Model B). The sim mutates it in place each tick;
+    // it persists across ticks exactly as ArcaneNode's internal map did before.
+    let mut world: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+    let mut inputs = NodeInputs::default();
 
     loop {
-        let extra = extra_entities_for_tick(core.tick_count());
-        core.tick(simulation.as_ref().map(|s| s.as_ref()), extra);
+        // 1. Core -> driver.
+        core.drain_inputs(&mut inputs);
+
+        // 2. Apply client updates + injected entities into the world (stamp cluster_id),
+        //    matching the old loop + add_entity ordering (client updates first, then extras).
+        for mut e in inputs.client_updates.drain(..) {
+            e.cluster_id = cluster_id;
+            world.insert(e.entity_id, e);
+        }
+        for mut e in extra_entities_for_tick(core.current_tick()) {
+            e.cluster_id = cluster_id;
+            world.insert(e.entity_id, e);
+        }
+
+        // 3. Driver steps its ClusterSimulation against the world map.
+        let mut removals: Vec<Uuid> = Vec::new();
+        let mut routed: Vec<(Uuid, PhysicsEvent)> = Vec::new();
+        if let Some(ref sim) = simulation {
+            if !inputs.inbound_physics.is_empty() {
+                sim.apply_inbound_physics_events(std::mem::take(&mut inputs.inbound_physics));
+            }
+            let upcoming_tick = core.current_tick() + 1;
+            sim.on_tick(&mut ClusterTickContext {
+                cluster_id,
+                tick: upcoming_tick,
+                dt_seconds,
+                entities: &mut world,
+                pending_removals: &mut removals,
+                game_actions: &inputs.game_actions,
+                neighbor_entities: &inputs.neighbor_entities,
+            });
+            routed = sim.drain_routed_physics_ops();
+        }
+
+        // 4. Apply removals to the world so the submitted spine excludes them.
+        for id in &removals {
+            world.remove(id);
+        }
+
+        // 5. Driver -> core: full authoritative spine + explicit removals + routed physics.
+        let spine: Vec<EntityStateEntry> = world.values().cloned().collect();
+        core.submit_entities(&spine, &removals);
+        if !routed.is_empty() {
+            core.submit_routed_physics_ops(routed);
+        }
+
+        // 6. Core: transport / replication / persistence / broadcast (non-blocking).
+        core.pump();
+
         thread::sleep(interval);
     }
     // unreachable
