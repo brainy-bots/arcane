@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
-use arcane_core::cluster_simulation::ClusterSimulation;
+use arcane_core::cluster_simulation::{ClusterSimulation, GameAction};
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
@@ -38,6 +38,22 @@ pub struct NodeConfig {
     pub ws_port: u16,
 }
 
+/// Inputs the driver's ClusterSimulation needs this tick. Contains everything a
+/// `ClusterTickContext` consumes, so the driver can build one from this alone.
+#[derive(Default)]
+pub struct NodeInputs {
+    pub client_updates: Vec<EntityStateEntry>,
+    pub game_actions: Vec<GameAction>,
+    pub neighbor_entities: HashMap<Uuid, EntityStateEntry>,
+    pub inbound_physics: Vec<arcane_core::physics_events::PhysicsEventBatch>,
+}
+
+pub struct PumpOutcome {
+    pub tick: u64,
+    pub seq: i64,
+    pub entity_count: usize,
+}
+
 /// The core node state machine — all components except loop ownership and timing.
 ///
 /// `NodeCore` owns the `ArcaneNode`, replication manager, all channel endpoints,
@@ -57,6 +73,11 @@ pub struct NodeCore {
     tick_count: u64,
     cluster_id: Uuid,
     dt_seconds: f64,
+    #[allow(dead_code)]
+    submitted_entities: Vec<EntityStateEntry>,
+    #[allow(dead_code)]
+    submitted_removals: Vec<Uuid>,
+    submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
 }
@@ -131,6 +152,9 @@ impl NodeCore {
             tick_count: 0,
             cluster_id: cfg.cluster_id,
             dt_seconds,
+            submitted_entities: Vec::new(),
+            submitted_removals: Vec::new(),
+            submitted_routed_physics: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
         })
@@ -267,6 +291,142 @@ impl NodeCore {
     /// before `tick()` to allow the driver to generate entities for this iteration.
     pub fn tick_count(&self) -> u64 {
         self.tick_count
+    }
+
+    /// Core -> driver. Drains client updates, game actions, inbound physics; accumulates &
+    /// prunes neighbor state (Redis plumbing stays in the core) and hands back a snapshot.
+    /// Reuses `out`'s allocations. Does NOT touch the node entity map.
+    pub fn drain_inputs(&mut self, out: &mut NodeInputs) {
+        out.client_updates.clear();
+        out.game_actions.clear();
+        out.inbound_physics.clear();
+
+        while let Ok(entry) = self.client_updates_rx.try_recv() {
+            out.client_updates.push(entry);
+        }
+        while let Ok(action) = self.game_actions_rx.try_recv() {
+            out.game_actions.push(action);
+        }
+        while let Ok(delta) = self.neighbor_rx.try_recv() {
+            for entry in delta.updated {
+                self.neighbor_last_seen
+                    .insert(entry.entity_id, self.tick_count);
+                self.neighbor_entities.insert(entry.entity_id, entry);
+            }
+            for removed_id in &delta.removed {
+                self.neighbor_entities.remove(removed_id);
+                self.neighbor_last_seen.remove(removed_id);
+            }
+        }
+        const PRUNE_INTERVAL_TICKS: u64 = 60;
+        if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
+            self.neighbor_last_seen.retain(|id, last_seen| {
+                let keep = self.tick_count - *last_seen <= NEIGHBOR_STALE_TICKS;
+                if !keep {
+                    self.neighbor_entities.remove(id);
+                }
+                keep
+            });
+        }
+        while let Ok(batch) = self.physics_events_rx.try_recv() {
+            out.inbound_physics.push(batch);
+        }
+        // Neighbor snapshot for the driver's ClusterTickContext.
+        // CLONE-COST: copies the whole neighbor map each tick — the clone-heavy pattern
+        // arcane#63 flags. Accepted for E1; optimize (borrow/Arc) later. (logged decision)
+        out.neighbor_entities.clone_from(&self.neighbor_entities);
+    }
+
+    /// Driver -> core. Writes this tick's authoritative spine into the node map, preserving the
+    /// old loop + add_entity semantics (stamp cluster_id, enforce max_entities), and records
+    /// EXPLICIT removals (matches today's pending_removed -> delta.removed one-shot semantics).
+    pub fn submit_entities(&mut self, spine: &[EntityStateEntry], removed: &[Uuid]) {
+        for entry in spine {
+            let mut e = entry.clone();
+            e.cluster_id = self.cluster_id;
+            self.server.add_entity(e);
+        }
+        for id in removed {
+            self.server.remove_entity(*id);
+        }
+    }
+
+    /// Driver -> core. Routed physics ops produced by the driver's sim this tick; published in
+    /// `pump()` before `server.tick()` (matches today's order). Rust-path adjunct.
+    pub fn submit_routed_physics_ops(
+        &mut self,
+        ops: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
+    ) {
+        self.submitted_routed_physics = ops;
+    }
+
+    /// NON-BLOCKING. Publish routed physics -> server.tick() -> merge with neighbor snapshot ->
+    /// persist -> broadcast (state_tx) -> stats -> tick_count++ -> logging. Never awaits a socket.
+    pub fn pump(&mut self) -> PumpOutcome {
+        if !self.submitted_routed_physics.is_empty() {
+            let ops = std::mem::take(&mut self.submitted_routed_physics);
+            if let Err(e) = self.physics_publisher.publish(self.cluster_id, ops) {
+                eprintln!("physics events publish error: {}", e);
+            }
+        }
+
+        let tick_start = Instant::now();
+        let our_delta = self.server.tick();
+        let tick_elapsed = tick_start.elapsed();
+        let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
+        let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
+        let outcome_tick = merged_delta.tick;
+        let outcome_seq = merged_delta.seq;
+        #[cfg(feature = "spacetimedb-persist")]
+        if let Some(ref persist) = self.persist {
+            persist.maybe_persist(self.tick_count, &merged_delta.updated);
+        }
+        let _ = self.state_tx.send(merged_delta);
+
+        self.stats.set_entities(self.server.entity_count() as u64);
+        self.stats
+            .tick
+            .store(self.server.current_tick(), Ordering::Relaxed);
+        self.stats
+            .seq
+            .store(self.server.current_seq() as u64, Ordering::Relaxed);
+        self.stats
+            .last_tick_us
+            .store(tick_elapsed.as_micros() as u64, Ordering::Relaxed);
+
+        self.tick_count += 1;
+        if self.tick_count.is_multiple_of(LOG_EVERY_TICKS) {
+            eprintln!(
+                "tick {} seq {}",
+                self.server.current_tick(),
+                self.server.current_seq()
+            );
+        }
+        if self.tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
+            let entities = self.server.entity_count();
+            let clusters = 1u32;
+            eprintln!(
+                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={} bytes_out={} lagged_events={} lagged_frames={} send_err={}",
+                entities,
+                clusters,
+                tick_elapsed_ms,
+                self.stats.ws_accepts.load(Ordering::Relaxed),
+                self.stats.msgs_player_state.load(Ordering::Relaxed),
+                self.stats.msgs_game_action.load(Ordering::Relaxed),
+                self.stats.parse_failures.load(Ordering::Relaxed),
+                self.stats.bytes_in.load(Ordering::Relaxed),
+                self.stats.bytes_out.load(Ordering::Relaxed),
+                self.stats.broadcast_lagged_events.load(Ordering::Relaxed),
+                self.stats.broadcast_lagged_frames.load(Ordering::Relaxed),
+                self.stats.ws_send_errors.load(Ordering::Relaxed),
+            );
+        }
+
+        PumpOutcome {
+            tick: outcome_tick,
+            seq: outcome_seq,
+            entity_count: self.server.entity_count(),
+        }
     }
 }
 
@@ -532,5 +692,41 @@ mod tests {
         assert_eq!(neighbor_entities.len(), 2);
         assert!(neighbor_entities.contains_key(&e1.entity_id));
         assert!(neighbor_entities.contains_key(&e2.entity_id));
+    }
+
+    #[test]
+    fn node_inputs_fields_suffice_for_cluster_tick_context() {
+        use super::NodeInputs;
+        use arcane_core::cluster_simulation::ClusterTickContext;
+
+        let cluster_id = Uuid::from_u128(1);
+        let entity1 = mk_entry(Uuid::from_u128(11), cluster_id, 5.0);
+        let entity2 = mk_entry(Uuid::from_u128(12), cluster_id, 10.0);
+
+        let mut node_inputs = NodeInputs::default();
+        node_inputs.client_updates.push(entity1.clone());
+        node_inputs
+            .neighbor_entities
+            .insert(entity2.entity_id, entity2.clone());
+
+        let mut world_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        world_entities.insert(entity1.entity_id, entity1.clone());
+
+        let mut pending_removals = Vec::new();
+
+        // Demonstrate that all fields needed for ClusterTickContext can be sourced from
+        // NodeInputs + driver-owned state (world_entities, pending_removals).
+        // This is compile-level proof that the interface is sufficient.
+        let _ctx = ClusterTickContext {
+            cluster_id,
+            tick: 42,
+            dt_seconds: 0.016,
+            entities: &mut world_entities,
+            pending_removals: &mut pending_removals,
+            game_actions: &node_inputs.game_actions,
+            neighbor_entities: &node_inputs.neighbor_entities,
+        };
+
+        assert_eq!(_ctx.tick, 42);
     }
 }
