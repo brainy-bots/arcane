@@ -15,6 +15,7 @@
 
 #[cfg(feature = "cluster-ws")]
 pub mod broadcast_channel_cap;
+pub mod fixed_timestep;
 pub mod manager;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
