@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
@@ -114,7 +114,8 @@ impl NodeCore {
         #[cfg(not(feature = "spacetimedb-persist"))]
         let _persist = ();
 
-        let dt_seconds = (1000.0 / tick_rate_hz as f64) / 1000.0;
+        let interval = Duration::from_millis(1000 / tick_rate_hz);
+        let dt_seconds = interval.as_secs_f64();
 
         Ok(Self {
             server,
