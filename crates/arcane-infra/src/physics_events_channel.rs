@@ -32,25 +32,26 @@ impl PhysicsEventsPublisher {
         let (tx, rx) = std::sync::mpsc::channel::<PublishMessage>();
 
         std::thread::spawn(move || {
-            let mut conn = match client.get_connection() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("physics events publisher: initial connection failed: {}", e);
-                    return;
-                }
-            };
-
+            // Lazily (re)connect; never exit on connection failure so `publish()` can always enqueue.
+            let mut conn: Option<redis::Connection> = client.get_connection().ok();
             while let Ok(msg) = rx.recv() {
                 if msg.routed_ops.is_empty() {
                     continue;
                 }
+                if conn.is_none() {
+                    conn = client.get_connection().ok();
+                }
+                let Some(c) = conn.as_mut() else {
+                    continue;
+                };
 
                 let mut by_target: std::collections::HashMap<Uuid, Vec<PhysicsEvent>> =
-                    std::collections::HashMap::new();
+                    Default::default();
                 for (target, event) in msg.routed_ops {
                     by_target.entry(target).or_default().push(event);
                 }
 
+                let mut should_reconnect = false;
                 for (target_cluster_id, ops) in by_target {
                     let batch = PhysicsEventBatch {
                         source_cluster_id: msg.source_cluster_id,
@@ -58,11 +59,15 @@ impl PhysicsEventsPublisher {
                     };
                     if let Ok(payload) = serde_json::to_string(&batch) {
                         let topic = format!("arcane:physics_events:{}", target_cluster_id);
-                        let _: Result<i64, redis::RedisError> = redis::cmd("PUBLISH")
-                            .arg(&topic)
-                            .arg(&payload)
-                            .query(&mut conn);
+                        let res: Result<i64, redis::RedisError> =
+                            redis::cmd("PUBLISH").arg(&topic).arg(&payload).query(c);
+                        if res.is_err() {
+                            should_reconnect = true;
+                        }
                     }
+                }
+                if should_reconnect {
+                    conn = None;
                 }
             }
         });
