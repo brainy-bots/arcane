@@ -12,20 +12,67 @@ use std::thread;
 use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch};
 use uuid::Uuid;
 
-/// Publishes physics event batches to target clusters via Redis.
+/// Message queued for the publisher thread.
+struct PublishMessage {
+    source_cluster_id: Uuid,
+    routed_ops: Vec<(Uuid, PhysicsEvent)>,
+}
+
+/// Publishes physics event batches to target clusters via Redis (non-blocking).
+/// Publishing is non-blocking: batches are enqueued on a producer thread via mpsc,
+/// which owns the Redis connection and drains the queue.
 pub struct PhysicsEventsPublisher {
-    client: redis::Client,
+    tx: std::sync::mpsc::Sender<PublishMessage>,
 }
 
 impl PhysicsEventsPublisher {
     pub fn new(redis_url: &str) -> Result<Self, String> {
         let client =
             redis::Client::open(redis_url).map_err(|e| format!("Redis open failed: {}", e))?;
-        Ok(Self { client })
+        let (tx, rx) = std::sync::mpsc::channel::<PublishMessage>();
+
+        std::thread::spawn(move || {
+            let mut conn = match client.get_connection() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("physics events publisher: initial connection failed: {}", e);
+                    return;
+                }
+            };
+
+            while let Ok(msg) = rx.recv() {
+                if msg.routed_ops.is_empty() {
+                    continue;
+                }
+
+                let mut by_target: std::collections::HashMap<Uuid, Vec<PhysicsEvent>> =
+                    std::collections::HashMap::new();
+                for (target, event) in msg.routed_ops {
+                    by_target.entry(target).or_default().push(event);
+                }
+
+                for (target_cluster_id, ops) in by_target {
+                    let batch = PhysicsEventBatch {
+                        source_cluster_id: msg.source_cluster_id,
+                        ops,
+                    };
+                    if let Ok(payload) = serde_json::to_string(&batch) {
+                        let topic = format!("arcane:physics_events:{}", target_cluster_id);
+                        let _: Result<i64, redis::RedisError> = redis::cmd("PUBLISH")
+                            .arg(&topic)
+                            .arg(&payload)
+                            .query(&mut conn);
+                    }
+                }
+            }
+        });
+
+        Ok(Self { tx })
     }
 
-    /// Group routed ops by target cluster and publish each batch.
+    /// Enqueue routed ops for non-blocking publication.
     /// `routed_ops` is `(target_cluster_id, PhysicsEvent)`.
+    /// Returns immediately without waiting on Redis.
     pub fn publish(
         &self,
         source_cluster_id: Uuid,
@@ -34,32 +81,12 @@ impl PhysicsEventsPublisher {
         if routed_ops.is_empty() {
             return Ok(());
         }
-        let mut conn = self
-            .client
-            .get_connection()
-            .map_err(|e| format!("Redis connection failed: {}", e))?;
-
-        let mut by_target: std::collections::HashMap<Uuid, Vec<PhysicsEvent>> =
-            std::collections::HashMap::new();
-        for (target, event) in routed_ops {
-            by_target.entry(target).or_default().push(event);
-        }
-
-        for (target_cluster_id, ops) in by_target {
-            let batch = PhysicsEventBatch {
+        self.tx
+            .send(PublishMessage {
                 source_cluster_id,
-                ops,
-            };
-            let payload = serde_json::to_string(&batch)
-                .map_err(|e| format!("serialize physics batch: {}", e))?;
-            let topic = format!("arcane:physics_events:{}", target_cluster_id);
-            redis::cmd("PUBLISH")
-                .arg(&topic)
-                .arg(&payload)
-                .query::<i64>(&mut conn)
-                .map_err(|e| format!("Redis PUBLISH failed: {}", e))?;
-        }
-        Ok(())
+                routed_ops,
+            })
+            .map_err(|_| "publisher thread dead".to_string())
     }
 }
 
@@ -115,6 +142,7 @@ pub fn spawn_physics_events_subscriber(
 mod tests {
     use super::*;
     use arcane_core::physics_events::PhysicsOp;
+    use std::time::Instant;
 
     #[test]
     fn physics_event_batch_json_roundtrip() {
@@ -144,5 +172,64 @@ mod tests {
         let parsed: PhysicsEventBatch = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source_cluster_id, batch.source_cluster_id);
         assert_eq!(parsed.ops.len(), 3);
+    }
+
+    #[test]
+    fn publish_returns_without_blocking_even_without_redis() {
+        // Create a publisher with an unreachable Redis URL.
+        // The publisher thread's connection will fail, but enqueue should still work.
+        let publisher = match PhysicsEventsPublisher::new("redis://127.0.0.1:16379") {
+            Ok(p) => p,
+            Err(_) => return, // Skip if we can't create the publisher.
+        };
+
+        let ops = vec![(
+            Uuid::from_u128(2),
+            PhysicsEvent {
+                target_entity_id: Uuid::from_u128(1),
+                op: PhysicsOp::Wake,
+            },
+        )];
+
+        let start = Instant::now();
+        let result = publisher.publish(Uuid::from_u128(1), ops);
+        let elapsed = start.elapsed();
+
+        // publish() should return promptly (< 10ms).
+        assert!(
+            elapsed.as_millis() < 10,
+            "publish() took too long: {:?}",
+            elapsed
+        );
+        // The enqueue itself should succeed (thread is running).
+        assert!(result.is_ok(), "publish should enqueue successfully");
+    }
+
+    #[test]
+    fn publish_multiple_batches_without_blocking() {
+        let publisher = match PhysicsEventsPublisher::new("redis://127.0.0.1:16379") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let start = Instant::now();
+        for i in 0..50 {
+            let ops = vec![(
+                Uuid::from_u128(2),
+                PhysicsEvent {
+                    target_entity_id: Uuid::from_u128(i),
+                    op: PhysicsOp::Wake,
+                },
+            )];
+            let _ = publisher.publish(Uuid::from_u128(1), ops);
+        }
+        let elapsed = start.elapsed();
+
+        // 50 non-blocking enqueues should complete very quickly.
+        assert!(
+            elapsed.as_millis() < 100,
+            "50 publishes took too long: {:?}",
+            elapsed
+        );
     }
 }
