@@ -2,8 +2,13 @@
 //!
 //! This module extracts the reusable `NodeCore` from `run_node_loop`, leaving the loop
 //! ownership and timing to the driver. `NodeCore::new()` runs all setup (Redis start,
-//! channel creation, I/O thread spawning); `NodeCore::tick()` executes one iteration of
-//! the loop body (drain inputs, simulate, tick, broadcast).
+//! channel creation, I/O thread spawning).
+//!
+//! **Pump mode (preferred):** `drain_inputs()` → driver runs simulation → `submit_entities()` → `pump()`.
+//! This inverts loop ownership — the driver owns the simulation step and entity injection.
+//! See the `pump()` docstring for the full driver loop pattern.
+//!
+//! **Transitional:** `tick(simulation, extra_entities)` is deprecated. Use the pump surface instead.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -28,6 +33,15 @@ use crate::{ArcaneNode, ReplicationChannelManager};
 const LOG_EVERY_TICKS: u64 = 100;
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 const NEIGHBOR_STALE_TICKS: u64 = 300;
+
+/// Outcome of a `pump()` call.
+#[derive(Debug, Clone)]
+pub struct PumpOutcome {
+    /// Tick index after this pump cycle completed.
+    pub tick_count: u64,
+    /// True if a replication delta was broadcast this cycle.
+    pub delta_sent: bool,
+}
 
 /// Configuration for creating a `NodeCore`.
 #[derive(Clone, Debug)]
@@ -57,6 +71,7 @@ pub struct NodeCore {
     tick_count: u64,
     cluster_id: Uuid,
     dt_seconds: f64,
+    submitted_entities: Vec<EntityStateEntry>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
 }
@@ -131,20 +146,23 @@ impl NodeCore {
             tick_count: 0,
             cluster_id: cfg.cluster_id,
             dt_seconds,
+            submitted_entities: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
         })
     }
 
+    /// **Deprecated.** Use the pump surface instead: `drain_inputs()` → driver runs simulation →
+    /// `submit_entities()` → `pump()`. This method is kept for backwards compatibility but will be removed.
+    ///
     /// Execute one iteration of the node loop body: drain inputs, simulate, tick, broadcast.
     /// Does NOT sleep or own the loop. `tick_count` is pre-incremented (current iteration's count
     /// before the increment) — this matches the existing semantics where logging and neighbor
     /// bookkeeping use the pre-increment value.
-    ///
-    /// ⚠️ **TRANSITIONAL**: This method's signature and semantics are not frozen. The `submit/pump/drain`
-    /// surface introduced in sub-issue #2 will replace this interface and resolve where `ClusterSimulation`
-    /// runs (today it runs inside `ArcaneNode::simulate_before_tick`; ownership may shift).
-    /// For this sub-issue, keeping the sim call inside `tick` preserves today's behavior exactly.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use drain_inputs, submit_entities, and pump instead. This puts loop and simulation ownership in the driver."
+    )]
     pub fn tick(
         &mut self,
         simulation: Option<&dyn ClusterSimulation>,
@@ -267,6 +285,209 @@ impl NodeCore {
     /// before `tick()` to allow the driver to generate entities for this iteration.
     pub fn tick_count(&self) -> u64 {
         self.tick_count
+    }
+
+    /// Run the simulation step for drivers that provide a ClusterSimulation.
+    /// This is a convenience method that encapsulates the simulation-execution pattern;
+    /// pump-mode drivers that manage their own simulation can skip this and call
+    /// drain_inputs, apply sim changes, submit_entities, pump directly.
+    ///
+    /// Drains inbound game actions, neighbor entity state, and physics events, then runs
+    /// `ClusterSimulation::on_tick` with exclusive access to the server's entity map.
+    /// Call this BEFORE `submit_entities` if your driver provides a simulation.
+    pub fn apply_simulation_step(&mut self, simulation: Option<&dyn ClusterSimulation>) {
+        let mut game_actions = Vec::new();
+        let mut neighbor_map: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+
+        while let Ok(action) = self.game_actions_rx.try_recv() {
+            game_actions.push(action);
+        }
+        while let Ok(delta) = self.neighbor_rx.try_recv() {
+            for entry in delta.updated {
+                self.neighbor_last_seen
+                    .insert(entry.entity_id, self.tick_count);
+                self.neighbor_entities
+                    .insert(entry.entity_id, entry.clone());
+                neighbor_map.insert(entry.entity_id, entry);
+            }
+            for removed_id in &delta.removed {
+                self.neighbor_entities.remove(removed_id);
+                self.neighbor_last_seen.remove(removed_id);
+            }
+        }
+        const PRUNE_INTERVAL_TICKS: u64 = 60;
+        if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
+            self.neighbor_last_seen.retain(|id, last_seen| {
+                let keep = self.tick_count - *last_seen <= NEIGHBOR_STALE_TICKS;
+                if !keep {
+                    self.neighbor_entities.remove(id);
+                }
+                keep
+            });
+        }
+
+        let mut inbound_physics = Vec::new();
+        while let Ok(batch) = self.physics_events_rx.try_recv() {
+            inbound_physics.push(batch);
+        }
+
+        if let Some(sim) = simulation {
+            if !inbound_physics.is_empty() {
+                sim.apply_inbound_physics_events(inbound_physics);
+            }
+            let upcoming_tick = self.server.current_tick() + 1;
+            self.server.simulate_before_tick(
+                self.dt_seconds,
+                upcoming_tick,
+                simulation,
+                &game_actions,
+                &self.neighbor_entities,
+            );
+            let routed = sim.drain_routed_physics_ops();
+            if !routed.is_empty() {
+                if let Err(e) = self.physics_publisher.publish(self.cluster_id, routed) {
+                    eprintln!("physics events publish error: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Drain inbound game actions and neighbor entity state accumulated since the last call.
+    /// Call BEFORE your simulation step so the driver can feed actions into ClusterSimulation.
+    ///
+    /// After calling this, the returned vectors contain:
+    /// - `game_actions`: all pending GameAction messages from clients (via WebSocket)
+    /// - `neighbor_entities`: a snapshot of the latest neighbor entity state by entity_id
+    ///   (this is cumulative across multiple neighbor-delta messages; the driver can use it
+    ///   to pass neighbor context to its simulation)
+    pub fn drain_inputs(
+        &mut self,
+        game_actions: &mut Vec<arcane_core::cluster_simulation::GameAction>,
+        neighbor_entities: &mut Vec<EntityStateEntry>,
+    ) {
+        while let Ok(action) = self.game_actions_rx.try_recv() {
+            game_actions.push(action);
+        }
+        while let Ok(delta) = self.neighbor_rx.try_recv() {
+            for entry in delta.updated {
+                self.neighbor_last_seen
+                    .insert(entry.entity_id, self.tick_count);
+                self.neighbor_entities.insert(entry.entity_id, entry);
+            }
+            for removed_id in &delta.removed {
+                self.neighbor_entities.remove(removed_id);
+                self.neighbor_last_seen.remove(removed_id);
+            }
+        }
+        const PRUNE_INTERVAL_TICKS: u64 = 60;
+        if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
+            self.neighbor_last_seen.retain(|id, last_seen| {
+                let keep = self.tick_count - *last_seen <= NEIGHBOR_STALE_TICKS;
+                if !keep {
+                    self.neighbor_entities.remove(id);
+                }
+                keep
+            });
+        }
+        neighbor_entities.extend(self.neighbor_entities.values().cloned());
+    }
+
+    /// Buffer entity states the driver is injecting this tick (driver-owned entities + simulation output).
+    /// Call after your simulation step but before `pump()`.
+    ///
+    /// This replaces the `extra_entities` parameter from the transitional `tick()` method.
+    /// The buffered entities are processed in the next `pump()` call.
+    pub fn submit_entities(&mut self, spine: &[EntityStateEntry]) {
+        self.submitted_entities.clear();
+        self.submitted_entities.extend_from_slice(spine);
+    }
+
+    /// Process one pump cycle: drain inbound WS/Redis buffers, run replication, broadcast delta,
+    /// optional persistence. **NON-BLOCKING** — must never await a socket. Increments tick_count.
+    ///
+    /// The driver loop pattern:
+    /// ```ignore
+    /// let mut core = NodeCore::new(cfg)?;
+    /// let interval = Duration::from_millis(1000 / tick_rate_hz);
+    /// loop {
+    ///     let mut game_actions = Vec::new();
+    ///     let mut neighbor_entities = Vec::new();
+    ///     core.drain_inputs(&mut game_actions, &mut neighbor_entities);
+    ///
+    ///     let extra = extra_entities_for_tick(core.tick_count());
+    ///     // driver steps its own ClusterSimulation with the drained inputs
+    ///     // then submits the resulting entity state:
+    ///     core.submit_entities(&extra);
+    ///
+    ///     let _outcome = core.pump();
+    ///     thread::sleep(interval);
+    /// }
+    /// ```
+    pub fn pump(&mut self) -> PumpOutcome {
+        while let Ok(mut entry) = self.client_updates_rx.try_recv() {
+            entry.cluster_id = self.cluster_id;
+            self.server.add_entity(entry);
+        }
+        for mut entry in self.submitted_entities.drain(..) {
+            entry.cluster_id = self.cluster_id;
+            self.server.add_entity(entry);
+        }
+
+        let tick_start = Instant::now();
+        let our_delta = self.server.tick();
+        let tick_elapsed = tick_start.elapsed();
+        let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
+        let merged_delta = merge_with_neighbor_latest(our_delta.clone(), &self.neighbor_entities);
+        #[cfg(feature = "spacetimedb-persist")]
+        if let Some(ref persist) = self.persist {
+            persist.maybe_persist(self.tick_count, &merged_delta.updated);
+        }
+
+        let delta_sent = self.state_tx.send(merged_delta).is_ok();
+
+        self.stats.set_entities(self.server.entity_count() as u64);
+        self.stats
+            .tick
+            .store(self.server.current_tick(), Ordering::Relaxed);
+        self.stats
+            .seq
+            .store(self.server.current_seq() as u64, Ordering::Relaxed);
+        self.stats
+            .last_tick_us
+            .store(tick_elapsed.as_micros() as u64, Ordering::Relaxed);
+
+        self.tick_count += 1;
+        if self.tick_count.is_multiple_of(LOG_EVERY_TICKS) {
+            eprintln!(
+                "tick {} seq {}",
+                self.server.current_tick(),
+                self.server.current_seq()
+            );
+        }
+        if self.tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
+            let entities = self.server.entity_count();
+            let clusters = 1u32;
+            eprintln!(
+                "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={} bytes_out={} lagged_events={} lagged_frames={} send_err={}",
+                entities,
+                clusters,
+                tick_elapsed_ms,
+                self.stats.ws_accepts.load(Ordering::Relaxed),
+                self.stats.msgs_player_state.load(Ordering::Relaxed),
+                self.stats.msgs_game_action.load(Ordering::Relaxed),
+                self.stats.parse_failures.load(Ordering::Relaxed),
+                self.stats.bytes_in.load(Ordering::Relaxed),
+                self.stats.bytes_out.load(Ordering::Relaxed),
+                self.stats.broadcast_lagged_events.load(Ordering::Relaxed),
+                self.stats.broadcast_lagged_frames.load(Ordering::Relaxed),
+                self.stats.ws_send_errors.load(Ordering::Relaxed),
+            );
+        }
+
+        PumpOutcome {
+            tick_count: self.tick_count,
+            delta_sent,
+        }
     }
 }
 

@@ -91,8 +91,12 @@ where
     let interval = Duration::from_millis(1000 / tick_rate_hz);
 
     loop {
+        core.apply_simulation_step(simulation.as_ref().map(|s| s.as_ref()));
+
         let extra = extra_entities_for_tick(core.tick_count());
-        core.tick(simulation.as_ref().map(|s| s.as_ref()), extra);
+        core.submit_entities(&extra);
+
+        let _outcome = core.pump();
         thread::sleep(interval);
     }
     // unreachable
