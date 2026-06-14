@@ -334,12 +334,20 @@ fn pump_mode_parity_model_b_vs_direct_insertion() {
         "should have same number of updated entities"
     );
 
-    for (u_b, u_d) in delta_model_b
+    // Build maps by entity_id (order may vary due to HashMap iteration).
+    let map_b: HashMap<Uuid, &EntityStateEntry> = delta_model_b
         .updated
         .iter()
-        .zip(delta_direct.updated.iter())
-    {
-        assert_eq!(u_b.entity_id, u_d.entity_id, "entity id should match");
+        .map(|e| (e.entity_id, e))
+        .collect();
+    let map_d: HashMap<Uuid, &EntityStateEntry> = delta_direct
+        .updated
+        .iter()
+        .map(|e| (e.entity_id, e))
+        .collect();
+
+    for (id, u_b) in &map_b {
+        let u_d = map_d.get(id).expect("entity should exist in both deltas");
         assert_eq!(
             u_b.position, u_d.position,
             "position should match (Model B == Direct)"
