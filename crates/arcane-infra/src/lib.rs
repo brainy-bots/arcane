@@ -27,6 +27,8 @@ pub mod spacetimedb_persist;
 pub mod tick_rate;
 
 #[cfg(feature = "cluster-ws")]
+pub mod node_core;
+#[cfg(feature = "cluster-ws")]
 pub mod node_runner;
 #[cfg(feature = "cluster-ws")]
 pub mod node_stats;
