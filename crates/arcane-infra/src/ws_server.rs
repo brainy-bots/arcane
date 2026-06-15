@@ -626,9 +626,11 @@ mod tests {
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::visibility::IVisibilityFilter;
     use arcane_core::Vec3;
+    use arcane_spatial::RadiusVisibilityFilter;
     use arcane_wire::{
         ClientFrame, GameActionPayload, PlayerStatePayload, ServerFrame, Vec3 as WireVec3,
     };
+    use dashmap::DashMap;
     use tokio::sync::broadcast::error::RecvError;
     use uuid::Uuid;
 
@@ -1294,6 +1296,114 @@ mod tests {
             assembled,
             pre_tick.shared_full_frame.as_slice(),
             "shared_full_frame must be byte-identical to assemble_outbound_frame(tick, None)"
+        );
+    }
+
+    /// **E3.2 Correctness Test:** Deterministic multi-observer producer-level AOI test.
+    /// Verifies that each observer receives exactly its in-radius entities, both at the
+    /// visibility mask level and in the decoded wire frame. Uses the actual
+    /// `RadiusVisibilityFilter` from arcane-spatial, not a mock.
+    #[test]
+    fn aoi_multi_observer_deterministic_correctness() {
+        // Build a deterministic delta with known entity positions.
+        let entities = vec![
+            // Entity A at (0, 0, 0)
+            EntityStateEntry::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(99),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            // Entity B at (5, 0, 0) — within radius 10 of observer 1
+            EntityStateEntry::new(
+                Uuid::from_u128(2),
+                Uuid::from_u128(99),
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            // Entity C at (100, 0, 0) — far away
+            EntityStateEntry::new(
+                Uuid::from_u128(3),
+                Uuid::from_u128(99),
+                Vec3::new(100.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        ];
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: entities,
+            removed: Vec::new(),
+        };
+
+        // Pre-encode the tick once; reuse across all observers.
+        let pre_tick = pre_encode_tick(&delta);
+        assert_eq!(pre_tick.entity_chunks.len(), 3);
+
+        // Set up two observers at different positions.
+        let subscriber_positions = DashMap::new();
+        subscriber_positions.insert(1u64, Vec3::new(0.0, 0.0, 0.0)); // Observer 1 at origin
+        subscriber_positions.insert(2u64, Vec3::new(100.0, 0.0, 0.0)); // Observer 2 far away
+
+        // Compute visibility masks using the actual RadiusVisibilityFilter.
+        let filter = RadiusVisibilityFilter::new(10.0);
+        let masks = compute_visibility_masks(&pre_tick, Some(&filter), &subscriber_positions);
+
+        // Verify masks at the visibility level.
+        // Observer 1 at (0,0,0): should see A (0,0,0) and B (5,0,0), not C (100,0,0).
+        assert_eq!(
+            masks[&1u64],
+            vec![true, true, false],
+            "Observer 1 should see entities A and B only"
+        );
+
+        // Observer 2 at (100,0,0): should see only C (100,0,0).
+        // A is 100 units away, B is ~95.5 units away — both outside radius 10.
+        assert_eq!(
+            masks[&2u64],
+            vec![false, false, true],
+            "Observer 2 should see entity C only"
+        );
+
+        // Verify decoded frames match expected entity subsets per observer.
+        // Observer 1 frame should include entities with IDs 1 and 2.
+        let bytes_obs1 = assemble_outbound_frame(&pre_tick, Some(&masks[&1u64]));
+        let decoded_obs1 =
+            arcane_wire::decode_server(&bytes_obs1).expect("Observer 1 frame decodes");
+        let ServerFrame::Delta(payload_obs1) = decoded_obs1;
+        assert_eq!(
+            payload_obs1.updated.len(),
+            2,
+            "Observer 1 should receive 2 entities"
+        );
+        assert_eq!(
+            payload_obs1.updated[0].entity_id,
+            Uuid::from_u128(1),
+            "Observer 1 first entity is A"
+        );
+        assert_eq!(
+            payload_obs1.updated[1].entity_id,
+            Uuid::from_u128(2),
+            "Observer 1 second entity is B"
+        );
+
+        // Observer 2 frame should include only entity with ID 3.
+        let bytes_obs2 = assemble_outbound_frame(&pre_tick, Some(&masks[&2u64]));
+        let decoded_obs2 =
+            arcane_wire::decode_server(&bytes_obs2).expect("Observer 2 frame decodes");
+        let ServerFrame::Delta(payload_obs2) = decoded_obs2;
+        assert_eq!(
+            payload_obs2.updated.len(),
+            1,
+            "Observer 2 should receive 1 entity"
+        );
+        assert_eq!(
+            payload_obs2.updated[0].entity_id,
+            Uuid::from_u128(3),
+            "Observer 2 entity is C"
         );
     }
 }
