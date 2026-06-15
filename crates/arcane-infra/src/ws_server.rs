@@ -407,6 +407,7 @@ pub fn run_ws_server(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -429,6 +430,7 @@ pub fn run_ws_server(
             client_updates_tx,
             game_actions_tx,
             stats,
+            visibility_filter,
         ));
     });
 }
@@ -442,6 +444,7 @@ async fn ws_loop(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity FlatBuffer chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
@@ -491,8 +494,11 @@ async fn ws_loop(
 
                     let entity_count = tick.entity_metadata.len();
                     if ticks_until_recompute == 0 || entity_count != cached_entity_count {
-                        cached_masks =
-                            Arc::new(compute_visibility_masks(&tick, None, &positions_clone));
+                        cached_masks = Arc::new(compute_visibility_masks(
+                            &tick,
+                            visibility_filter.as_deref(),
+                            &positions_clone,
+                        ));
                         cached_entity_count = entity_count;
                         ticks_until_recompute = recompute_interval;
                     } else {
@@ -613,9 +619,9 @@ async fn ws_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_outbound_frame, encode_entity_chunk, entry_from_wire_player_state,
-        game_action_from_wire, pre_encode_tick, should_backoff_on_accept_error,
-        should_keep_ws_loop_running_on_broadcast_error,
+        assemble_outbound_frame, compute_visibility_masks, encode_entity_chunk,
+        entry_from_wire_player_state, game_action_from_wire, pre_encode_tick,
+        should_backoff_on_accept_error, should_keep_ws_loop_running_on_broadcast_error,
     };
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::visibility::IVisibilityFilter;
@@ -1199,6 +1205,59 @@ mod tests {
         let bytes_none_mask = assemble_outbound_frame(&pre_tick, None);
 
         assert_eq!(bytes_no_mask, bytes_none_mask);
+    }
+
+    /// Producer with filter: compute_visibility_masks with a filter should
+    /// generate per-subscriber masks that correctly filter entities by range.
+    #[test]
+    fn producer_with_filter_computes_masks_correctly() {
+        use dashmap::DashMap;
+
+        let entities = vec![
+            EntityStateEntry::new(
+                Uuid::from_u128(1),
+                Uuid::from_u128(99),
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            EntityStateEntry::new(
+                Uuid::from_u128(2),
+                Uuid::from_u128(99),
+                Vec3::new(5.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+            EntityStateEntry::new(
+                Uuid::from_u128(3),
+                Uuid::from_u128(99),
+                Vec3::new(20.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        ];
+
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: entities,
+            removed: Vec::new(),
+        };
+
+        let pre_tick = pre_encode_tick(&delta);
+
+        // Set up subscriber positions
+        let subscriber_positions = DashMap::new();
+        subscriber_positions.insert(1u64, Vec3::new(0.0, 0.0, 0.0)); // At origin
+        subscriber_positions.insert(2u64, Vec3::new(25.0, 0.0, 0.0)); // Far away
+
+        let filter = MockRadiusFilter::new(10.0);
+        let masks = compute_visibility_masks(&pre_tick, Some(&filter), &subscriber_positions);
+
+        // Subscriber 1 at (0, 0, 0) should see entities 1 and 2 (within radius 10)
+        assert_eq!(masks[&1u64], vec![true, true, false]);
+
+        // Subscriber 2 at (25, 0, 0) should only see entity 3 (entities 1 and 2 are > 10 away)
+        assert_eq!(masks[&2u64], vec![false, false, true]);
     }
 
     /// The pre-built `shared_full_frame` must be byte-identical to what
