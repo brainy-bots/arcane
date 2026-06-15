@@ -87,6 +87,8 @@ where
         redis_url,
         neighbor_ids,
         ws_port,
+        // The standalone production node requires Redis; single-node mode is for the C-ABI/dev path.
+        allow_single_node: false,
     })?;
 
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
