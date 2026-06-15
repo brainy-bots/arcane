@@ -75,6 +75,11 @@ pub struct NodeConfig {
     pub redis_url: String,
     pub neighbor_ids: Vec<Uuid>,
     pub ws_port: u16,
+    /// When `false` (default for production), `NodeCore::new` fails if Redis is unavailable.
+    /// When `true`, a Redis-start failure is tolerated: the node runs a **single cluster with no
+    /// replication** (sim + client WS still work). Intended for engine/dev use without full infra
+    /// (e.g. driving the C-ABI boundary locally); never silently degrade a production node.
+    pub allow_single_node: bool,
 }
 
 /// Inputs the driver's ClusterSimulation needs this tick. Contains everything a
@@ -151,13 +156,23 @@ impl NodeCore {
     /// I/O thread spawning. Returns Err on setup failure (Redis, physics publisher).
     pub fn new(cfg: NodeConfig) -> Result<Self, String> {
         let replication = ReplicationChannelManager::new(cfg.cluster_id);
-        replication
-            .start(&cfg.redis_url)
-            .map_err(|e| format!("Redis start failed: {}", e))?;
-        replication.set_neighbors(cfg.neighbor_ids.clone());
-
         let server = ArcaneNode::new(cfg.cluster_id);
-        server.set_replication(Arc::new(replication));
+        // Replication requires Redis. In production (allow_single_node = false) a failure here is
+        // fatal — a node that can't replicate must not start silently. In single-node mode we keep
+        // running with no replication manager attached (ArcaneNode::tick then skips neighbor sends).
+        match replication.start(&cfg.redis_url) {
+            Ok(()) => {
+                replication.set_neighbors(cfg.neighbor_ids.clone());
+                server.set_replication(Arc::new(replication));
+            }
+            Err(e) if cfg.allow_single_node => {
+                eprintln!(
+                    "single-node mode: Redis unavailable ({}); running one cluster without replication",
+                    e
+                );
+            }
+            Err(e) => return Err(format!("Redis start failed: {}", e)),
+        }
 
         let (state_tx, state_rx) = std::sync::mpsc::channel();
         let (client_updates_tx, client_updates_rx) = std::sync::mpsc::channel();
