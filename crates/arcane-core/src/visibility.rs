@@ -27,6 +27,32 @@ pub trait IVisibilityFilter: Send + Sync {
     fn filter(&self, observer_position: Vec3, entities: &[(Uuid, Vec3)]) -> Vec<bool>;
 }
 
+/// L0 geometric area-of-interest filter: an observer receives only entities within `radius`
+/// of its position. The simplest visibility primitive — pure distance, no interaction graph
+/// or line-of-sight. Higher levels (L1 interaction-graph, L2 LOS, L3 predicate, L4 per-field)
+/// live in `arcane-primitives`; this default ships in core so L0 users get AOI for free.
+pub struct RadiusVisibilityFilter {
+    radius_sq: f64,
+}
+
+impl RadiusVisibilityFilter {
+    /// Build a radius filter. `radius` is in world units (same space as entity positions).
+    pub fn new(radius: f64) -> Self {
+        Self {
+            radius_sq: radius * radius,
+        }
+    }
+}
+
+impl IVisibilityFilter for RadiusVisibilityFilter {
+    fn filter(&self, observer_position: Vec3, entities: &[(Uuid, Vec3)]) -> Vec<bool> {
+        entities
+            .iter()
+            .map(|(_, pos)| observer_position.distance_sq_to(pos) <= self.radius_sq)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -185,12 +185,28 @@ impl NodeCore {
             .unwrap_or(cfg.ws_port.saturating_add(1));
         crate::node_stats::serve_stats_http(stats_port, cfg.cluster_id.to_string(), stats.clone());
 
+        // Area-of-interest: ARCANE_AOI_RADIUS (world units) enables the L0 geometric visibility
+        // filter so each client receives only entities within that radius of its observer position.
+        // Unset/<=0 = no filtering (every client sees every entity).
+        let visibility_filter: Option<
+            std::sync::Arc<dyn arcane_core::visibility::IVisibilityFilter>,
+        > = std::env::var("ARCANE_AOI_RADIUS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|r| *r > 0.0)
+            .map(|r| {
+                eprintln!("AOI: L0 radius visibility filter enabled (radius={r} world units)");
+                std::sync::Arc::new(arcane_core::visibility::RadiusVisibilityFilter::new(r))
+                    as std::sync::Arc<dyn arcane_core::visibility::IVisibilityFilter>
+            });
+
         crate::ws_server::run_ws_server(
             cfg.ws_port,
             state_rx,
             client_updates_tx,
             game_actions_tx,
             stats.clone(),
+            visibility_filter,
         );
 
         let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();

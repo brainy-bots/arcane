@@ -407,6 +407,10 @@ pub fn run_ws_server(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
+    // Optional per-client visibility filter (area-of-interest). None = broadcast every entity to
+    // every subscriber (L0-off). Some(f) = each subscriber receives only the entities f admits for
+    // its observer position, computed in the producer at the throttled recompute cadence.
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -429,6 +433,7 @@ pub fn run_ws_server(
             client_updates_tx,
             game_actions_tx,
             stats,
+            visibility_filter,
         ));
     });
 }
@@ -442,6 +447,7 @@ async fn ws_loop(
     client_updates_tx: Sender<EntityStateEntry>,
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
+    visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity FlatBuffer chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
@@ -473,6 +479,8 @@ async fn ws_loop(
     // Updated by subscriber tasks on PLAYER_STATE, read by producer for mask computation.
     let subscriber_positions = Arc::new(DashMap::new());
     let positions_clone = subscriber_positions.clone();
+    // Moved into the producer task; drives per-subscriber AOI masks (None = no filtering).
+    let producer_filter = visibility_filter.clone();
 
     tokio::spawn(async move {
         let recompute_interval = visibility_recompute_interval();
@@ -491,8 +499,11 @@ async fn ws_loop(
 
                     let entity_count = tick.entity_metadata.len();
                     if ticks_until_recompute == 0 || entity_count != cached_entity_count {
-                        cached_masks =
-                            Arc::new(compute_visibility_masks(&tick, None, &positions_clone));
+                        cached_masks = Arc::new(compute_visibility_masks(
+                            &tick,
+                            producer_filter.as_deref(),
+                            &positions_clone,
+                        ));
                         cached_entity_count = entity_count;
                         ticks_until_recompute = recompute_interval;
                     } else {
