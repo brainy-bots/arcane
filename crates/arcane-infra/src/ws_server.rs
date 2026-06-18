@@ -633,18 +633,88 @@ async fn ws_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_outbound_frame, encode_entity_chunk, entry_from_wire_player_state,
-        game_action_from_wire, pre_encode_tick, should_backoff_on_accept_error,
-        should_keep_ws_loop_running_on_broadcast_error,
+        assemble_outbound_frame, compute_visibility_masks, encode_entity_chunk,
+        entry_from_wire_player_state, game_action_from_wire, pre_encode_tick,
+        should_backoff_on_accept_error, should_keep_ws_loop_running_on_broadcast_error,
     };
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
-    use arcane_core::visibility::IVisibilityFilter;
+    use arcane_core::visibility::{IVisibilityFilter, RadiusVisibilityFilter};
     use arcane_core::Vec3;
     use arcane_wire::{
         ClientFrame, GameActionPayload, PlayerStatePayload, ServerFrame, Vec3 as WireVec3,
     };
+    use dashmap::DashMap;
+    use std::collections::HashMap;
     use tokio::sync::broadcast::error::RecvError;
     use uuid::Uuid;
+
+    // ── AOI visibility (multi-observer, default-deny) ────────────────────
+    // Producer-level regression guard for the corrected AOI pipeline (ported from arcane#200 and
+    // adapted to the fixed API): the observer position is the avatar's AUTHORITATIVE position
+    // (latest_positions[avatar]), masks are computed against the current tick, and a subscriber with
+    // no known avatar position is default-DENIED. Deterministic; no Redis/cluster/AWS.
+    #[test]
+    fn aoi_multi_observer_and_default_deny() {
+        let mk = |id: u128, x: f64| {
+            EntityStateEntry::new(
+                Uuid::from_u128(id),
+                Uuid::from_u128(99),
+                Vec3::new(x, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            )
+        };
+        // Entities A(0), B(5), C(100).
+        let delta = EntityStateDelta {
+            source_cluster_id: Uuid::from_u128(99),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: vec![mk(1, 0.0), mk(2, 5.0), mk(3, 100.0)],
+            removed: Vec::new(),
+        };
+        let pre_tick = pre_encode_tick(&delta);
+        assert_eq!(pre_tick.entity_chunks.len(), 3);
+
+        // Two observers, each bound to an avatar; observer position comes from the avatar's
+        // authoritative position, NOT any client-reported value.
+        let avatar1 = Uuid::from_u128(101);
+        let avatar2 = Uuid::from_u128(102);
+        let subscriber_avatars: DashMap<u64, Option<Uuid>> = DashMap::new();
+        subscriber_avatars.insert(1, Some(avatar1));
+        subscriber_avatars.insert(2, Some(avatar2));
+        subscriber_avatars.insert(3, None); // never reported an avatar -> default-deny
+        let mut latest_positions: HashMap<Uuid, Vec3> = HashMap::new();
+        latest_positions.insert(avatar1, Vec3::new(0.0, 0.0, 0.0)); // at origin
+        latest_positions.insert(avatar2, Vec3::new(100.0, 0.0, 0.0)); // far
+
+        let filter = RadiusVisibilityFilter::new(10.0);
+        let masks = compute_visibility_masks(
+            &pre_tick,
+            Some(&filter),
+            &subscriber_avatars,
+            &latest_positions,
+        );
+
+        // Observer 1 at origin sees A(0) and B(5), not C(100).
+        assert_eq!(masks[&1], vec![true, true, false]);
+        // Observer 2 at (100,0,0) sees only C.
+        assert_eq!(masks[&2], vec![false, false, true]);
+        // Observer 3 has no known position -> default-deny (all false), NOT the full set.
+        assert_eq!(masks[&3], vec![false, false, false]);
+
+        // Decoded frames carry exactly the visible subset.
+        let decode = |sub: u64| {
+            let bytes = assemble_outbound_frame(&pre_tick, Some(&masks[&sub]));
+            let ServerFrame::Delta(p) = arcane_wire::decode_server(&bytes).expect("decode");
+            p.updated
+                .into_iter()
+                .map(|e| e.entity_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(decode(1), vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+        assert_eq!(decode(2), vec![Uuid::from_u128(3)]);
+        assert_eq!(decode(3), Vec::<Uuid>::new());
+    }
 
     // ── backpressure policy ──────────────────────────────────────────────
 
