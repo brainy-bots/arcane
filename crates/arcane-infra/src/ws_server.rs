@@ -170,6 +170,9 @@ struct PreEncodedTick {
     removed: Vec<Uuid>,
     entity_metadata: Vec<(Uuid, Vec3)>,
     shared_full_frame: Arc<Vec<u8>>,
+    /// Header + removed-ids with NO entity chunks. Sent to a subscriber when an AOI filter is active but
+    /// that subscriber has no known observer position yet — default-DENY, never the full frame.
+    shared_empty_frame: Arc<Vec<u8>>,
 }
 
 /// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
@@ -221,12 +224,19 @@ fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
         &chunk_refs,
         &delta.removed,
     ));
+    // Empty (entity-less) frame for AOI default-deny: same header + removals, zero entity chunks.
+    let shared_empty_frame = Arc::new(arcane_wire::encode_server_delta_from_chunks(
+        &header,
+        &[],
+        &delta.removed,
+    ));
     PreEncodedTick {
         header,
         entity_chunks,
         removed: delta.removed.clone(),
         entity_metadata,
         shared_full_frame,
+        shared_empty_frame,
     }
 }
 
@@ -349,55 +359,44 @@ fn init_encode_thread_pool() {
     }
 }
 
-/// How many ticks to reuse cached visibility masks before recomputing.
+/// Compute all subscriber visibility masks for THIS tick, in parallel via rayon.
 ///
-/// At 3K entities × 3K subscribers, a full recompute is ~9M distance checks.
-/// Reusing masks across ticks amortizes this cost: at 60 Hz with an interval
-/// of 30, masks recompute at ~2 Hz — reducing filter work by ~30×.
+/// Recomputed every tick against the current tick's `entity_metadata` so the returned `Vec<bool>` is
+/// positionally aligned to *this* tick's `entity_chunks`. (Masks must NOT be reused across ticks: the
+/// broadcast delta is sparse and HashMap-ordered, so a cached mask would gate the wrong entities.)
 ///
-/// Masks are also invalidated when the entity count changes (spawn/despawn),
-/// since the mask length must match the entity chunk count.
+/// The observer position is the subscriber's avatar's AUTHORITATIVE position (`latest_positions`,
+/// accumulated from the server's deltas) — never the client-reported position, which a client could
+/// spoof to widen its view (visibility is a security primitive). A subscriber whose avatar position is
+/// not yet known gets an all-false mask: **default-deny**, so unknown observers never see the world.
 ///
-/// `ARCANE_VISIBILITY_RECOMPUTE_TICKS` env var overrides the default.
-fn visibility_recompute_interval() -> u64 {
-    if let Ok(s) = std::env::var("ARCANE_VISIBILITY_RECOMPUTE_TICKS") {
-        if let Ok(n) = s.parse::<u64>() {
-            return n.max(1);
-        }
-    }
-    30
-}
-
-/// Compute all subscriber visibility masks in parallel via rayon.
-/// Takes the preencoded tick, the visibility filter, and subscriber positions.
-/// Returns a HashMap<subscriber_id, mask> where each mask is a Vec<bool> indicating
-/// which entities are visible to that subscriber.
+/// Returns an empty map iff no filter is active (callers then send the shared full frame).
 fn compute_visibility_masks(
     tick: &PreEncodedTick,
     filter: Option<&dyn IVisibilityFilter>,
-    subscriber_positions: &DashMap<u64, Vec3>,
+    subscriber_avatars: &DashMap<u64, Option<Uuid>>,
+    latest_positions: &HashMap<Uuid, Vec3>,
 ) -> HashMap<u64, Vec<bool>> {
     match filter {
         Some(f) => {
-            // Collect subscriber IDs and positions into a vec for parallel iteration
-            let subscribers: Vec<(u64, Vec3)> = subscriber_positions
+            let subscribers: Vec<(u64, Option<Uuid>)> = subscriber_avatars
                 .iter()
                 .map(|entry| (*entry.key(), *entry.value()))
                 .collect();
 
-            // Compute masks in parallel
             subscribers
                 .par_iter()
-                .map(|&(sub_id, obs_pos)| {
-                    let mask = f.filter(obs_pos, &tick.entity_metadata);
+                .map(|&(sub_id, avatar_id)| {
+                    let observer = avatar_id.and_then(|id| latest_positions.get(&id).copied());
+                    let mask = match observer {
+                        Some(pos) => f.filter(pos, &tick.entity_metadata),
+                        None => vec![false; tick.entity_metadata.len()], // default-deny
+                    };
                     (sub_id, mask)
                 })
                 .collect()
         }
-        None => {
-            // No filter active; no masks needed
-            HashMap::new()
-        }
+        None => HashMap::new(),
     }
 }
 
@@ -475,18 +474,16 @@ async fn ws_loop(
     let tx_clone = broadcast_tx.clone();
     let rx = Arc::new(std::sync::Mutex::new(state_rx));
 
-    // Shared subscriber position map: DashMap<subscriber_id, position>
-    // Updated by subscriber tasks on PLAYER_STATE, read by producer for mask computation.
-    let subscriber_positions = Arc::new(DashMap::new());
-    let positions_clone = subscriber_positions.clone();
-    // Moved into the producer task; drives per-subscriber AOI masks (None = no filtering).
+    // subscriber_id -> the subscriber's avatar entity id (None until it sends its first PlayerState).
+    // A subscriber is registered here on connect so AOI default-denies it until its avatar is known.
+    let subscriber_avatars: Arc<DashMap<u64, Option<Uuid>>> = Arc::new(DashMap::new());
+    let avatars_clone = subscriber_avatars.clone();
     let producer_filter = visibility_filter.clone();
 
     tokio::spawn(async move {
-        let recompute_interval = visibility_recompute_interval();
-        let mut cached_masks: Arc<HashMap<u64, Vec<bool>>> = Arc::new(HashMap::new());
-        let mut cached_entity_count: usize = 0;
-        let mut ticks_until_recompute: u64 = 0;
+        // Running cache of every entity's latest AUTHORITATIVE position, accumulated from the server's
+        // (sparse) deltas. Used to resolve each subscriber's observer position (its avatar) for AOI.
+        let mut latest_positions: HashMap<Uuid, Vec3> = HashMap::new();
 
         loop {
             let r = rx.clone();
@@ -495,25 +492,24 @@ async fn ws_loop(
                 .unwrap();
             match delta {
                 Ok(d) => {
-                    let tick = Arc::new(pre_encode_tick(&d));
-
-                    let entity_count = tick.entity_metadata.len();
-                    if ticks_until_recompute == 0 || entity_count != cached_entity_count {
-                        cached_masks = Arc::new(compute_visibility_masks(
-                            &tick,
-                            producer_filter.as_deref(),
-                            &positions_clone,
-                        ));
-                        cached_entity_count = entity_count;
-                        ticks_until_recompute = recompute_interval;
-                    } else {
-                        ticks_until_recompute -= 1;
+                    for e in &d.updated {
+                        latest_positions.insert(e.entity_id, e.position);
+                    }
+                    for id in &d.removed {
+                        latest_positions.remove(id);
                     }
 
-                    let broadcast = Arc::new(TickBroadcast {
-                        tick,
-                        masks: cached_masks.clone(),
-                    });
+                    let tick = Arc::new(pre_encode_tick(&d));
+                    // Recompute masks EVERY tick against this tick's entities (no cross-tick reuse — a
+                    // cached mask would misalign against the sparse, reordered delta).
+                    let masks = Arc::new(compute_visibility_masks(
+                        &tick,
+                        producer_filter.as_deref(),
+                        &avatars_clone,
+                        &latest_positions,
+                    ));
+
+                    let broadcast = Arc::new(TickBroadcast { tick, masks });
                     let _ = tx_clone.send(broadcast);
                 }
                 Err(_) => break,
@@ -553,7 +549,12 @@ async fn ws_loop(
         let updates_tx = client_updates_tx.clone();
         let actions_tx = game_actions_tx.clone();
         let stats = stats.clone();
-        let positions = subscriber_positions.clone();
+        let avatars = subscriber_avatars.clone();
+        // Whether AOI is active at all. When active, a subscriber with no mask is default-DENIED (sent the
+        // empty frame), never the full broadcast — so a client that never reports an avatar sees nothing.
+        let filter_active = visibility_filter.is_some();
+        // Register immediately so the producer accounts for this subscriber (default-deny) from tick one.
+        avatars.insert(subscriber_id, None);
 
         tokio::spawn(async move {
             loop {
@@ -568,9 +569,15 @@ async fn ws_loop(
                                         let len = b.len() as u64;
                                         (Message::Binary(b), len)
                                     }
+                                    // No mask for this subscriber: full frame iff AOI is OFF; otherwise
+                                    // default-DENY with the empty frame (never leak the world).
                                     None => {
-                                        let len = broadcast_arc.tick.shared_full_frame.len() as u64;
-                                        (Message::Binary((*broadcast_arc.tick.shared_full_frame).clone()), len)
+                                        let frame = if filter_active {
+                                            &broadcast_arc.tick.shared_empty_frame
+                                        } else {
+                                            &broadcast_arc.tick.shared_full_frame
+                                        };
+                                        (Message::Binary((**frame).clone()), frame.len() as u64)
                                     }
                                 };
                                 if ws_stream.send(bytes).await.is_err() {
@@ -597,15 +604,17 @@ async fn ws_loop(
                             Some(Ok(Message::Binary(bytes))) => {
                                 if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
                                     if let Some(entry) = entry_from_wire_player_state(&payload) {
-                                        // Update shared subscriber positions
-                                        positions.insert(subscriber_id, entry.position);
+                                        // Bind this subscriber to its avatar entity. The AOI observer
+                                        // position is then sourced from that entity's AUTHORITATIVE server
+                                        // position — not the client-reported one (which could be spoofed).
+                                        avatars.insert(subscriber_id, Some(entry.entity_id));
                                     }
                                 }
                                 let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
                             }
                             Some(Err(_)) | None => {
-                                // Subscriber disconnected; remove from position map
-                                positions.remove(&subscriber_id);
+                                // Subscriber disconnected; drop its AOI registration.
+                                avatars.remove(&subscriber_id);
                                 break;
                             },
                             // Text and other frame types are not part of the
@@ -615,8 +624,8 @@ async fn ws_loop(
                     }
                 }
             }
-            // Clean up position on task exit
-            positions.remove(&subscriber_id);
+            // Drop this subscriber's AOI registration on task exit.
+            avatars.remove(&subscriber_id);
         });
     }
 }

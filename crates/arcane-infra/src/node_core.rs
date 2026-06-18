@@ -195,7 +195,9 @@ impl NodeCore {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|r| *r > 0.0)
             .map(|r| {
-                eprintln!("AOI: L0 radius visibility filter enabled (radius={r} world units)");
+                eprintln!(
+                    "AOI: L1 spatial-radius visibility filter enabled (radius={r} world units)"
+                );
                 std::sync::Arc::new(arcane_core::visibility::RadiusVisibilityFilter::new(r))
                     as std::sync::Arc<dyn arcane_core::visibility::IVisibilityFilter>
             });
@@ -371,9 +373,16 @@ impl NodeCore {
         let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
         let outcome_tick = merged_delta.tick;
         let outcome_seq = merged_delta.seq;
+        // Durable persistence (bucket 4): snapshot the FULL authoritative set, not the sparse broadcast
+        // delta. `set_entities` is a full-replace reducer, so persisting only the changed entities would
+        // wipe unchanged ones from the durable table. Build the snapshot ONLY on persist ticks (the
+        // cadence check is cheap; the snapshot clone is not) — own entities only, neighbours persist theirs.
         #[cfg(feature = "spacetimedb-persist")]
         if let Some(ref persist) = self.persist {
-            persist.maybe_persist(self.tick_count, &merged_delta.updated);
+            if persist.is_persist_tick(self.tick_count) {
+                let snapshot = self.server.snapshot();
+                persist.maybe_persist(self.tick_count, &snapshot);
+            }
         }
         let _ = self.state_tx.send(merged_delta);
 

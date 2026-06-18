@@ -206,6 +206,12 @@ impl SpacetimeDbPersist {
         }
     }
 
+    /// Cheap cadence check so the caller can skip building a full entity snapshot on non-persist ticks
+    /// (snapshotting every tick just to throttle inside `maybe_persist` would defeat the throttle).
+    pub fn is_persist_tick(&self, tick: u64) -> bool {
+        tick.is_multiple_of(self.interval_ticks)
+    }
+
     pub fn maybe_persist(&self, tick: u64, entries: &[EntityStateEntry]) {
         if !should_persist_tick(tick, self.interval_ticks, entries.len()) {
             return;
