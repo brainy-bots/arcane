@@ -285,6 +285,13 @@ boundary size = replication cost. "Is this split worth it?" = "is the boundary
 small enough that two nodes replicating their boundary beats one node carrying
 everyone?"
 
+**Two split triggers.** The above (interaction min-cut) is the response to **CPU
+pressure**. A cluster can also hit a **memory ceiling** — terrain footprint from
+spatially-dispersed players (§9) — in which case the split criterion is **spatial
+separation**, not the interaction min-cut: peel off the geographically-distant
+group so its terrain unloads. So: CPU-bound → min-cut; memory-bound → spatial cut.
+See §9.
+
 Hysteresis/cooldown (already in `arcane-affinity`) rate-limits splits so they do
 not thrash; `SCALING_MODEL.md`'s K_max slack (~218 boundary entities on demo
 constants) means there is large tolerance before action is forced.
@@ -438,24 +445,60 @@ Kubernetes orchestration), so Plane 2 is nearly static, with one rule honored:
 (provision-on-overload, spot-aware placement) is the Sigil operator's job and a
 future seam. See [clustering-system-requirements.md](clustering-system-requirements.md) §11.
 
-### Cluster vs container vs process (refines Model B's identity collapse)
-Model B (`#170`) set 1 cluster = 1 container = 1 engine process. That was priced
-for engine-less Arcane; it is **too expensive once a cluster hosts a real engine**
-(a UE/Godot/Rapier process is heavy). The target decouples:
+### Terrain footprint, split criteria, and capability-class provisioning
 
-```
-Machine → Process (the provisioned unit) → Simulation context / engine island (1..N per process) → Cluster (logical ownership group, 1..M per context) → Entities
-```
+**1 cluster = 1 process (Model B) is retained.** An earlier idea to decouple
+cluster / simulation-context / process was **retracted**: it rested on a false
+premise (that sparse spatial pockets imply many clusters). They do not — the
+clustering policy (§5) **minimizes cluster count** (pack everything into as few
+clusters as load allows; split only under resource pressure), so 100 sparse
+groups of 3 players is *one* cluster on *one* node, not 100. Cluster count is
+bounded by load, never by world structure. No decoupling is needed.
 
-Many small clusters **pack** into one process (isolated pockets = cheap Rapier
-islands / UE sublevels, not whole processes); hot clusters get their own process
-for isolation + vertical scaling (the `SCALING_MODEL.md` vertical trigger).
-Migration within a process is near-free (relabel in shared memory); across
-processes uses the network handoff. **This reverses part of `#170` and is
-architecture-affecting — it requires founder sign-off and a per-engine
-feasibility note** (Rapier: trivial multi-island; UE: world-partition/sublevels
-but heavy, may stay closer to 1:1). Clusters-per-process becomes an engine-tier
-capability dimension.
+**Terrain footprint is a per-node cost, but it needs no new mechanism.** Terrain
+authority (Primitive #5; ADR-002 / terrain epic `#119`) loads ambient world
+geometry per a cluster's entity positions. Players scattered across a large map
+force one cluster to load many terrain regions → high RAM. This is not a new
+budget term: it flows through the **existing Sigil resource-pressure signal** — a
+memory-heavy cluster trips Sigil's RAM warning *sooner*, which pushes the Manager
+to split, exactly as a CPU-heavy cluster trips the CPU threshold.
+
+**Two split triggers, two split criteria:**
+
+| Trigger (which ceiling) | Split criterion | Why |
+|---|---|---|
+| **CPU / compute pressure** | interaction **min-cut** (§5) | separate the least-interacting subgroup; minimizes cross-node replication |
+| **Memory / terrain pressure** | **spatial separation** | move the geographically-distant group to another node so its terrain regions unload from the overloaded process |
+
+The Manager also factors **spatial dispersion into placement proactively**: it
+treats a cluster's spatial spread as a memory-cost signal, keeping same-region
+players together (terrain loaded once) and isolating the memory-expensive
+scattered groups, with the Sigil RAM warning as the hard backstop. Co-locating
+*unrelated* same-region players is correct — it loads that region's terrain once.
+Terrain is duplicated across nodes only when a region's population exceeds one
+node's compute budget (a forced split), which is the only time you pay to load
+the same terrain twice.
+
+**Capability-class provisioning (the elasticity tier — `p` at ~minutes).** When
+the Manager needs a node, it requests the **capability class matching the workload
+shape** from Sigil — not just "a node":
+
+- **Dispersed / sparse load (memory-bound)** → request a **memory-optimized**
+  instance (r-class). Concentrated clusters go on compute nodes; sparse clusters
+  go on memory nodes.
+- **Forming battle (compute-bound, detected via the interaction graph before
+  contact)** → request a **compute-optimized, high-single-thread** instance
+  (c-class), *predictively*, ahead of the spike.
+
+This is the `clustering-system-requirements.md` §4 **workload-vector →
+capability-vector** match. **The Manager asks; Sigil provisions and reports
+capacity/cost/spot-risk back** (the "intentionally dumb execution layer"). The
+selection is a **game-tunable heuristic**: not "always keep one of each extreme"
+(wasteful) — a single rule (dense→compute, sparse→memory) whose aggressiveness,
+and whether both classes are ever used, is per-game (a pure-arena game is
+effectively all-compute; a pure-exploration game all-memory). L0 default rule;
+L1+ game-specific policy, same as every primitive. See [[Sigil Operator]],
+[[Host CRD]].
 
 ---
 
@@ -508,8 +551,10 @@ justifies it.
 2. **Predictor sharding boundary** (region vs entity vs pair). Region is natural
    (matches clusters); cross-region pairs are the low-`p` tail.
 3. **Manager region-sharding trigger** — when one machine's graph is exceeded.
-4. **Cluster-per-process model per engine tier** (§9) — requires founder sign-off
-   (reverses part of `#170`) and per-engine feasibility.
+4. **Capability-selection heuristic** (§9) — the dense→compute / sparse→memory
+   rule the Manager uses to request instance classes from Sigil is game-tunable
+   (L0 default, L1+ game policy); its exact form is TBD and learned from telemetry
+   in production.
 5. **Prediction stability enforcement** (hysteresis + horizon) as an explicit
    requirement, since incremental re-partition cost depends on it.
 
