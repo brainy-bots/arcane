@@ -30,8 +30,9 @@ subject to per-node compute budget and per-link bandwidth budget
 ```
 
 This layer is the machinery that computes `p`, turns it into per-entity
-**refresh rates**, and executes the ownership handoffs (**live authority
-migration**) it implies. It is **game-agnostic and multi-tenant**: it operates
+**refresh rates**, and executes the ownership changes (**live authority
+migration** — a two-step "replicate then flip ownership", not a state handoff;
+see §8) it implies. It is **game-agnostic and multi-tenant**: it operates
 only on interaction *metadata* (who is likely to interact with whom, who owns
 what, at what rate) and never reads game semantics (HP, spells, factions) except
 through a pluggable feature interface at the predictor boundary.
@@ -369,28 +370,62 @@ the Manager's imperfection harmless:
 ## 8. Live authority migration — the linchpin (paper C3, `#170`, ADR-002 Layer 3)
 
 The whole layer's headline capability, and the one the demo (Arcane Arena) has
-**never** exercised (ownership is static today). Migration is a natural
-consequence of the rate field: **an entity is migratable A→B only if B already
-receives it at high rate** (B is warm), so migration is an authority flip, not a
-cold state transfer.
+**never** exercised (ownership is static today).
 
-Design fork resolved in the demo runtime (which is Redis-authoritative, not
-SpacetimeDB-authoritative on the hot path): the migrated entity's live state is
-already flowing to B via the rate field, so the handoff is:
+### There is no handoff. Migration is a two-step ownership change.
 
-1. Manager decides `e: A→B` (from the partition).
-2. Ensure B is warm (already true if `e` is a migration candidate — it was in
-   the rate field to B).
-3. **Dest-adopts-before-source-releases** authority flip (single-writer safety;
-   the local-wins merge dedup covers the one-tick overlap). Source stops writing
-   `e` at end-of-tick.
-4. Client redirect (`CLUSTER_REASSIGN`) only if `e` is a player.
-5. Confirm/abort: on timeout `e` stays on A (safe default).
+**All simulation state is ephemeral** (Redis, tick by tick). A node owns exactly
+the entities it writes; every other node that cares about an entity is already
+**replicating it in real time from Redis**. SpacetimeDB is **never** authoritative
+for a running entity — it is a throttled crash-recovery snapshot, read only at
+cold restart (a full-fleet restart with no running owner). For any live entity on
+a running node, SpacetimeDB is always behind and irrelevant to the hot path.
 
-This refines Model B (`#170`): merge/split is orchestrator-level (Manager
-decides, Sigil provisions), migration is Redis-warm-up + authority flip. The old
-`#78`-era in-process `ServerPool` shuffle (dangling commit `47ab6b0`) is
-reference-only — do not revive. See the migration executor epic.
+So there is **no state transfer, no snapshot, no handoff protocol.** Migration is
+a **two-step operation**:
+
+1. **Add the entity to the destination cluster's replication interest.** B starts
+   receiving `e`'s state each frame — the *ordinary* interest/rate mechanism
+   (§2.3, §4), not migration-specific machinery.
+2. **Give the destination ownership.** A stops writing `e` at end-of-its-tick, B
+   starts writing `e`. Ephemeral, via Redis. The local-wins merge dedup covers the
+   one-tick overlap.
+
+With two rules:
+- **Skip step 1 if B already replicates `e`** — the common interaction-driven case.
+  `e` was already high-rate to B (that is *why* it is a migration candidate), so
+  migration is just step 2.
+- **Require a few frames (`N`) of confirmed replication between step 1 and step 2**
+  — a safety buffer so B is provably current before it takes over. This absorbs
+  Redis jitter; it is a margin, not a correctness requirement.
+
+```
+migrate(e, A → B):
+  if B does not already replicate e:
+     add e to B's replication interest             # step 1 (reuses the interest mechanism)
+     wait until B has replicated e for >= N frames  # safety buffer
+  flip ownership: A stops writing e at end-of-tick, B starts   # step 2 (ephemeral, Redis)
+  if e is a player: CLUSTER_REASSIGN to its client (reconnect to B)
+```
+
+### The invariant: replication always precedes ownership
+
+The Manager **never** flips ownership to a node that is not already (or newly, via
+step 1) replicating the entity. A cluster never exists without an interest list —
+**starting a server means giving it a set of players to track**, and that happens
+well *before* any ownership change: the server starts, begins replicating, players
+receive its state each frame, and only once the Manager is sure the destination
+has the entity replicated and current does ownership flip. There is no scenario —
+interaction-driven or infrastructure-driven (new/empty cluster, load/spot
+rebalance, whole-cluster move, split into a new node) — where the target lacks
+replication at flip time, because step 1 establishes it first in every case.
+
+This refines Model B (`#170`): merge/split is orchestrator-level (Manager decides,
+Sigil provisions), and *migration itself* is just an ephemeral ownership-bit flip
+on an already-replicating node — no in-process `ServerPool` shuffle (the old
+`#78`-era `47ab6b0` is reference-only, do not revive), no SpacetimeDB write.
+Guardrails (cooldown, rate limit, CPU cap, max in-flight) gate the flip. See the
+migration executor epic (#207).
 
 ---
 
