@@ -1,6 +1,6 @@
 [package]
 name = "arcane-infra"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Arcane Engine — ArcaneManager, ArcaneNode, ReplicationChannelManager, RPCHandler (IN-01, 02, 05, 06)"
 
