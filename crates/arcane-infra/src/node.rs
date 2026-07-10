@@ -247,6 +247,19 @@ impl ArcaneNode {
         self.entities.lock().expect("entities lock").len()
     }
 
+    /// Snapshot (clone) of all current authoritative entities. Durable persistence needs the FULL set
+    /// each cycle — the broadcast delta is sparse (only velocity-changed/new/resync entities), so feeding
+    /// it to a full-replace persistence reducer would drop unchanged entities. Cloned under the lock;
+    /// only called at the throttled persist cadence (e.g. 1 Hz), so the cost is amortized.
+    pub fn snapshot(&self) -> Vec<EntityStateEntry> {
+        self.entities
+            .lock()
+            .expect("entities lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn cluster_id(&self) -> Uuid {
         self.cluster_id
     }

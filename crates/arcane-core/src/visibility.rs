@@ -27,6 +27,36 @@ pub trait IVisibilityFilter: Send + Sync {
     fn filter(&self, observer_position: Vec3, entities: &[(Uuid, Vec3)]) -> Vec<bool>;
 }
 
+/// L1 spatial-radius area-of-interest override: an observer receives only entities within `radius`
+/// of its position. Pure distance — no interaction graph or line-of-sight.
+///
+/// NOTE on the ladder: the documented L0 default is *interaction-graph-determined* visibility (Arcane
+/// partitions by predicted interaction probability, NOT space). That L0 is not yet implemented; this
+/// radius filter is the L1 spatial override, shipped early as a usable stopgap default. It lives in core
+/// so users get *some* AOI for free; the interaction-graph L0 and higher levels (L2 LOS, L3 predicate,
+/// L4 per-field) are `arcane-primitives` scope. Don't mistake this for the headline clustering premise.
+pub struct RadiusVisibilityFilter {
+    radius_sq: f64,
+}
+
+impl RadiusVisibilityFilter {
+    /// Build a radius filter. `radius` is in world units (same space as entity positions).
+    pub fn new(radius: f64) -> Self {
+        Self {
+            radius_sq: radius * radius,
+        }
+    }
+}
+
+impl IVisibilityFilter for RadiusVisibilityFilter {
+    fn filter(&self, observer_position: Vec3, entities: &[(Uuid, Vec3)]) -> Vec<bool> {
+        entities
+            .iter()
+            .map(|(_, pos)| observer_position.distance_sq_to(pos) <= self.radius_sq)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

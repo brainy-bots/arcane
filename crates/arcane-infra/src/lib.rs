@@ -15,6 +15,7 @@
 
 #[cfg(feature = "cluster-ws")]
 pub mod broadcast_channel_cap;
+pub mod fixed_timestep;
 pub mod manager;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
@@ -26,6 +27,8 @@ pub mod rpc_handler;
 pub mod spacetimedb_persist;
 pub mod tick_rate;
 
+#[cfg(feature = "cluster-ws")]
+pub mod node_core;
 #[cfg(feature = "cluster-ws")]
 pub mod node_runner;
 #[cfg(feature = "cluster-ws")]
