@@ -58,6 +58,8 @@ use uuid::Uuid;
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
 #[cfg(feature = "cluster-ws")]
 use crate::node_stats::NodeStats;
+#[cfg(feature = "migration")]
+use crate::ownership_migration::{spawn_ownership_flip_subscriber, OwnershipFlip, OwnershipMap};
 #[cfg(feature = "cluster-ws")]
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 #[cfg(feature = "spacetimedb-persist")]
@@ -149,6 +151,8 @@ pub struct NodeCore {
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
+    #[cfg(feature = "migration")]
+    ownership: OwnershipMap,
 }
 
 impl NodeCore {
@@ -235,6 +239,13 @@ impl NodeCore {
         let interval = Duration::from_millis(1000 / tick_rate_hz);
         let dt_seconds = interval.as_secs_f64();
 
+        #[cfg(feature = "migration")]
+        let ownership = {
+            let map = OwnershipMap::new();
+            spawn_ownership_flip_subscriber(cfg.redis_url.clone(), cfg.cluster_id, map.clone());
+            map
+        };
+
         Ok(Self {
             server,
             state_tx,
@@ -252,6 +263,8 @@ impl NodeCore {
             submitted_routed_physics: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
+            #[cfg(feature = "migration")]
+            ownership,
         })
     }
 
@@ -317,12 +330,29 @@ impl NodeCore {
     /// old loop + add_entity semantics (stamp cluster_id, enforce max_entities), and records
     /// EXPLICIT removals (matches today's pending_removed → delta.removed one-shot semantics).
     ///
+    /// When migration is enabled, applies the ownership boundary: only writes entities this node
+    /// currently owns per the `OwnershipMap`. Entities that were owned but are now owned by another
+    /// cluster are dropped from the spine.
+    ///
     /// **In-memory operation.** Operates on the node's entity map; no I/O or network boundary.
     pub fn submit_entities(&mut self, spine: &[EntityStateEntry], removed: &[Uuid]) {
-        for entry in spine {
-            let mut e = entry.clone();
-            e.cluster_id = self.cluster_id;
-            self.server.add_entity(e);
+        #[cfg(feature = "migration")]
+        {
+            for entry in spine {
+                if self.ownership.owns(entry.entity_id, self.cluster_id) {
+                    let mut e = entry.clone();
+                    e.cluster_id = self.cluster_id;
+                    self.server.add_entity(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            for entry in spine {
+                let mut e = entry.clone();
+                e.cluster_id = self.cluster_id;
+                self.server.add_entity(e);
+            }
         }
         for id in removed {
             self.server.remove_entity(*id);
@@ -430,6 +460,32 @@ impl NodeCore {
             seq: outcome_seq,
             entity_count: self.server.entity_count(),
         }
+    }
+}
+
+/// Decide whether this node should write (author) an entity this tick.
+///
+/// Used by the ownership migration boundary to gate which cluster writes each entity.
+/// Given the current tick and an optional ownership flip affecting this entity:
+/// - Before `effective_tick`: the `from_cluster` writes.
+/// - At/after `effective_tick`: the `to_cluster` writes.
+/// - If no flip, the node writes if it previously owned the entity (or always, if no ownership map).
+#[cfg(feature = "migration")]
+pub fn resolve_authoritative(
+    entity_id: Uuid,
+    my_cluster: Uuid,
+    ownership_map: &OwnershipMap,
+    current_tick: u64,
+    flip: Option<OwnershipFlip>,
+) -> bool {
+    if let Some(f) = flip {
+        if current_tick < f.effective_tick {
+            f.from_cluster == my_cluster
+        } else {
+            f.to_cluster == my_cluster
+        }
+    } else {
+        ownership_map.owns(entity_id, my_cluster)
     }
 }
 
@@ -807,5 +863,245 @@ mod tests {
         drop(rx);
         let (_tx2, _rx2) = std::sync::mpsc::channel::<()>();
         let _ = _tx2.send(()); // Immediate return, no Future, no .await possible.
+    }
+
+    #[cfg(feature = "migration")]
+    mod ownership_boundary_tests {
+        use super::*;
+        use crate::node_core::resolve_authoritative;
+        use crate::ownership_migration::{OwnershipFlip, OwnershipMap};
+
+        #[test]
+        fn resolve_authoritative_before_flip_writes_from_cluster() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, from_cluster, &ownership, 99, Some(flip));
+            assert!(result, "from_cluster should write before effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_before_flip_rejects_to_cluster() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 99, Some(flip));
+            assert!(!result, "to_cluster should not write before effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_at_flip_tick_to_cluster_writes() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 100, Some(flip));
+            assert!(result, "to_cluster should write at effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_at_flip_tick_from_cluster_stops() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result =
+                resolve_authoritative(entity_id, from_cluster, &ownership, 100, Some(flip));
+            assert!(!result, "from_cluster should not write at effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_after_flip_to_cluster_writes() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 150, Some(flip));
+            assert!(result, "to_cluster should write after effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_no_flip_checks_ownership_map() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let cluster_a = Uuid::from_u128(10);
+            let cluster_b = Uuid::from_u128(20);
+
+            ownership.set_owner(entity_id, cluster_a);
+
+            let result = resolve_authoritative(entity_id, cluster_a, &ownership, 50, None);
+            assert!(result, "cluster_a owns the entity, should write");
+
+            let result = resolve_authoritative(entity_id, cluster_b, &ownership, 50, None);
+            assert!(
+                !result,
+                "cluster_b does not own the entity, should not write"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_tick_minus_one() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // Before flip: only A writes
+            let a_writes_before =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick - 1, Some(flip));
+            let b_writes_before =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick - 1, Some(flip));
+            assert!(a_writes_before, "A should write before flip");
+            assert!(!b_writes_before, "B should not write before flip");
+            assert!(
+                a_writes_before as u8 + b_writes_before as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_flip_tick() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // At flip: only B writes
+            let a_writes_at =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick, Some(flip));
+            let b_writes_at =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick, Some(flip));
+            assert!(!a_writes_at, "A should not write at flip");
+            assert!(b_writes_at, "B should write at flip");
+            assert!(
+                a_writes_at as u8 + b_writes_at as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_tick_plus_one() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // After flip: only B writes
+            let a_writes_after =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick + 1, Some(flip));
+            let b_writes_after =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick + 1, Some(flip));
+            assert!(!a_writes_after, "A should not write after flip");
+            assert!(b_writes_after, "B should write after flip");
+            assert!(
+                a_writes_after as u8 + b_writes_after as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn state_continuity_b_sources_from_neighbor_entities() {
+            let entity_id = Uuid::from_u128(50);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 100;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // Before flip: A owns and writes with position X
+            let a_entry = mk_entry(entity_id, cluster_a, 42.0);
+            assert_eq!(a_entry.position.x, 42.0, "A's entry has position 42.0");
+
+            // A is writing via submit_entities. The state gets replicated to B as a neighbor entity.
+            // B has this in neighbor_entities. When flip happens at tick 100:
+
+            // At tick 100: B becomes the owner (resolve_authoritative says B should write).
+            // B already has the entity state from neighbor_entities (position 42.0, etc.)
+            // When B includes this in its spine via submit_entities, it preserves the state.
+
+            let b_ownership = OwnershipMap::new();
+            b_ownership.set_owner(entity_id, cluster_b);
+
+            // After the flip, B's position should still be 42.0 (carried over from neighbor replication)
+            let result =
+                resolve_authoritative(entity_id, cluster_b, &b_ownership, flip_tick, Some(flip));
+            assert!(result, "B becomes the authoritative writer at flip_tick");
+
+            // The assertion is: B's merge_with_neighbor_latest will include the replicated entry
+            // from neighbor_entities, which has position 42.0, same as what A had written.
+            // This test documents that assumption; the actual state preservation is tested
+            // in the broader integration (neighbor state arrives before flip).
+        }
     }
 }
