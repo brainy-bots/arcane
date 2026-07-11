@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn gate_skip_if_already_replicating_scenario() {
-        let mut gate = ReplicationGate::new();
+        let gate = ReplicationGate::new();
         let entity = Uuid::from_u128(1);
         let dest_neighbors = vec![Uuid::from_u128(10), Uuid::from_u128(20)];
         let source = Uuid::from_u128(20);
