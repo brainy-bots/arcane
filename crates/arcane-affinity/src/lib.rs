@@ -5,7 +5,7 @@ pub mod scorer;
 
 use config::AffinityConfig;
 use hysteresis::MigrationState;
-use interaction_graph::InteractionGraph;
+use interaction_graph::{InteractionGraph, InteractionKind};
 use scorer::score_entity;
 
 use arcane_core::{
@@ -63,6 +63,7 @@ impl AffinityEngine {
                             a.player_id,
                             b.player_id,
                             self.config.weight_party_member,
+                            InteractionKind::PartyMember,
                         );
                     }
                 }
@@ -73,6 +74,7 @@ impl AffinityEngine {
                             a.player_id,
                             b.player_id,
                             self.config.weight_guild_member,
+                            InteractionKind::GuildMember,
                         );
                     }
                 }
@@ -92,6 +94,7 @@ impl AffinityEngine {
                         a.player_id,
                         b.player_id,
                         self.config.weight_proximity_per_tick,
+                        InteractionKind::Proximity,
                     );
                 }
             }
@@ -607,7 +610,7 @@ mod tests {
         // Seed a single interaction with the C2 partner (weight 1.0).
         {
             let mut graph = engine.interaction_graph.lock().unwrap();
-            graph.record_interaction(entity, c2_partner, 1.0);
+            graph.record_interaction(entity, c2_partner, 1.0, InteractionKind::Proximity);
         }
 
         let view_threshold = make_view(
@@ -633,7 +636,7 @@ mod tests {
         // Add strong interaction with C2 partner: total weight now >> migration_threshold.
         {
             let mut graph = engine.interaction_graph.lock().unwrap();
-            graph.record_interaction(entity, c2_partner, 10.0);
+            graph.record_interaction(entity, c2_partner, 10.0, InteractionKind::Proximity);
         }
         // Also clear any existing assignment cache so entity starts fresh from C1.
         {
@@ -655,7 +658,7 @@ mod tests {
             let mut graph = engine.interaction_graph.lock().unwrap();
             // Replace weights: heavy C1 interaction, zero C2
             graph.remove_entity(c2_partner);
-            graph.record_interaction(entity, c1_partner, 20.0);
+            graph.record_interaction(entity, c1_partner, 20.0, InteractionKind::Proximity);
         }
 
         let view_cooldown = make_view(
