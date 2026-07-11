@@ -296,15 +296,10 @@ mod tests {
 
     #[test]
     fn gate_skip_if_already_replicating_scenario() {
-        let gate = ReplicationGate::new();
-        let entity = Uuid::from_u128(1);
         let dest_neighbors = vec![Uuid::from_u128(10), Uuid::from_u128(20)];
         let source = Uuid::from_u128(20);
 
-        // If already replicating, gate is immediately satisfiable.
-        if already_replicates(&dest_neighbors, source) {
-            // Skip step 1; go straight to checking gate (which is implicitly satisfied).
-            assert!(gate.is_confirmed(entity, 3) || true); // Or we set a flag; gate doesn't need to be tracked.
-        }
+        // If already replicating, gate is immediately satisfiable (replication is already in place).
+        assert!(already_replicates(&dest_neighbors, source));
     }
 }
