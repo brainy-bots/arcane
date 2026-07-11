@@ -43,6 +43,9 @@ pub mod ws_server;
 #[cfg(feature = "rapier-cluster")]
 pub mod rapier_cluster;
 
+#[cfg(feature = "migration")]
+pub mod ownership_migration;
+
 #[cfg(feature = "cluster-ws")]
 pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 #[cfg(feature = "cluster-ws")]

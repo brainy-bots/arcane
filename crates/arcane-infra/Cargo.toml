@@ -31,6 +31,7 @@ manager = ["dep:axum", "dep:tokio"]
 cluster-ws = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:rayon", "dep:libc", "dep:dashmap"]
 spacetimedb-persist = ["dep:reqwest"]
 affinity-clustering = ["dep:arcane-affinity"]
+migration = ["affinity-clustering"]
 rapier-cluster = ["cluster-ws", "dep:rapier3d"]
 
 [[bin]]
