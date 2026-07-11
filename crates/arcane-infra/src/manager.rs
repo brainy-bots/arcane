@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[cfg(feature = "migration")]
+use crate::ownership_migration::OwnershipFlip;
+
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ArcaneManager {
     model: Arc<dyn IClusteringModel>,
@@ -38,6 +41,11 @@ struct MigrationState {
     max_in_flight: usize,
     /// Current tick counter for cooldown tracking.
     current_tick: u64,
+    /// Ownership-flip decisions made this cycle, awaiting drain by the caller.
+    /// The Manager decides but never publishes (design §3: it never talks to clusters
+    /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
+    /// actuates them (the Router's job in the target architecture).
+    pending_flips: Vec<OwnershipFlip>,
 }
 
 impl ArcaneManager {
@@ -234,7 +242,13 @@ impl ArcaneManager {
                 if desired_cluster != current_cluster {
                     // Decision is to migrate this entity.
                     if self.migration_state.can_migrate(entity_id) {
-                        self.migration_state.record_migration(entity_id);
+                        let flip = OwnershipFlip {
+                            entity_id,
+                            from_cluster: current_cluster,
+                            to_cluster: desired_cluster,
+                            effective_tick: self.migration_state.current_tick,
+                        };
+                        self.migration_state.record_migration(flip);
                         eprintln!(
                             "Migration initiated for entity {} from {} to {}",
                             entity_id, current_cluster, desired_cluster
@@ -274,6 +288,23 @@ impl ArcaneManager {
         self.allocated_servers.len() as u32
     }
 
+    /// Drain the ownership-flip decisions produced by `run_evaluation_cycle`.
+    ///
+    /// The Manager decides migrations and records them but never publishes to clusters
+    /// itself (design §3: the Manager writes decisions where the Router reads them, and
+    /// never talks to clusters directly). The caller (a node/router/test harness) drains
+    /// the decisions here and actuates them — publishing each `OwnershipFlip` via
+    /// `OwnershipFlipPublisher`. Draining acknowledges the in-flight decisions, so the
+    /// in-flight guardrail counter is decremented per drained flip.
+    #[cfg(feature = "migration")]
+    pub fn take_pending_flips(&mut self) -> Vec<OwnershipFlip> {
+        let flips = std::mem::take(&mut self.migration_state.pending_flips);
+        for _ in 0..flips.len() {
+            self.migration_state.complete_migration();
+        }
+        flips
+    }
+
     /// Snapshot of cluster geometry from the spatial index (for visualization / debugging).
     pub fn snapshot_for_view(&self) -> Vec<arcane_core::ClusterGeometry> {
         self.spatial_index.snapshot_for_view()
@@ -289,6 +320,7 @@ impl MigrationState {
             in_flight_count: 0,
             max_in_flight: 5,
             current_tick: 1,
+            pending_flips: Vec::new(),
         }
     }
 
@@ -307,15 +339,16 @@ impl MigrationState {
         cooldown_elapsed && under_cap
     }
 
-    /// Mark an entity as migrated.
-    fn record_migration(&mut self, entity_id: Uuid) {
-        self.last_migrated.insert(entity_id, self.current_tick);
+    /// Mark an entity as migrated and record the ownership-flip decision for the caller
+    /// to drain and actuate. In-flight count increments here; it decrements when the
+    /// decision is drained via `take_pending_flips` (see `complete_migration`).
+    fn record_migration(&mut self, flip: OwnershipFlip) {
+        self.last_migrated.insert(flip.entity_id, self.current_tick);
         self.in_flight_count += 1;
+        self.pending_flips.push(flip);
     }
 
-    /// Decrement in-flight count (call when migration completes or is rejected).
-    /// Reserved for future use when the full two-step migration pipeline tracks completion.
-    #[allow(dead_code)]
+    /// Decrement in-flight count when a recorded decision is drained/acknowledged.
     fn complete_migration(&mut self) {
         if self.in_flight_count > 0 {
             self.in_flight_count -= 1;
@@ -335,6 +368,16 @@ impl MigrationState {
 mod migration_tests {
     use super::*;
 
+    /// Build a minimal flip for an entity (from/to clusters are placeholders for guardrail tests).
+    fn mk_flip(entity_id: Uuid) -> OwnershipFlip {
+        OwnershipFlip {
+            entity_id,
+            from_cluster: Uuid::from_u128(0xA),
+            to_cluster: Uuid::from_u128(0xB),
+            effective_tick: 1,
+        }
+    }
+
     #[test]
     fn migration_state_can_migrate_initially_true() {
         let state = MigrationState::new();
@@ -348,7 +391,7 @@ mod migration_tests {
         let entity = Uuid::from_u128(1);
 
         // Record a migration
-        state.record_migration(entity);
+        state.record_migration(mk_flip(entity));
         assert!(
             !state.can_migrate(entity),
             "entity should be in cooldown immediately"
@@ -385,7 +428,7 @@ mod migration_tests {
                 state.can_migrate(entity),
                 "should migrate until cap is reached"
             );
-            state.record_migration(entity);
+            state.record_migration(mk_flip(entity));
         }
 
         // Next entity should be blocked by cap
@@ -401,10 +444,42 @@ mod migration_tests {
         let mut state = MigrationState::new();
         let entity = Uuid::from_u128(1);
 
-        state.record_migration(entity);
+        state.record_migration(mk_flip(entity));
         assert_eq!(state.in_flight_count, 1);
 
         state.complete_migration();
         assert_eq!(state.in_flight_count, 0);
+    }
+
+    #[test]
+    fn record_migration_records_pending_flip() {
+        let mut state = MigrationState::new();
+        let entity = Uuid::from_u128(7);
+        state.record_migration(mk_flip(entity));
+        assert_eq!(state.pending_flips.len(), 1);
+        assert_eq!(state.pending_flips[0].entity_id, entity);
+        assert_eq!(state.in_flight_count, 1);
+    }
+
+    #[test]
+    fn take_pending_flips_drains_and_decrements_in_flight() {
+        let mut manager = ArcaneManager::with_defaults();
+        // Record two decisions directly on the guardrail state.
+        manager
+            .migration_state
+            .record_migration(mk_flip(Uuid::from_u128(1)));
+        manager
+            .migration_state
+            .record_migration(mk_flip(Uuid::from_u128(2)));
+        assert_eq!(manager.migration_state.in_flight_count, 2);
+
+        let drained = manager.take_pending_flips();
+        assert_eq!(drained.len(), 2, "both recorded flips are drained");
+        assert_eq!(
+            manager.migration_state.in_flight_count, 0,
+            "draining acknowledges the in-flight decisions"
+        );
+        // Second drain is empty.
+        assert!(manager.take_pending_flips().is_empty());
     }
 }
