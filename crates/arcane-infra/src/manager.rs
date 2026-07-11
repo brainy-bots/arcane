@@ -1,5 +1,7 @@
 //! ArcaneManager (IN-01) — central coordinator.
 
+#[cfg(feature = "migration")]
+use crate::ownership_migration::OwnershipFlip;
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
     types::Vec2,
@@ -38,6 +40,8 @@ struct MigrationState {
     max_in_flight: usize,
     /// Current tick counter for cooldown tracking.
     current_tick: u64,
+    /// Pending ownership flips to be published by the caller.
+    pending_flips: Vec<OwnershipFlip>,
 }
 
 impl ArcaneManager {
@@ -234,7 +238,11 @@ impl ArcaneManager {
                 if desired_cluster != current_cluster {
                     // Decision is to migrate this entity.
                     if self.migration_state.can_migrate(entity_id) {
-                        self.migration_state.record_migration(entity_id);
+                        self.migration_state.record_migration(
+                            entity_id,
+                            current_cluster,
+                            desired_cluster,
+                        );
                         eprintln!(
                             "Migration initiated for entity {} from {} to {}",
                             entity_id, current_cluster, desired_cluster
@@ -278,6 +286,22 @@ impl ArcaneManager {
     pub fn snapshot_for_view(&self) -> Vec<arcane_core::ClusterGeometry> {
         self.spatial_index.snapshot_for_view()
     }
+
+    /// Drain and return all pending ownership flips from the current evaluation cycle.
+    /// The caller (router/actuation layer) publishes these and should call
+    /// `acknowledge_pending_flips()` after successful publication.
+    /// This keeps the manager pure (no Redis), per design §3.
+    #[cfg(feature = "migration")]
+    pub fn take_pending_flips(&mut self) -> Vec<OwnershipFlip> {
+        self.migration_state.take_pending_flips()
+    }
+
+    /// Acknowledge N flips that were published, decrementing in-flight count.
+    /// Call this after successfully publishing flips obtained from `take_pending_flips()`.
+    #[cfg(feature = "migration")]
+    pub fn acknowledge_pending_flips(&mut self, count: usize) {
+        self.migration_state.acknowledge_flips(count);
+    }
 }
 
 #[cfg(feature = "migration")]
@@ -289,6 +313,7 @@ impl MigrationState {
             in_flight_count: 0,
             max_in_flight: 5,
             current_tick: 1,
+            pending_flips: Vec::new(),
         }
     }
 
@@ -307,18 +332,36 @@ impl MigrationState {
         cooldown_elapsed && under_cap
     }
 
-    /// Mark an entity as migrated.
-    fn record_migration(&mut self, entity_id: Uuid) {
+    /// Mark an entity as migrated and queue an OwnershipFlip for publication.
+    fn record_migration(&mut self, entity_id: Uuid, from_cluster: Uuid, to_cluster: Uuid) {
         self.last_migrated.insert(entity_id, self.current_tick);
         self.in_flight_count += 1;
+        let flip = OwnershipFlip {
+            entity_id,
+            from_cluster,
+            to_cluster,
+            effective_tick: self.current_tick,
+        };
+        self.pending_flips.push(flip);
     }
 
-    /// Decrement in-flight count (call when migration completes or is rejected).
-    /// Reserved for future use when the full two-step migration pipeline tracks completion.
-    #[allow(dead_code)]
+    /// Decrement in-flight count (call when migration completes or is acknowledged).
     fn complete_migration(&mut self) {
         if self.in_flight_count > 0 {
             self.in_flight_count -= 1;
+        }
+    }
+
+    /// Drain and return all pending flips. Called by the actuation layer (not the manager itself).
+    /// The caller publishes these and calls `acknowledge_flips()` to decrement in-flight count.
+    fn take_pending_flips(&mut self) -> Vec<OwnershipFlip> {
+        self.pending_flips.drain(..).collect()
+    }
+
+    /// Acknowledge N flips that were published, decrementing in-flight count.
+    fn acknowledge_flips(&mut self, count: usize) {
+        for _ in 0..count {
+            self.complete_migration();
         }
     }
 
@@ -348,7 +391,7 @@ mod migration_tests {
         let entity = Uuid::from_u128(1);
 
         // Record a migration
-        state.record_migration(entity);
+        state.record_migration(entity, Uuid::from_u128(10), Uuid::from_u128(20));
         assert!(
             !state.can_migrate(entity),
             "entity should be in cooldown immediately"
@@ -385,7 +428,7 @@ mod migration_tests {
                 state.can_migrate(entity),
                 "should migrate until cap is reached"
             );
-            state.record_migration(entity);
+            state.record_migration(entity, Uuid::from_u128(10), Uuid::from_u128(20 + i as u128));
         }
 
         // Next entity should be blocked by cap
@@ -400,11 +443,66 @@ mod migration_tests {
     fn migration_state_completes_migration() {
         let mut state = MigrationState::new();
         let entity = Uuid::from_u128(1);
+        let from = Uuid::from_u128(10);
+        let to = Uuid::from_u128(20);
 
-        state.record_migration(entity);
+        state.record_migration(entity, from, to);
         assert_eq!(state.in_flight_count, 1);
 
         state.complete_migration();
+        assert_eq!(state.in_flight_count, 0);
+    }
+
+    #[test]
+    fn migration_state_records_flip_on_migration() {
+        let mut state = MigrationState::new();
+        let entity = Uuid::from_u128(1);
+        let from = Uuid::from_u128(10);
+        let to = Uuid::from_u128(20);
+
+        state.record_migration(entity, from, to);
+
+        let flips = state.take_pending_flips();
+        assert_eq!(flips.len(), 1);
+        assert_eq!(flips[0].entity_id, entity);
+        assert_eq!(flips[0].from_cluster, from);
+        assert_eq!(flips[0].to_cluster, to);
+        assert_eq!(flips[0].effective_tick, 1);
+    }
+
+    #[test]
+    fn migration_state_cooldown_prevents_duplicate_flip() {
+        let mut state = MigrationState::new();
+        let entity = Uuid::from_u128(1);
+        let from = Uuid::from_u128(10);
+        let to = Uuid::from_u128(20);
+
+        // First migration allowed
+        assert!(state.can_migrate(entity));
+        state.record_migration(entity, from, to);
+
+        // Immediate re-migration blocked by cooldown
+        assert!(!state.can_migrate(entity));
+        // If we tried to migrate again, it would be rejected and no flip added
+        let flips = state.take_pending_flips();
+        assert_eq!(
+            flips.len(),
+            1,
+            "only one flip should exist after cooldown blocks second"
+        );
+    }
+
+    #[test]
+    fn migration_state_acknowledge_flips_decrements_in_flight() {
+        let mut state = MigrationState::new();
+        let entity1 = Uuid::from_u128(1);
+        let entity2 = Uuid::from_u128(2);
+
+        state.record_migration(entity1, Uuid::from_u128(10), Uuid::from_u128(20));
+        state.record_migration(entity2, Uuid::from_u128(30), Uuid::from_u128(40));
+        assert_eq!(state.in_flight_count, 2);
+
+        state.acknowledge_flips(2);
         assert_eq!(state.in_flight_count, 0);
     }
 }
