@@ -237,7 +237,10 @@ impl ArcaneManager {
             current_assignments.insert(*entity_id, *cluster_id);
         }
 
-        for (entity_id, desired_cluster) in assignments {
+        // Collapse mutual cross-boundary swaps into co-location
+        let resolved = crate::convergence::resolve_convergence(&current_assignments, &assignments);
+
+        for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {
                 if desired_cluster != current_cluster {
                     // Decision is to migrate this entity.
