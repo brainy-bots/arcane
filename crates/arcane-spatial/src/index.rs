@@ -124,6 +124,8 @@ pub struct SpatialIndex {
     grid: HashMap<GridCell, HashSet<Uuid>>,
     /// cluster_id -> its current centroid cell (O(1) re-bucketing, no grid sweeps).
     cluster_to_cell: HashMap<Uuid, GridCell>,
+    /// entity_id -> velocity. Optional per-entity velocity (default: zero if not set).
+    velocities: HashMap<Uuid, Vec3>,
 }
 
 impl SpatialIndex {
@@ -142,6 +144,7 @@ impl SpatialIndex {
             entity_to_cluster: HashMap::new(),
             grid: HashMap::new(),
             cluster_to_cell: HashMap::new(),
+            velocities: HashMap::new(),
         }
     }
 
@@ -240,7 +243,18 @@ impl SpatialIndex {
         if emptied {
             self.clusters.remove(&cluster_id);
         }
+        self.velocities.remove(&entity_id);
         self.rebucket(cluster_id);
+    }
+
+    /// Set or update the velocity for an entity.
+    pub fn update_entity_velocity(&mut self, entity_id: Uuid, velocity: Vec3) {
+        self.velocities.insert(entity_id, velocity);
+    }
+
+    /// Get the velocity for an entity, or None if not set. Default is Vec3::new(0, 0, 0) when unset.
+    pub fn velocity_of(&self, entity_id: Uuid) -> Option<Vec3> {
+        self.velocities.get(&entity_id).copied()
     }
 
     /// Return centroid, spread_radius, and entity_count for a cluster, or None if not in index.
