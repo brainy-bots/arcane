@@ -15,6 +15,15 @@ use uuid::Uuid;
 #[cfg(feature = "migration")]
 use crate::ownership_migration::OwnershipFlip;
 
+#[cfg(feature = "migration")]
+use arcane_affinity::interaction_graph::Colocation;
+#[cfg(feature = "migration")]
+use arcane_affinity::partition::{
+    GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
+};
+#[cfg(feature = "migration")]
+use arcane_affinity::refinement::{refine, RefineConfig};
+
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ArcaneManager {
     model: Arc<dyn IClusteringModel>,
@@ -50,6 +59,172 @@ struct MigrationState {
     /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
     /// actuates them (the Router's job in the target architecture).
     pending_flips: Vec<OwnershipFlip>,
+}
+
+/// Build partition-based migration decisions from the world view.
+///
+/// This function:
+/// 1. Builds a weighted edge list from party/guild/proximity signals in the view
+/// 2. Runs the global GreedyGrowthPartitioner
+/// 3. Runs refinement
+/// 4. Maps partition indices to actual cluster ids deterministically
+/// 5. Returns the desired assignments
+#[cfg(feature = "migration")]
+fn build_partition_decisions(
+    view: &WorldStateView,
+    current_assignments: &HashMap<Uuid, Uuid>,
+) -> HashMap<Uuid, Uuid> {
+    // Constants from AffinityConfig (matching the affinity engine weights)
+    const WEIGHT_PARTY_MEMBER: f64 = 5.0;
+    const WEIGHT_GUILD_MEMBER: f64 = 1.0;
+    const WEIGHT_PROXIMITY: f64 = 0.1;
+    const PROXIMITY_RADIUS: f64 = 50.0;
+
+    // Build weighted edge list from view signals.
+    let mut edges: Vec<WeightedEdge> = Vec::new();
+    let players = &view.players;
+
+    // Party members (same party_id, both Some and equal)
+    for i in 0..players.len() {
+        for j in (i + 1)..players.len() {
+            let a = &players[i];
+            let b = &players[j];
+
+            if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
+                if pa == pb {
+                    edges.push(WeightedEdge {
+                        a: a.player_id,
+                        b: b.player_id,
+                        weight: WEIGHT_PARTY_MEMBER,
+                        colocation: Colocation::Soft,
+                    });
+                }
+            }
+
+            // Guild members (same guild_id)
+            if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
+                if ga == gb {
+                    edges.push(WeightedEdge {
+                        a: a.player_id,
+                        b: b.player_id,
+                        weight: WEIGHT_GUILD_MEMBER,
+                        colocation: Colocation::Soft,
+                    });
+                }
+            }
+
+            // Proximity (within radius)
+            let dx = a.position.x - b.position.x;
+            let dy = a.position.y - b.position.y;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= PROXIMITY_RADIUS * PROXIMITY_RADIUS {
+                edges.push(WeightedEdge {
+                    a: a.player_id,
+                    b: b.player_id,
+                    weight: WEIGHT_PROXIMITY,
+                    colocation: Colocation::Soft,
+                });
+            }
+        }
+    }
+
+    // Collect all entity ids from the view
+    let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
+
+    if entities.is_empty() {
+        return HashMap::new();
+    }
+
+    // If no edges (no interactions), preserve current assignments (no reason to migrate).
+    if edges.is_empty() {
+        return current_assignments.clone();
+    }
+
+    // Number of partitions = number of distinct current clusters (at least 1)
+    let num_partitions = {
+        let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
+        clusters.sort();
+        clusters.dedup();
+        std::cmp::max(1, clusters.len())
+    };
+
+    // Build partition input
+    let input = PartitionInput {
+        entities: entities.clone(),
+        edges,
+        num_partitions,
+        capacity: 0, // Unbounded for now
+    };
+
+    // Run partitioner
+    let partitioner = GreedyGrowthPartitioner::new();
+    let partition = partitioner.partition(&input);
+
+    // Run refinement
+    let refined_partition = refine(
+        &partition,
+        &input.edges,
+        num_partitions,
+        &RefineConfig::default(),
+    );
+
+    // Map partition indices to cluster ids deterministically.
+    // For each partition index, seed it from the cluster that currently holds the plurality
+    // of that partition's members (tie-break: lowest Uuid).
+    let mut partition_to_cluster_id: HashMap<usize, Uuid> = HashMap::new();
+    for part_idx in 0..num_partitions {
+        let members = refined_partition.members(part_idx);
+        if members.is_empty() {
+            // Empty partition: assign to the lowest current cluster (shouldn't happen)
+            let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
+            clusters.sort();
+            if !clusters.is_empty() {
+                partition_to_cluster_id.insert(part_idx, clusters[0]);
+            }
+            continue;
+        }
+
+        // Count which cluster currently holds the plurality of this partition's members
+        let mut cluster_counts: HashMap<Uuid, usize> = HashMap::new();
+        for member in &members {
+            if let Some(&current_cluster) = current_assignments.get(member) {
+                *cluster_counts.entry(current_cluster).or_insert(0) += 1;
+            }
+        }
+
+        // Pick the cluster with the highest count, tie-break with lowest Uuid
+        let chosen_cluster = cluster_counts
+            .into_iter()
+            .max_by(|a, b| {
+                let cmp = a.1.cmp(&b.1); // Compare counts
+                if cmp == std::cmp::Ordering::Equal {
+                    b.0.cmp(&a.0) // Tie-break: higher comes first (we want lower), so reverse
+                } else {
+                    cmp
+                }
+            })
+            .map(|(cluster, _)| cluster)
+            .unwrap_or_else(|| {
+                // Fallback: use lowest current cluster
+                let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
+                clusters.sort();
+                clusters[0]
+            });
+
+        partition_to_cluster_id.insert(part_idx, chosen_cluster);
+    }
+
+    // Produce final desired assignments from the partition
+    let mut desired: HashMap<Uuid, Uuid> = HashMap::new();
+    for entity in entities {
+        if let Some(part_idx) = refined_partition.of(entity) {
+            if let Some(&cluster_id) = partition_to_cluster_id.get(&part_idx) {
+                desired.insert(entity, cluster_id);
+            }
+        }
+    }
+
+    desired
 }
 
 impl ArcaneManager {
@@ -275,8 +450,6 @@ impl ArcaneManager {
         // Keep the existing evaluate() call for compatibility.
         let _decisions = self.model.evaluate(&view);
 
-        // Consume assignments from the model and drive migrations.
-        let assignments = self.model.compute_entity_assignments(&view);
         self.migration_state.advance_tick();
 
         // Build a map of current cluster assignment from the view for comparison.
@@ -285,8 +458,8 @@ impl ArcaneManager {
             current_assignments.insert(*entity_id, *cluster_id);
         }
 
-        // Collapse mutual cross-boundary swaps into co-location
-        let resolved = crate::convergence::resolve_convergence(&current_assignments, &assignments);
+        // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
+        let resolved = build_partition_decisions(&view, &current_assignments);
 
         for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {
