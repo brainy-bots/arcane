@@ -113,10 +113,12 @@ impl GreedyGrowthPartitioner {
                 continue;
             }
 
+            #[allow(clippy::map_entry)]
             if !component_id.contains_key(&edge.a) {
                 component_id.insert(edge.a, next_id);
                 next_id += 1;
             }
+            #[allow(clippy::map_entry)]
             if !component_id.contains_key(&edge.b) {
                 component_id.insert(edge.b, next_id);
                 next_id += 1;
@@ -173,7 +175,7 @@ impl GreedyGrowthPartitioner {
         component: usize,
         components: &HashMap<Uuid, usize>,
         edges: &[WeightedEdge],
-        partition_members: &Vec<Vec<Uuid>>,
+        partition_members: &[Vec<Uuid>],
         part_idx: usize,
     ) -> f64 {
         let mut weight = 0.0;
@@ -192,9 +194,35 @@ impl GreedyGrowthPartitioner {
             let a_in_comp = component_entities.contains(&edge.a);
             let b_in_comp = component_entities.contains(&edge.b);
 
-            if a_in_comp && partition_members[part_idx].contains(&edge.b) {
+            let crosses_to_partition = (a_in_comp && partition_members[part_idx].contains(&edge.b))
+                || (b_in_comp && partition_members[part_idx].contains(&edge.a));
+
+            if crosses_to_partition {
                 weight += edge.weight;
-            } else if b_in_comp && partition_members[part_idx].contains(&edge.a) {
+            }
+        }
+
+        weight
+    }
+
+    fn entity_soft_weight_to_partition(
+        entity: Uuid,
+        edges: &[WeightedEdge],
+        partition_members: &[Vec<Uuid>],
+        part_idx: usize,
+    ) -> f64 {
+        let mut weight = 0.0;
+
+        for edge in edges {
+            if edge.colocation != Colocation::Soft {
+                continue;
+            }
+
+            let crosses_to_partition = (edge.a == entity
+                && partition_members[part_idx].contains(&edge.b))
+                || (edge.b == entity && partition_members[part_idx].contains(&edge.a));
+
+            if crosses_to_partition {
                 weight += edge.weight;
             }
         }
@@ -268,9 +296,8 @@ impl IPartitioner for GreedyGrowthPartitioner {
                 0,
             );
 
-            for part_idx in 1..input.num_partitions {
-                let at_capacity =
-                    input.capacity > 0 && partition_members[part_idx].len() >= input.capacity;
+            for (part_idx, members) in partition_members.iter().enumerate().skip(1) {
+                let at_capacity = input.capacity > 0 && members.len() >= input.capacity;
                 if at_capacity {
                     continue;
                 }
@@ -294,8 +321,8 @@ impl IPartitioner for GreedyGrowthPartitioner {
                 let mut least_full = None;
                 let mut least_count = input.capacity + 1;
 
-                for part_idx in 0..input.num_partitions {
-                    let count = partition_members[part_idx].len();
+                for (part_idx, members) in partition_members.iter().enumerate() {
+                    let count = members.len();
                     if count < input.capacity
                         && (count < least_count
                             || (count == least_count
@@ -322,38 +349,25 @@ impl IPartitioner for GreedyGrowthPartitioner {
             if !components.contains_key(entity) {
                 // Find partition with highest soft weight to this entity
                 let mut best_partition = 0;
-                let mut best_weight = 0.0;
+                let mut best_weight = Self::entity_soft_weight_to_partition(
+                    *entity,
+                    &input.edges,
+                    &partition_members,
+                    0,
+                );
 
-                for edge in &input.edges {
-                    if edge.colocation != Colocation::Soft {
-                        continue;
-                    }
-                    if edge.a == *entity && partition_members[0].contains(&edge.b) {
-                        best_weight += edge.weight;
-                    } else if edge.b == *entity && partition_members[0].contains(&edge.a) {
-                        best_weight += edge.weight;
-                    }
-                }
-
-                for part_idx in 1..input.num_partitions {
-                    let at_capacity =
-                        input.capacity > 0 && partition_members[part_idx].len() >= input.capacity;
+                for (part_idx, members) in partition_members.iter().enumerate().skip(1) {
+                    let at_capacity = input.capacity > 0 && members.len() >= input.capacity;
                     if at_capacity {
                         continue;
                     }
 
-                    let mut weight = 0.0;
-                    for edge in &input.edges {
-                        if edge.colocation != Colocation::Soft {
-                            continue;
-                        }
-                        if edge.a == *entity && partition_members[part_idx].contains(&edge.b) {
-                            weight += edge.weight;
-                        } else if edge.b == *entity && partition_members[part_idx].contains(&edge.a)
-                        {
-                            weight += edge.weight;
-                        }
-                    }
+                    let weight = Self::entity_soft_weight_to_partition(
+                        *entity,
+                        &input.edges,
+                        &partition_members,
+                        part_idx,
+                    );
 
                     if weight > best_weight || (weight == best_weight && part_idx < best_partition)
                     {
@@ -367,8 +381,8 @@ impl IPartitioner for GreedyGrowthPartitioner {
                     let mut least_full = None;
                     let mut least_count = input.capacity + 1;
 
-                    for part_idx in 0..input.num_partitions {
-                        let count = partition_members[part_idx].len();
+                    for (part_idx, members) in partition_members.iter().enumerate() {
+                        let count = members.len();
                         if count < input.capacity
                             && (count < least_count
                                 || (count == least_count
