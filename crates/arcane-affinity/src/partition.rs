@@ -27,6 +27,10 @@ pub struct Partition {
 }
 
 impl Partition {
+    pub fn new(assignment: HashMap<Uuid, usize>) -> Self {
+        Partition { assignment }
+    }
+
     pub fn of(&self, entity: Uuid) -> Option<usize> {
         self.assignment.get(&entity).copied()
     }
