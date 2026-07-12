@@ -164,6 +164,13 @@ impl InteractionGraph {
     pub fn pair_count(&self) -> usize {
         self.weights.len()
     }
+
+    /// Iterate all pairs with non-zero weight. Each pair is yielded exactly once (canonical order).
+    pub fn pairs(&self) -> impl Iterator<Item = (Uuid, Uuid, f64)> + '_ {
+        self.weights
+            .iter()
+            .map(|(pair, edge)| (pair.0, pair.1, edge.weight))
+    }
 }
 
 impl Default for InteractionGraph {
