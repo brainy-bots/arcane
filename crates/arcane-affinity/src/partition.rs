@@ -159,86 +159,86 @@ impl GreedyGrowthPartitioner {
         component_id
     }
 
-    fn compute_component_weight(
-        component: usize,
-        components: &HashMap<Uuid, usize>,
-        edges: &[WeightedEdge],
-    ) -> f64 {
-        let mut weight = 0.0;
-
+    /// Build a soft-edge adjacency list: entity -> Vec<(neighbor, weight)>.
+    /// One entry per soft edge in each direction. O(E). Hard/CutFree edges are excluded
+    /// (Hard is handled by component coalescing; CutFree contributes nothing to the cut).
+    fn build_soft_adjacency(edges: &[WeightedEdge]) -> HashMap<Uuid, Vec<(Uuid, f64)>> {
+        let mut adj: HashMap<Uuid, Vec<(Uuid, f64)>> = HashMap::new();
         for edge in edges {
             if edge.colocation != Colocation::Soft {
                 continue;
             }
-
-            let a_comp = components.get(&edge.a).copied();
-            let b_comp = components.get(&edge.b).copied();
-
-            if a_comp == Some(component) || b_comp == Some(component) {
-                weight += edge.weight;
-            }
+            adj.entry(edge.a).or_default().push((edge.b, edge.weight));
+            adj.entry(edge.b).or_default().push((edge.a, edge.weight));
         }
-
-        weight
+        adj
     }
 
-    fn soft_weight_to_partition_slice(
-        component: usize,
-        components: &HashMap<Uuid, usize>,
-        edges: &[WeightedEdge],
-        partition_members: &[Vec<Uuid>],
-        part_idx: usize,
-    ) -> f64 {
-        let mut weight = 0.0;
-
-        let component_entities: Vec<Uuid> = components
-            .iter()
-            .filter(|(_, &c)| c == component)
-            .map(|(&e, _)| e)
-            .collect();
-
-        for edge in edges {
-            if edge.colocation != Colocation::Soft {
-                continue;
-            }
-
-            let a_in_comp = component_entities.contains(&edge.a);
-            let b_in_comp = component_entities.contains(&edge.b);
-
-            let crosses_to_partition = (a_in_comp && partition_members[part_idx].contains(&edge.b))
-                || (b_in_comp && partition_members[part_idx].contains(&edge.a));
-
-            if crosses_to_partition {
-                weight += edge.weight;
+    /// Soft weight from a unit (one or more entities being placed together) to each partition,
+    /// using the adjacency list and the current placement. Neighbors not yet placed (including
+    /// the unit's own members) contribute nothing. Cost is O(sum of unit member degrees), not O(E).
+    fn unit_weight_to_partitions(
+        unit: &[Uuid],
+        adj: &HashMap<Uuid, Vec<(Uuid, f64)>>,
+        entity_partition: &HashMap<Uuid, usize>,
+        num_partitions: usize,
+    ) -> Vec<f64> {
+        let mut weights = vec![0.0; num_partitions];
+        for e in unit {
+            if let Some(neighbors) = adj.get(e) {
+                for &(n, w) in neighbors {
+                    if let Some(&p) = entity_partition.get(&n) {
+                        if p < num_partitions {
+                            weights[p] += w;
+                        }
+                    }
+                }
             }
         }
-
-        weight
+        weights
     }
 
-    fn entity_soft_weight_to_partition(
-        entity: Uuid,
-        edges: &[WeightedEdge],
-        partition_members: &[Vec<Uuid>],
-        part_idx: usize,
-    ) -> f64 {
-        let mut weight = 0.0;
-
-        for edge in edges {
-            if edge.colocation != Colocation::Soft {
+    /// Select the partition to place a unit into, given per-partition soft weights, current
+    /// partition sizes, and a capacity (0 = unbounded). Preserves the original semantics exactly:
+    /// partition 0 is the initial candidate (even if full); among partitions 1.. only non-full ones
+    /// can win, on strictly greater weight (ties keep the lower index). If the chosen partition is
+    /// full, fall back to the least-full partition (lowest index on ties). Returns None only when
+    /// every partition is at capacity (the unit is skipped).
+    fn select_partition(
+        weights: &[f64],
+        partition_sizes: &[usize],
+        capacity: usize,
+    ) -> Option<usize> {
+        let num_partitions = weights.len();
+        let mut best_partition = 0usize;
+        let mut best_weight = weights[0];
+        for part_idx in 1..num_partitions {
+            if capacity > 0 && partition_sizes[part_idx] >= capacity {
                 continue;
             }
-
-            let crosses_to_partition = (edge.a == entity
-                && partition_members[part_idx].contains(&edge.b))
-                || (edge.b == entity && partition_members[part_idx].contains(&edge.a));
-
-            if crosses_to_partition {
-                weight += edge.weight;
+            let w = weights[part_idx];
+            if w > best_weight || (w == best_weight && part_idx < best_partition) {
+                best_weight = w;
+                best_partition = part_idx;
             }
         }
 
-        weight
+        if capacity > 0 && partition_sizes[best_partition] >= capacity {
+            let mut least_full: Option<usize> = None;
+            let mut least_count = capacity + 1;
+            for (part_idx, &count) in partition_sizes.iter().enumerate() {
+                if count < capacity
+                    && (count < least_count
+                        || (count == least_count && part_idx < least_full.unwrap_or(usize::MAX)))
+                {
+                    least_count = count;
+                    least_full = Some(part_idx);
+                }
+            }
+            return least_full;
+        }
+
+        Some(best_partition)
     }
 }
 
@@ -255,175 +255,99 @@ impl IPartitioner for GreedyGrowthPartitioner {
         let mut all_entities: Vec<Uuid> = input.entities.clone();
         all_entities.sort();
 
-        // Collect unique components and sort by weight (descending) then min UUID (ascending)
-        let mut unique_components: Vec<usize> = components.values().copied().collect();
-        unique_components.sort_unstable();
-        unique_components.dedup();
+        // Precompute the members and min-Uuid of each Hard component, and the soft adjacency
+        // list, all in O(N + E). This replaces the per-placement O(E) rescans that made the
+        // original implementation O(N^2) (measured), restoring the design's near-linear target.
+        let mut component_members: HashMap<usize, Vec<Uuid>> = HashMap::new();
+        for (&entity, &comp) in &components {
+            component_members.entry(comp).or_default().push(entity);
+        }
+        // Component weight for sorting = sum of soft-edge weights incident to the component
+        // (an internal edge counted once, a cross edge counted once per endpoint component).
+        let adj = Self::build_soft_adjacency(&input.edges);
+        let mut component_weight: HashMap<usize, f64> = HashMap::new();
+        for edge in &input.edges {
+            if edge.colocation != Colocation::Soft {
+                continue;
+            }
+            let ca = components.get(&edge.a).copied();
+            let cb = components.get(&edge.b).copied();
+            if let Some(ca) = ca {
+                *component_weight.entry(ca).or_insert(0.0) += edge.weight;
+            }
+            if let Some(cb) = cb {
+                if Some(cb) != ca {
+                    *component_weight.entry(cb).or_insert(0.0) += edge.weight;
+                }
+            }
+        }
 
-        let mut sorted_components: Vec<usize> = unique_components;
+        let mut sorted_components: Vec<usize> = component_members.keys().copied().collect();
         sorted_components.sort_by(|&a, &b| {
-            let weight_a = Self::compute_component_weight(a, &components, &input.edges);
-            let weight_b = Self::compute_component_weight(b, &components, &input.edges);
-
+            let weight_a = component_weight.get(&a).copied().unwrap_or(0.0);
+            let weight_b = component_weight.get(&b).copied().unwrap_or(0.0);
             if (weight_b - weight_a).abs() > 1e-10 {
                 weight_b.partial_cmp(&weight_a).unwrap()
             } else {
-                let min_uuid_a = components
-                    .iter()
-                    .filter(|(_, &c)| c == a)
-                    .map(|(&e, _)| e)
-                    .min()
+                let min_a = component_members
+                    .get(&a)
+                    .and_then(|m| m.iter().min())
+                    .copied()
                     .unwrap_or(Uuid::nil());
-
-                let min_uuid_b = components
-                    .iter()
-                    .filter(|(_, &c)| c == b)
-                    .map(|(&e, _)| e)
-                    .min()
+                let min_b = component_members
+                    .get(&b)
+                    .and_then(|m| m.iter().min())
+                    .copied()
                     .unwrap_or(Uuid::nil());
-
-                min_uuid_a.cmp(&min_uuid_b)
+                min_a.cmp(&min_b)
             }
         });
 
-        let mut partition_members: Vec<Vec<Uuid>> =
-            (0..input.num_partitions).map(|_| Vec::new()).collect();
+        // Running placement state: entity -> partition, and per-partition sizes. Placement
+        // weight is computed against this map via the adjacency list in O(unit degree).
+        let mut entity_partition: HashMap<Uuid, usize> = HashMap::new();
+        let mut partition_sizes: Vec<usize> = vec![0; input.num_partitions];
 
-        // Place all components using grow logic (even the "seed" components)
+        // Place all Hard components (as atomic units) in the sorted order.
         for &comp in &sorted_components {
-            let component_entities: Vec<Uuid> = components
-                .iter()
-                .filter(|(_, &c)| c == comp)
-                .map(|(&e, _)| e)
-                .collect();
-
-            // Find partition with highest soft weight to this component
-            let mut best_partition = 0;
-            let mut best_weight = Self::soft_weight_to_partition_slice(
-                comp,
-                &components,
-                &input.edges,
-                &partition_members,
-                0,
+            let unit = &component_members[&comp];
+            let weights = Self::unit_weight_to_partitions(
+                unit,
+                &adj,
+                &entity_partition,
+                input.num_partitions,
             );
-
-            for (part_idx, members) in partition_members.iter().enumerate().skip(1) {
-                let at_capacity = input.capacity > 0 && members.len() >= input.capacity;
-                if at_capacity {
-                    continue;
+            if let Some(part) = Self::select_partition(&weights, &partition_sizes, input.capacity) {
+                for &e in unit {
+                    entity_partition.insert(e, part);
                 }
-
-                let weight = Self::soft_weight_to_partition_slice(
-                    comp,
-                    &components,
-                    &input.edges,
-                    &partition_members,
-                    part_idx,
-                );
-
-                if weight > best_weight || (weight == best_weight && part_idx < best_partition) {
-                    best_weight = weight;
-                    best_partition = part_idx;
-                }
+                partition_sizes[part] += unit.len();
             }
-
-            // If best partition is at capacity, find least-full (but only if it's not at capacity)
-            if input.capacity > 0 && partition_members[best_partition].len() >= input.capacity {
-                let mut least_full = None;
-                let mut least_count = input.capacity + 1;
-
-                for (part_idx, members) in partition_members.iter().enumerate() {
-                    let count = members.len();
-                    if count < input.capacity
-                        && (count < least_count
-                            || (count == least_count
-                                && part_idx < least_full.unwrap_or(usize::MAX)))
-                    {
-                        least_count = count;
-                        least_full = Some(part_idx);
-                    }
-                }
-
-                if let Some(part) = least_full {
-                    best_partition = part;
-                } else {
-                    // All partitions at capacity, skip placing this component
-                    continue;
-                }
-            }
-
-            partition_members[best_partition].extend(&component_entities);
+            // else: all partitions at capacity — skip this component (matches original).
         }
 
-        // Place isolated entities (not in any component) using soft-weight logic
+        // Place isolated entities (not in any Hard component) in sorted-Uuid order.
         for entity in &all_entities {
-            if !components.contains_key(entity) {
-                // Find partition with highest soft weight to this entity
-                let mut best_partition = 0;
-                let mut best_weight = Self::entity_soft_weight_to_partition(
-                    *entity,
-                    &input.edges,
-                    &partition_members,
-                    0,
-                );
-
-                for (part_idx, members) in partition_members.iter().enumerate().skip(1) {
-                    let at_capacity = input.capacity > 0 && members.len() >= input.capacity;
-                    if at_capacity {
-                        continue;
-                    }
-
-                    let weight = Self::entity_soft_weight_to_partition(
-                        *entity,
-                        &input.edges,
-                        &partition_members,
-                        part_idx,
-                    );
-
-                    if weight > best_weight || (weight == best_weight && part_idx < best_partition)
-                    {
-                        best_weight = weight;
-                        best_partition = part_idx;
-                    }
-                }
-
-                // If best partition is at capacity, find least-full (but only if not at capacity)
-                if input.capacity > 0 && partition_members[best_partition].len() >= input.capacity {
-                    let mut least_full = None;
-                    let mut least_count = input.capacity + 1;
-
-                    for (part_idx, members) in partition_members.iter().enumerate() {
-                        let count = members.len();
-                        if count < input.capacity
-                            && (count < least_count
-                                || (count == least_count
-                                    && part_idx < least_full.unwrap_or(usize::MAX)))
-                        {
-                            least_count = count;
-                            least_full = Some(part_idx);
-                        }
-                    }
-
-                    if let Some(part) = least_full {
-                        best_partition = part;
-                    } else {
-                        // All partitions at capacity, skip this entity
-                        continue;
-                    }
-                }
-
-                partition_members[best_partition].push(*entity);
+            if components.contains_key(entity) {
+                continue;
             }
+            let unit = [*entity];
+            let weights = Self::unit_weight_to_partitions(
+                &unit,
+                &adj,
+                &entity_partition,
+                input.num_partitions,
+            );
+            if let Some(part) = Self::select_partition(&weights, &partition_sizes, input.capacity) {
+                entity_partition.insert(*entity, part);
+                partition_sizes[part] += 1;
+            }
+            // else: all partitions at capacity — skip this entity (matches original).
         }
 
-        let mut assignment = HashMap::new();
-        for (part_idx, members) in partition_members.iter().enumerate() {
-            for &entity in members {
-                assignment.insert(entity, part_idx);
-            }
+        Partition {
+            assignment: entity_partition,
         }
-
-        Partition { assignment }
     }
 
     fn info(&self) -> PartitionerInfo {

@@ -35,6 +35,14 @@ pub struct ArcaneManager {
     entity_party: HashMap<Uuid, Uuid>,
     /// entity_id -> guild_id mapping for social membership.
     entity_guild: HashMap<Uuid, Uuid>,
+    /// Physics-coupling edges between entity pairs (Joint / Collision / PhysicsImpulse), keyed
+    /// by the canonical ordered pair. These carry a `Colocation` class into the partitioner:
+    /// `Hard` (Joint) is uncuttable, `CutFree` (SharedDeterministic) is free to cut. This is the
+    /// seam a physics backend (Rapier) feeds; without it the Manager only ever sees Soft social
+    /// and proximity edges and could never honor a joint constraint (design: interaction-edge
+    /// taxonomy).
+    #[cfg(feature = "migration")]
+    physics_edges: HashMap<(Uuid, Uuid), Colocation>,
     /// Migration guardrails (feature-gated).
     #[cfg(feature = "migration")]
     migration_state: MigrationState,
@@ -73,6 +81,7 @@ struct MigrationState {
 fn build_partition_decisions(
     view: &WorldStateView,
     current_assignments: &HashMap<Uuid, Uuid>,
+    physics_edges: &HashMap<(Uuid, Uuid), Colocation>,
 ) -> HashMap<Uuid, Uuid> {
     // Constants from AffinityConfig (matching the affinity engine weights)
     const WEIGHT_PARTY_MEMBER: f64 = 5.0;
@@ -133,6 +142,25 @@ fn build_partition_decisions(
 
     if entities.is_empty() {
         return HashMap::new();
+    }
+
+    // Inject physics-coupling edges (Joint = Hard/uncuttable, SharedDeterministic = CutFree, etc.)
+    // for pairs where BOTH entities are currently in the view. These carry their co-location class
+    // straight into the partitioner, so a joint constraint forces co-location and is never cut.
+    if !physics_edges.is_empty() {
+        let present: std::collections::HashSet<Uuid> = entities.iter().copied().collect();
+        for (&(a, b), &colocation) in physics_edges {
+            if present.contains(&a) && present.contains(&b) {
+                edges.push(WeightedEdge {
+                    a,
+                    b,
+                    // Weight matters only for Soft edges; Hard/CutFree ignore it. Use a nominal
+                    // positive weight so a Soft physics edge still contributes to the cut.
+                    weight: 1.0,
+                    colocation,
+                });
+            }
+        }
     }
 
     // If no edges (no interactions), preserve current assignments (no reason to migrate).
@@ -241,6 +269,8 @@ impl ArcaneManager {
             entity_party: HashMap::new(),
             entity_guild: HashMap::new(),
             #[cfg(feature = "migration")]
+            physics_edges: HashMap::new(),
+            #[cfg(feature = "migration")]
             migration_state: MigrationState::new(),
         }
     }
@@ -307,6 +337,31 @@ impl ArcaneManager {
             }
             None => {
                 self.entity_guild.remove(&entity_id);
+            }
+        }
+    }
+
+    /// Register (or clear) a physics-coupling edge between two entities, carrying its co-location
+    /// class into the partitioner. `Colocation::Hard` (a Rapier joint) is uncuttable — the pair
+    /// must never be split across clusters; `Colocation::CutFree` (a shared deterministic seed)
+    /// costs nothing to cut; `Colocation::Soft` contributes weight. Pass `None` to remove the edge
+    /// (e.g. a joint was destroyed). This is the seam the physics backend feeds; social/proximity
+    /// edges are derived automatically from the view.
+    ///
+    /// The pair is stored canonically (min, max) so `set_physics_edge(a, b, ..)` and
+    /// `set_physics_edge(b, a, ..)` refer to the same edge.
+    #[cfg(feature = "migration")]
+    pub fn set_physics_edge(&mut self, a: Uuid, b: Uuid, colocation: Option<Colocation>) {
+        if a == b {
+            return;
+        }
+        let key = if a <= b { (a, b) } else { (b, a) };
+        match colocation {
+            Some(c) => {
+                self.physics_edges.insert(key, c);
+            }
+            None => {
+                self.physics_edges.remove(&key);
             }
         }
     }
@@ -459,7 +514,7 @@ impl ArcaneManager {
         }
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
-        let resolved = build_partition_decisions(&view, &current_assignments);
+        let resolved = build_partition_decisions(&view, &current_assignments, &self.physics_edges);
 
         for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {

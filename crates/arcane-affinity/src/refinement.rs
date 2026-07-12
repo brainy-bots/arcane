@@ -21,70 +21,86 @@ impl Default for RefineConfig {
     }
 }
 
-/// Calculate the gain for moving a single entity to a different partition.
-/// Returns `None` if the move is forbidden (Hard edge to current partition).
-fn gain_single_move(
+/// Adjacency entry: a neighbor and the edge connecting to it.
+#[derive(Clone, Copy)]
+struct Adj {
+    other: Uuid,
+    weight: f64,
+    colocation: Colocation,
+}
+
+/// Build an undirected adjacency list: entity -> incident edges (each edge appears under both
+/// endpoints). Lets gain/boundary computations run in O(degree) instead of O(E), which is what
+/// makes refinement near-linear on bounded-degree graphs (the original re-scanned all edges per
+/// gain evaluation, giving O(passes * V^2 * E) — measured to blow up past N~1000).
+fn build_adjacency(edges: &[WeightedEdge]) -> HashMap<Uuid, Vec<Adj>> {
+    let mut adj: HashMap<Uuid, Vec<Adj>> = HashMap::new();
+    for edge in edges {
+        adj.entry(edge.a).or_default().push(Adj {
+            other: edge.b,
+            weight: edge.weight,
+            colocation: edge.colocation,
+        });
+        adj.entry(edge.b).or_default().push(Adj {
+            other: edge.a,
+            weight: edge.weight,
+            colocation: edge.colocation,
+        });
+    }
+    adj
+}
+
+/// Adjacency-based single-move gain. Same semantics as `gain_single_move` but O(degree).
+fn gain_single_move_adj(
     entity: Uuid,
     from_part: usize,
     to_part: usize,
     partition: &Partition,
-    edges: &[WeightedEdge],
+    adj: &HashMap<Uuid, Vec<Adj>>,
 ) -> Option<f64> {
     let mut internal = 0.0;
     let mut external = 0.0;
-
-    for edge in edges {
-        let other = if edge.a == entity {
-            edge.b
-        } else if edge.b == entity {
-            edge.a
-        } else {
-            continue;
-        };
-
-        let other_part = match partition.of(other) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        match edge.colocation {
-            Colocation::Hard => {
-                if other_part == from_part {
-                    return None;
+    if let Some(neighbors) = adj.get(&entity) {
+        for a in neighbors {
+            let other_part = match partition.of(a.other) {
+                Some(p) => p,
+                None => continue,
+            };
+            match a.colocation {
+                Colocation::Hard => {
+                    if other_part == from_part {
+                        return None;
+                    }
                 }
+                Colocation::Soft => {
+                    if other_part == from_part {
+                        internal += a.weight;
+                    }
+                    if other_part == to_part {
+                        external += a.weight;
+                    }
+                }
+                Colocation::CutFree => {}
             }
-            Colocation::Soft => {
-                if other_part == from_part {
-                    internal += edge.weight;
-                }
-                if other_part == to_part {
-                    external += edge.weight;
-                }
-            }
-            Colocation::CutFree => {}
         }
     }
-
     Some(external - internal)
 }
 
-/// Calculate the gain for swapping two entities between partitions.
-fn gain_pair_swap(
+/// Adjacency-based pair-swap gain. Same semantics as `gain_pair_swap` but O(deg(a)+deg(b)).
+/// The shared A-B edge is visited from both endpoints; its before/after cut status is identical
+/// under the swap (a and b exchange partitions, so cut-vs-not is unchanged), contributing 0 net.
+fn gain_pair_swap_adj(
     entity_a: Uuid,
     part_a: usize,
     entity_b: Uuid,
     part_b: usize,
     partition: &Partition,
-    edges: &[WeightedEdge],
+    adj: &HashMap<Uuid, Vec<Adj>>,
 ) -> Option<f64> {
     if part_a == part_b {
         return None;
     }
-
-    // Gain = cut_cost(before swap) - cut_cost(after swap), summed over edges incident to A or B.
-    // After the swap, A sits in part_b and B sits in part_a. We compute the effective partition
-    // of any endpoint under that hypothetical, so the shared A-B edge is handled correctly by
-    // construction (it stays within-or-across consistently, contributing 0 net change here).
     let eff_part = |e: Uuid| -> Option<usize> {
         if e == entity_a {
             Some(part_b)
@@ -98,103 +114,74 @@ fn gain_pair_swap(
     let mut before = 0.0;
     let mut after = 0.0;
 
-    for edge in edges {
-        // Only consider edges incident to A or B (the entities whose partition changes).
-        let incident =
-            edge.a == entity_a || edge.b == entity_a || edge.a == entity_b || edge.b == entity_b;
-        if !incident {
-            continue;
-        }
-
-        let a_before = match partition.of(edge.a) {
-            Some(p) => p,
-            None => continue,
-        };
-        let b_before = match partition.of(edge.b) {
-            Some(p) => p,
-            None => continue,
-        };
-        let a_after = match eff_part(edge.a) {
-            Some(p) => p,
-            None => continue,
-        };
-        let b_after = match eff_part(edge.b) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        match edge.colocation {
-            Colocation::Hard => {
-                // A Hard edge must never be cut after the swap.
-                if a_after != b_after {
-                    return None;
+    // Iterate edges incident to A, then edges incident to B, skipping B's copy of the shared
+    // A-B edge so it is counted exactly once (matching the original all-edges scan).
+    for (owner, owner_part) in [(entity_a, part_a), (entity_b, part_b)] {
+        if let Some(neighbors) = adj.get(&owner) {
+            for a in neighbors {
+                // The shared edge appears under both a and b; count it once (from A's side).
+                if owner == entity_b && a.other == entity_a {
+                    continue;
+                }
+                let owner_before = owner_part;
+                let other_before = match partition.of(a.other) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let owner_after = match eff_part(owner) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let other_after = match eff_part(a.other) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                match a.colocation {
+                    Colocation::Hard => {
+                        if owner_after != other_after {
+                            return None;
+                        }
+                    }
+                    Colocation::Soft => {
+                        if owner_before != other_before {
+                            before += a.weight;
+                        }
+                        if owner_after != other_after {
+                            after += a.weight;
+                        }
+                    }
+                    Colocation::CutFree => {}
                 }
             }
-            Colocation::Soft => {
-                if a_before != b_before {
-                    before += edge.weight;
-                }
-                if a_after != b_after {
-                    after += edge.weight;
-                }
-            }
-            Colocation::CutFree => {}
         }
     }
 
     Some(before - after)
 }
 
-/// Check if an entity is on the boundary (has at least one cut Soft edge).
-fn is_boundary_entity(entity: Uuid, partition: &Partition, edges: &[WeightedEdge]) -> bool {
+/// Adjacency-based boundary check: true if the entity has a cut Soft edge. O(degree).
+fn is_boundary_entity_adj(
+    entity: Uuid,
+    partition: &Partition,
+    adj: &HashMap<Uuid, Vec<Adj>>,
+) -> bool {
     let entity_part = match partition.of(entity) {
         Some(p) => p,
         None => return false,
     };
-
-    for edge in edges {
-        if edge.colocation != Colocation::Soft {
-            continue;
-        }
-
-        let other = if edge.a == entity {
-            edge.b
-        } else if edge.b == entity {
-            edge.a
-        } else {
-            continue;
-        };
-
-        let other_part = match partition.of(other) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        if other_part != entity_part {
-            return true;
+    if let Some(neighbors) = adj.get(&entity) {
+        for a in neighbors {
+            if a.colocation != Colocation::Soft {
+                continue;
+            }
+            if let Some(op) = partition.of(a.other) {
+                if op != entity_part {
+                    return true;
+                }
+            }
         }
     }
-
     false
-}
-
-/// Check if adding an entity to a partition would exceed capacity.
-fn would_exceed_capacity(
-    entity: Uuid,
-    part: usize,
-    partition: &Partition,
-    capacity: usize,
-) -> bool {
-    if capacity == 0 {
-        return false;
-    }
-
-    if partition.of(entity) == Some(part) {
-        return false;
-    }
-
-    let members = partition.members(part);
-    members.len() >= capacity
 }
 
 /// Refine a partition by KL/FM local search.
@@ -205,6 +192,7 @@ pub fn refine(
     config: &RefineConfig,
 ) -> Partition {
     let mut current = start.clone();
+    let adj = build_adjacency(edges);
 
     for _ in 0..config.max_passes {
         let mut improved = false;
@@ -217,12 +205,28 @@ pub fn refine(
             let mut all_entities: Vec<Uuid> = current.assignment().keys().copied().collect();
             all_entities.sort();
 
-            // Single-vertex moves
-            for entity in &all_entities {
-                if !is_boundary_entity(*entity, &current, edges) {
-                    continue;
+            // Index map for O(1) position lookups, and current per-partition sizes for capacity.
+            let entity_index: HashMap<Uuid, usize> = all_entities
+                .iter()
+                .enumerate()
+                .map(|(i, &e)| (e, i))
+                .collect();
+            let mut partition_sizes = vec![0usize; num_partitions];
+            for &p in current.assignment().values() {
+                if p < num_partitions {
+                    partition_sizes[p] += 1;
                 }
+            }
 
+            // Precompute the boundary set once per inner iteration (O(V * degree)).
+            let boundary: Vec<Uuid> = all_entities
+                .iter()
+                .copied()
+                .filter(|&e| is_boundary_entity_adj(e, &current, &adj))
+                .collect();
+
+            // Single-vertex moves
+            for entity in &boundary {
                 let entity_part = match current.of(*entity) {
                     Some(p) => p,
                     None => continue,
@@ -233,48 +237,48 @@ pub fn refine(
                         continue;
                     }
 
-                    if would_exceed_capacity(*entity, target_part, &current, config.capacity) {
+                    // Single moves must respect capacity (a move grows the target by one).
+                    if config.capacity > 0 && partition_sizes[target_part] >= config.capacity {
                         continue;
                     }
 
-                    let gain = match gain_single_move(
+                    let gain = match gain_single_move_adj(
                         *entity,
                         entity_part,
                         target_part,
                         &current,
-                        edges,
+                        &adj,
                     ) {
                         Some(g) if g > config.min_gain => g,
                         _ => continue,
                     };
 
+                    let entity_idx = entity_index[entity];
                     if best_move.is_none()
                         || gain > best_move.unwrap().2
                         || (gain == best_move.unwrap().2
                             && (*entity, target_part)
                                 < (all_entities[best_move.unwrap().0], best_move.unwrap().1))
                     {
-                        best_move = Some((
-                            all_entities.iter().position(|&e| e == *entity).unwrap(),
-                            target_part,
-                            gain,
-                        ));
+                        best_move = Some((entity_idx, target_part, gain));
                     }
                 }
             }
 
             // Pair swaps
-            for (i, entity_a) in all_entities.iter().enumerate() {
+            for entity_a in &boundary {
+                let i = entity_index[entity_a];
                 let part_a = match current.of(*entity_a) {
                     Some(p) => p,
                     None => continue,
                 };
 
-                if !is_boundary_entity(*entity_a, &current, edges) {
-                    continue;
-                }
-
-                for (j, entity_b) in all_entities.iter().enumerate().skip(i + 1) {
+                for entity_b in &boundary {
+                    let j = entity_index[entity_b];
+                    // Preserve the original ordering: only consider pairs with i < j.
+                    if j <= i {
+                        continue;
+                    }
                     let part_b = match current.of(*entity_b) {
                         Some(p) => p,
                         None => continue,
@@ -284,19 +288,15 @@ pub fn refine(
                         continue;
                     }
 
-                    if !is_boundary_entity(*entity_b, &current, edges) {
-                        continue;
-                    }
-
                     // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
                     // so it can never violate capacity when the starting partition is valid.
                     // No capacity check is needed here (unlike single moves).
-                    let gain =
-                        match gain_pair_swap(*entity_a, part_a, *entity_b, part_b, &current, edges)
-                        {
-                            Some(g) if g > config.min_gain => g,
-                            _ => continue,
-                        };
+                    let gain = match gain_pair_swap_adj(
+                        *entity_a, part_a, *entity_b, part_b, &current, &adj,
+                    ) {
+                        Some(g) if g > config.min_gain => g,
+                        _ => continue,
+                    };
 
                     if best_swap.is_none()
                         || gain > best_swap.unwrap().4
