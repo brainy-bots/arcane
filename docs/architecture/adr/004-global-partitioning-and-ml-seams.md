@@ -52,6 +52,18 @@ Every place ML can plug in is a **policy/prediction** decision behind a trait, w
 
 Discipline: **never add a trait that isn't already exercised by a real rule-based implementation.** The seam is defined now; the ML implementation is deferred until data and measured need exist.
 
+#### Why the mechanism/policy line falls where it does (runtime-assurance framing)
+
+The line is **not** "keep ML away from migration" — ML belongs in the *decision* to migrate (when/where an entity moves), which is exactly the partitioner seam above, a control/optimization problem where learned controllers are appropriate. The line separates that **decision** from the **enforcement** of exactly-once ownership. This is the standard **runtime-assurance / safety-filter (Simplex) architecture** from safety-critical control: a learned controller proposes actions; a small, verified, deterministic layer admits or clamps them to keep the system in a safe set. So this is a specific, well-established form of "AI for control," not an exception to it.
+
+`resolve_authoritative` (the enforcement layer) must be deterministic for three reasons that come from the *problem's structure*, not from conservatism about ML:
+
+1. **It is a distributed-agreement problem, not an optimization.** It runs independently on the source and destination clusters, which do not communicate at resolution time. Exactly-once ownership holds only because both sides compute the *identical deterministic function* on the *identical inputs* (the shared flip record + shared tick) and therefore reach the same conclusion at the same tick — agreement-by-determinism. A learned, stochastic, or even hardware-nondeterministic-float function could make the two sides disagree for a window, which is precisely the double-owner (corruption) / zero-owner (dropped-write) failure. This is why consensus (Paxos/Raft) uses deterministic state machines, not learned policies.
+2. **It enforces a hard invariant, not a soft objective.** ML-in-control optimizes soft objectives where "mostly optimal" is fine. Ownership is binary correctness — exactly-one-owner is true or false at every tick, with no partial credit; a rare violation is state corruption, not degraded quality. ML gives *statistical* guarantees on a training distribution; a consensus invariant needs a *logical* guarantee over all inputs, including unseen ones.
+3. **It must be verifiable.** `if tick < effective_tick { from } else { to }` is provable by exhaustive case analysis (what the exactly-once integration test does); a network can only be sample-tested. Safety-critical standards (DO-178C, ISO 26262) reflect exactly this — an unbounded network is never the *sole* safety mechanism; it is wrapped in a verified monitor.
+
+Corrected statement of the boundary: **ML proposes ownership changes; a deterministic, verified rule enforces exactly-once.** That is the runtime-assurance architecture, i.e. the mature form of AI-for-control, applied here.
+
 Where ML helps, ranked, and explicitly where it does NOT:
 
 - **Predictor `p` (highest leverage).** Better `p` → better graph → better partition; everything inherits. The shipped heuristic is the C4 baseline the model must beat.
