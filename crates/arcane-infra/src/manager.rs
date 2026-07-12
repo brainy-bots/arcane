@@ -2,7 +2,7 @@
 
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
-    types::Vec2,
+    types::{Vec2, Vec3},
     IClusteringModel, IServerPool, ServerHandle,
 };
 use arcane_pool::LocalPool;
@@ -22,6 +22,10 @@ pub struct ArcaneManager {
     spatial_index: SpatialIndex,
     /// Allocated nodes. active_count = allocated_servers.len().
     allocated_servers: Vec<ServerHandle>,
+    /// entity_id -> party_id mapping for social membership.
+    entity_party: HashMap<Uuid, Uuid>,
+    /// entity_id -> guild_id mapping for social membership.
+    entity_guild: HashMap<Uuid, Uuid>,
     /// Migration guardrails (feature-gated).
     #[cfg(feature = "migration")]
     migration_state: MigrationState,
@@ -59,6 +63,8 @@ impl ArcaneManager {
             pool,
             spatial_index,
             allocated_servers: Vec::new(),
+            entity_party: HashMap::new(),
+            entity_guild: HashMap::new(),
             #[cfg(feature = "migration")]
             migration_state: MigrationState::new(),
         }
@@ -98,6 +104,36 @@ impl ArcaneManager {
     /// Set observation radius used for neighbor discovery (delegates to SpatialIndex). Call before get_neighbors_for_cluster.
     pub fn set_observation_radius(&mut self, radius: f64) {
         self.spatial_index.set_observation_radius(radius);
+    }
+
+    /// Set the velocity for an entity (delegates to SpatialIndex).
+    pub fn set_entity_velocity(&mut self, entity_id: Uuid, velocity: Vec3) {
+        self.spatial_index
+            .update_entity_velocity(entity_id, velocity);
+    }
+
+    /// Set the party ID for an entity (insert or remove if None).
+    pub fn set_entity_party(&mut self, entity_id: Uuid, party_id: Option<Uuid>) {
+        match party_id {
+            Some(id) => {
+                self.entity_party.insert(entity_id, id);
+            }
+            None => {
+                self.entity_party.remove(&entity_id);
+            }
+        }
+    }
+
+    /// Set the guild ID for an entity (insert or remove if None).
+    pub fn set_entity_guild(&mut self, entity_id: Uuid, guild_id: Option<Uuid>) {
+        match guild_id {
+            Some(id) => {
+                self.entity_guild.insert(entity_id, id);
+            }
+            None => {
+                self.entity_guild.remove(&entity_id);
+            }
+        }
     }
 
     /// Neighbor cluster IDs for a given cluster (from spatial index). Topology source for ReplicationChannelManager::set_neighbors.
@@ -140,13 +176,19 @@ impl ArcaneManager {
 
         let players: Vec<PlayerInfo> = entity_data
             .iter()
-            .map(|&(entity_id, cluster_id, pos)| PlayerInfo {
-                player_id: entity_id,
-                cluster_id,
-                position: Vec2::new(pos.x, pos.z),
-                velocity: Vec2::new(0.0, 0.0),
-                guild_id: None,
-                party_id: None,
+            .map(|&(entity_id, cluster_id, pos)| {
+                let v = self
+                    .spatial_index
+                    .velocity_of(entity_id)
+                    .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+                PlayerInfo {
+                    player_id: entity_id,
+                    cluster_id,
+                    position: Vec2::new(pos.x, pos.z),
+                    velocity: Vec2::new(v.x, v.z),
+                    guild_id: self.entity_guild.get(&entity_id).copied(),
+                    party_id: self.entity_party.get(&entity_id).copied(),
+                }
             })
             .collect();
 
@@ -207,13 +249,19 @@ impl ArcaneManager {
 
         let players: Vec<PlayerInfo> = entity_data
             .iter()
-            .map(|&(entity_id, cluster_id, pos)| PlayerInfo {
-                player_id: entity_id,
-                cluster_id,
-                position: Vec2::new(pos.x, pos.z),
-                velocity: Vec2::new(0.0, 0.0),
-                guild_id: None,
-                party_id: None,
+            .map(|&(entity_id, cluster_id, pos)| {
+                let v = self
+                    .spatial_index
+                    .velocity_of(entity_id)
+                    .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+                PlayerInfo {
+                    player_id: entity_id,
+                    cluster_id,
+                    position: Vec2::new(pos.x, pos.z),
+                    velocity: Vec2::new(v.x, v.z),
+                    guild_id: self.entity_guild.get(&entity_id).copied(),
+                    party_id: self.entity_party.get(&entity_id).copied(),
+                }
             })
             .collect();
 
@@ -484,5 +532,171 @@ mod migration_tests {
         );
         // Second drain is empty.
         assert!(manager.take_pending_flips().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod view_enrichment_tests {
+    use super::*;
+
+    #[test]
+    fn test_velocity_storage_and_retrieval() {
+        let mut manager = ArcaneManager::with_defaults();
+        let entity_id = Uuid::from_u128(1);
+        let cluster_id = Uuid::from_u128(100);
+        let position = arcane_core::Vec3 {
+            x: 10.0,
+            y: 0.0,
+            z: 20.0,
+        };
+        let velocity = Vec3 {
+            x: 1.5,
+            y: 0.0,
+            z: 2.5,
+        };
+
+        // Set up entity
+        manager.update_entity(entity_id, cluster_id, position);
+        manager.set_entity_velocity(entity_id, velocity);
+
+        // Verify velocity is stored
+        assert_eq!(manager.spatial_index.velocity_of(entity_id), Some(velocity));
+    }
+
+    #[test]
+    fn test_social_membership_storage() {
+        let mut manager = ArcaneManager::with_defaults();
+        let entity_id = Uuid::from_u128(1);
+        let party_id = Uuid::from_u128(200);
+        let guild_id = Uuid::from_u128(300);
+
+        // Set party and guild
+        manager.set_entity_party(entity_id, Some(party_id));
+        manager.set_entity_guild(entity_id, Some(guild_id));
+
+        // Verify storage
+        assert_eq!(
+            manager.entity_party.get(&entity_id).copied(),
+            Some(party_id)
+        );
+        assert_eq!(
+            manager.entity_guild.get(&entity_id).copied(),
+            Some(guild_id)
+        );
+    }
+
+    #[test]
+    fn test_social_membership_removal() {
+        let mut manager = ArcaneManager::with_defaults();
+        let entity_id = Uuid::from_u128(1);
+        let party_id = Uuid::from_u128(200);
+
+        // Set and then remove party
+        manager.set_entity_party(entity_id, Some(party_id));
+        assert_eq!(
+            manager.entity_party.get(&entity_id).copied(),
+            Some(party_id)
+        );
+
+        manager.set_entity_party(entity_id, None);
+        assert_eq!(manager.entity_party.get(&entity_id).copied(), None);
+    }
+
+    #[test]
+    fn test_worldstateview_reflects_real_signals() {
+        let mut manager = ArcaneManager::with_defaults();
+        manager.set_observation_radius(100.0);
+
+        let entity1_id = Uuid::from_u128(1);
+        let entity2_id = Uuid::from_u128(2);
+        let cluster1_id = Uuid::from_u128(100);
+        let cluster2_id = Uuid::from_u128(101);
+        let party_id = Uuid::from_u128(500);
+
+        let pos1 = arcane_core::Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let pos2 = arcane_core::Vec3 {
+            x: 10.0,
+            y: 0.0,
+            z: 10.0,
+        };
+        let vel1 = Vec3 {
+            x: 1.0,
+            y: 0.0,
+            z: 2.0,
+        };
+        let vel2 = Vec3 {
+            x: -1.0,
+            y: 0.0,
+            z: -2.0,
+        };
+
+        // Set up two entities with party membership and velocities
+        manager.update_entity(entity1_id, cluster1_id, pos1);
+        manager.update_entity(entity2_id, cluster2_id, pos2);
+        manager.set_entity_velocity(entity1_id, vel1);
+        manager.set_entity_velocity(entity2_id, vel2);
+        manager.set_entity_party(entity1_id, Some(party_id));
+        manager.set_entity_party(entity2_id, Some(party_id));
+
+        // Run evaluation cycle
+        let result = manager.run_evaluation_cycle();
+        assert!(result.is_ok());
+
+        // Verify snapshot contains the real signals
+        let snapshot_entities = manager.spatial_index.snapshot_entities();
+        assert_eq!(snapshot_entities.len(), 2);
+
+        // Verify velocity is retrieved correctly (x/z mapping per spec)
+        for (entity_id, _, _pos) in &snapshot_entities {
+            if *entity_id == entity1_id {
+                let retrieved_vel = manager.spatial_index.velocity_of(entity1_id);
+                assert_eq!(retrieved_vel, Some(vel1));
+            } else if *entity_id == entity2_id {
+                let retrieved_vel = manager.spatial_index.velocity_of(entity2_id);
+                assert_eq!(retrieved_vel, Some(vel2));
+            }
+        }
+
+        // Verify party membership is accessible
+        assert_eq!(
+            manager.entity_party.get(&entity1_id).copied(),
+            Some(party_id)
+        );
+        assert_eq!(
+            manager.entity_party.get(&entity2_id).copied(),
+            Some(party_id)
+        );
+    }
+
+    #[test]
+    fn test_velocity_removed_with_entity() {
+        let mut manager = ArcaneManager::with_defaults();
+        let entity_id = Uuid::from_u128(1);
+        let cluster_id = Uuid::from_u128(100);
+        let position = arcane_core::Vec3 {
+            x: 10.0,
+            y: 0.0,
+            z: 20.0,
+        };
+        let velocity = Vec3 {
+            x: 1.5,
+            y: 0.0,
+            z: 2.5,
+        };
+
+        // Set up entity with velocity
+        manager.update_entity(entity_id, cluster_id, position);
+        manager.set_entity_velocity(entity_id, velocity);
+        assert_eq!(manager.spatial_index.velocity_of(entity_id), Some(velocity));
+
+        // Remove entity
+        manager.spatial_index.remove_entity(entity_id, cluster_id);
+
+        // Verify velocity is removed
+        assert_eq!(manager.spatial_index.velocity_of(entity_id), None);
     }
 }
