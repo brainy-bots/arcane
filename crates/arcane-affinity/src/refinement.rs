@@ -81,67 +81,70 @@ fn gain_pair_swap(
         return None;
     }
 
-    let mut total_gain = 0.0;
+    // Gain = cut_cost(before swap) - cut_cost(after swap), summed over edges incident to A or B.
+    // After the swap, A sits in part_b and B sits in part_a. We compute the effective partition
+    // of any endpoint under that hypothetical, so the shared A-B edge is handled correctly by
+    // construction (it stays within-or-across consistently, contributing 0 net change here).
+    let eff_part = |e: Uuid| -> Option<usize> {
+        if e == entity_a {
+            Some(part_b)
+        } else if e == entity_b {
+            Some(part_a)
+        } else {
+            partition.of(e)
+        }
+    };
+
+    let mut before = 0.0;
+    let mut after = 0.0;
 
     for edge in edges {
-        let (e1, e2) = if edge.a == entity_a && edge.b == entity_b {
-            (entity_a, entity_b)
-        } else if edge.a == entity_b && edge.b == entity_a {
-            (entity_b, entity_a)
-        } else if edge.a == entity_a {
-            (entity_a, edge.b)
-        } else if edge.b == entity_a {
-            (edge.a, entity_a)
-        } else if edge.a == entity_b {
-            (entity_b, edge.b)
-        } else if edge.b == entity_b {
-            (edge.a, entity_b)
-        } else {
+        // Only consider edges incident to A or B (the entities whose partition changes).
+        let incident = edge.a == entity_a
+            || edge.b == entity_a
+            || edge.a == entity_b
+            || edge.b == entity_b;
+        if !incident {
             continue;
-        };
+        }
 
-        let other_part = match partition.of(e2) {
+        let a_before = match partition.of(edge.a) {
+            Some(p) => p,
+            None => continue,
+        };
+        let b_before = match partition.of(edge.b) {
+            Some(p) => p,
+            None => continue,
+        };
+        let a_after = match eff_part(edge.a) {
+            Some(p) => p,
+            None => continue,
+        };
+        let b_after = match eff_part(edge.b) {
             Some(p) => p,
             None => continue,
         };
 
         match edge.colocation {
             Colocation::Hard => {
-                if e1 == entity_a && other_part == part_a {
-                    return None;
-                }
-                if e1 == entity_b && other_part == part_b {
+                // A Hard edge must never be cut after the swap.
+                if a_after != b_after {
                     return None;
                 }
             }
             Colocation::Soft => {
-                let is_shared = (edge.a == entity_a && edge.b == entity_b)
-                    || (edge.a == entity_b && edge.b == entity_a);
-
-                if e1 == entity_a {
-                    if is_shared {
-                        continue;
-                    }
-                    if other_part == part_a {
-                        total_gain -= edge.weight;
-                    }
-                    if other_part == part_b {
-                        total_gain += edge.weight;
-                    }
-                } else if e1 == entity_b {
-                    if other_part == part_b {
-                        total_gain -= edge.weight;
-                    }
-                    if other_part == part_a {
-                        total_gain += edge.weight;
-                    }
+                if a_before != b_before {
+                    before += edge.weight;
+                }
+                if a_after != b_after {
+                    after += edge.weight;
                 }
             }
             Colocation::CutFree => {}
         }
     }
 
-    Some(total_gain)
+    Some(before - after)
 }
 
 /// Check if an entity is on the boundary (has at least one cut Soft edge).
@@ -287,13 +290,9 @@ pub fn refine(
                         continue;
                     }
 
-                    if would_exceed_capacity(*entity_a, part_b, &current, config.capacity) {
-                        continue;
-                    }
-                    if would_exceed_capacity(*entity_b, part_a, &current, config.capacity) {
-                        continue;
-                    }
-
+                    // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
+                    // so it can never violate capacity when the starting partition is valid.
+                    // No capacity check is needed here (unlike single moves).
                     let gain = match gain_pair_swap(*entity_a, part_a, *entity_b, part_b, &current, edges)
                     {
                         Some(g) if g > config.min_gain => g,
@@ -635,5 +634,33 @@ mod tests {
             refined_twice.cut_cost(&edges),
             "refining an optimal partition should not change cost"
         );
+    }
+
+    #[test]
+    fn swap_required_when_partitions_full() {
+        // Swap-REQUIRED: capacity 2, both partitions full, so no single move is legal.
+        // A,B in part 0; C,D in part 1. Strong cross edges A-D and B-C. Only a size-neutral
+        // swap (A<->C or B<->D) can reduce the cut. This regression-guards two bugs:
+        //   1. gain_pair_swap must count an edge whose swapped endpoint is the `.b` side.
+        //   2. the swap path must NOT apply the single-move capacity check (a swap is size-neutral).
+        let a = uuid(10);
+        let b = uuid(20);
+        let c = uuid(30);
+        let d = uuid(40);
+        let mut assignment = HashMap::new();
+        assignment.insert(a, 0);
+        assignment.insert(b, 0);
+        assignment.insert(c, 1);
+        assignment.insert(d, 1);
+        let start = partition_from_map(assignment);
+        let edges = vec![
+            WeightedEdge { a, b: d, weight: 10.0, colocation: Colocation::Soft },
+            WeightedEdge { a: b, b: c, weight: 10.0, colocation: Colocation::Soft },
+        ];
+        let cfg = RefineConfig { max_passes: 8, capacity: 2, min_gain: 0.0 };
+        let refined = refine(&start, &edges, 2, &cfg);
+        assert_eq!(refined.cut_cost(&edges), 0.0, "optimal swap should zero the cut");
+        // capacity still respected after the swap
+        assert!(refined.members(0).len() <= 2 && refined.members(1).len() <= 2);
     }
 }
