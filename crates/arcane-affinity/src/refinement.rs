@@ -232,6 +232,9 @@ pub fn refine(
                     None => continue,
                 };
 
+                // `target_part` is used both as a partition index and as a value passed to the
+                // gain function, so an index loop is the clearest form here.
+                #[allow(clippy::needless_range_loop)]
                 for target_part in 0..num_partitions {
                     if target_part == entity_part {
                         continue;

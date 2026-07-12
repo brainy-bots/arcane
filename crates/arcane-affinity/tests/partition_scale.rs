@@ -106,7 +106,7 @@ fn partition_assigns_every_entity_once() {
         2000,
         "every entity must be assigned"
     );
-    for (_, &p) in part.assignment() {
+    for &p in part.assignment().values() {
         assert!(p < 8, "partition index {} out of range", p);
     }
 }
@@ -130,7 +130,7 @@ fn partition_is_balanced_under_capacity() {
     let part = GreedyGrowthPartitioner::new().partition(&input);
 
     let mut sizes = vec![0usize; k];
-    for (_, &p) in part.assignment() {
+    for &p in part.assignment().values() {
         sizes[p] += 1;
     }
     let max = *sizes.iter().max().unwrap();
@@ -166,7 +166,7 @@ fn partition_unbounded_packs_into_one() {
     let input = gen_grid_graph(n, 8, 7); // capacity defaults to 0 in gen_grid_graph
     let part = GreedyGrowthPartitioner::new().partition(&input);
     let mut sizes = vec![0usize; 8];
-    for (_, &p) in part.assignment() {
+    for &p in part.assignment().values() {
         sizes[p] += 1;
     }
     let used = sizes.iter().filter(|&&s| s > 0).count();
@@ -197,7 +197,7 @@ fn partition_cut_is_small_fraction_of_total() {
     assert!(total > 0.0);
     // Sanity: the split actually used multiple partitions (otherwise the fraction is meaningless).
     let mut sizes = vec![0usize; k];
-    for (_, &p) in part.assignment() {
+    for &p in part.assignment().values() {
         sizes[p] += 1;
     }
     assert!(
