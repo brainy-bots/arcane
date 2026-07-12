@@ -5,6 +5,7 @@ pub mod interaction_graph;
 pub mod predictor;
 pub mod rate_field;
 pub mod scorer;
+pub mod staleness_bench;
 
 use config::AffinityConfig;
 use hysteresis::MigrationState;
