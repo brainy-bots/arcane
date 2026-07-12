@@ -648,7 +648,7 @@ mod view_enrichment_tests {
         assert_eq!(snapshot_entities.len(), 2);
 
         // Verify velocity is retrieved correctly (x/z mapping per spec)
-        for (entity_id, _, pos) in &snapshot_entities {
+        for (entity_id, _, _pos) in &snapshot_entities {
             if *entity_id == entity1_id {
                 let retrieved_vel = manager.spatial_index.velocity_of(entity1_id);
                 assert_eq!(retrieved_vel, Some(vel1));
