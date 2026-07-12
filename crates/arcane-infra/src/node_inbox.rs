@@ -99,6 +99,8 @@ struct PublishMessage {
 /// which owns the Redis connection and drains the queue.
 pub struct RedisInboxBus {
     tx: mpsc::Sender<PublishMessage>,
+    /// Redis URL, kept so `subscribe` connects to the SAME server the publisher uses.
+    redis_url: String,
 }
 
 impl RedisInboxBus {
@@ -130,7 +132,10 @@ impl RedisInboxBus {
             }
         });
 
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            redis_url: redis_url.to_string(),
+        })
     }
 }
 
@@ -143,10 +148,10 @@ impl InboxBus for RedisInboxBus {
 
     fn subscribe(&self, cluster_id: Uuid) -> mpsc::Receiver<NodeInboxFrame> {
         let (tx, rx) = mpsc::channel();
-        let redis_url = "redis://127.0.0.1:6379"; // Default; should be configurable in production.
+        let redis_url = self.redis_url.clone();
 
         thread::spawn(move || {
-            let client = match redis::Client::open(redis_url) {
+            let client = match redis::Client::open(redis_url.as_str()) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("node inbox subscriber: Redis open failed: {}", e);
