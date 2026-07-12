@@ -200,3 +200,87 @@ fn no_flip_for_distant_non_interacting_pair() {
 
     eprintln!("✓ Test 3 passed: distant non-interacting pair produced no spurious flips");
 }
+
+/// Test 4: THREE mutually-interacting entities spread across three clusters end up
+/// co-located on ONE cluster through the real Manager loop. This is the payoff of the
+/// global partition model (epic #245): the retired per-entity greedy scorer + its
+/// `convergence.rs` 2-cycle patch could only collapse a mutual PAIR swap; a 3-way cycle
+/// (A wants B's, B wants C's, C wants A's) slipped through. The global partitioner puts
+/// all three in one partition, so they converge. Exactly-once ownership must hold throughout.
+#[test]
+fn three_way_interacting_group_co_locates() {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_observation_radius(500.0);
+
+    let a = uuid(10);
+    let b = uuid(20);
+    let c = uuid(30);
+    let cluster_a = uuid(1);
+    let cluster_b = uuid(2);
+    let cluster_c = uuid(3);
+
+    // Same party => strong (weight 5.0) pairwise edges among all three: a clique the
+    // partitioner should keep whole.
+    let party_id = uuid(40);
+
+    let ownership_map = OwnershipMap::new();
+    ownership_map.set_owner(a, cluster_a);
+    ownership_map.set_owner(b, cluster_b);
+    ownership_map.set_owner(c, cluster_c);
+
+    let mut all_flips: Vec<OwnershipFlip> = Vec::new();
+
+    for _cycle in 0..300 {
+        // Keep all three spatially adjacent (within proximity radius) and party-linked,
+        // each on its own distinct cluster at the start of every cycle's feed.
+        mgr.update_entity(a, cluster_a, Vec3::new(0.0, 0.0, 0.0));
+        mgr.update_entity(b, cluster_b, Vec3::new(4.0, 0.0, 0.0));
+        mgr.update_entity(c, cluster_c, Vec3::new(8.0, 0.0, 0.0));
+        mgr.set_entity_party(a, Some(party_id));
+        mgr.set_entity_party(b, Some(party_id));
+        mgr.set_entity_party(c, Some(party_id));
+
+        mgr.run_evaluation_cycle().expect("evaluation cycle failed");
+        for flip in mgr.take_pending_flips() {
+            ownership_map.set_owner(flip.entity_id, flip.to_cluster);
+            all_flips.push(flip);
+        }
+    }
+
+    // All three must end co-located on a single cluster.
+    let owner_a = ownership_map.owner_of(a);
+    let owner_b = ownership_map.owner_of(b);
+    let owner_c = ownership_map.owner_of(c);
+    assert_eq!(
+        owner_a, owner_b,
+        "A and B must co-locate; a={:?} b={:?}",
+        owner_a, owner_b
+    );
+    assert_eq!(
+        owner_b, owner_c,
+        "B and C must co-locate; b={:?} c={:?}",
+        owner_b, owner_c
+    );
+    assert!(!all_flips.is_empty(), "at least one migration should occur");
+
+    // Exactly-once ownership (XOR across the two endpoints of each flip) at every flip tick.
+    for flip in &all_flips {
+        let e = flip.entity_id;
+        let t = flip.effective_tick;
+        for tick in t.saturating_sub(2)..=(t + 2) {
+            let from_owns = resolve_authoritative(e, flip.from_cluster, &ownership_map, tick, Some(*flip));
+            let to_owns = resolve_authoritative(e, flip.to_cluster, &ownership_map, tick, Some(*flip));
+            assert!(
+                from_owns != to_owns,
+                "tick {}: exactly one of from/to must own entity {} (XOR)",
+                tick,
+                e
+            );
+        }
+    }
+
+    eprintln!(
+        "✓ Test 4 passed: 3-way interacting group co-located on cluster {:?} (global partition beats the 2-cycle patch)",
+        owner_a
+    );
+}
