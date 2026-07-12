@@ -217,8 +217,16 @@ mod tests {
         //   2x high-interest, FAR  -> rate field keeps them fresh; AOI (k=3, nearest) drops them
         //   10x low-interest, NEAR -> AOI wastes its whole budget here
         let mut entities = vec![
-            ConsumerEntity { p: 0.9, dynamism: 0.5, distance: 100.0 },
-            ConsumerEntity { p: 0.9, dynamism: 0.5, distance: 110.0 },
+            ConsumerEntity {
+                p: 0.9,
+                dynamism: 0.5,
+                distance: 100.0,
+            },
+            ConsumerEntity {
+                p: 0.9,
+                dynamism: 0.5,
+                distance: 110.0,
+            },
         ];
         for i in 0..10 {
             entities.push(ConsumerEntity {
