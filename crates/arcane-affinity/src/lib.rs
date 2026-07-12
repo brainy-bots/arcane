@@ -3,6 +3,7 @@ pub mod config;
 pub mod hysteresis;
 pub mod interaction_graph;
 pub mod predictor;
+pub mod rate_field;
 pub mod scorer;
 
 use config::AffinityConfig;
