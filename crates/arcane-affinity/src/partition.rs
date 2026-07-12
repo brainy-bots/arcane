@@ -59,6 +59,13 @@ impl Partition {
         &self.assignment
     }
 
+    pub(crate) fn from_assignment(assignment: HashMap<Uuid, usize>) -> Option<Self> {
+        if assignment.is_empty() {
+            return None;
+        }
+        Some(Partition { assignment })
+    }
+
     pub fn cut_cost(&self, edges: &[WeightedEdge]) -> f64 {
         let mut cost = 0.0;
         for edge in edges {
