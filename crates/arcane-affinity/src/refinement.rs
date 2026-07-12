@@ -100,10 +100,8 @@ fn gain_pair_swap(
 
     for edge in edges {
         // Only consider edges incident to A or B (the entities whose partition changes).
-        let incident = edge.a == entity_a
-            || edge.b == entity_a
-            || edge.a == entity_b
-            || edge.b == entity_b;
+        let incident =
+            edge.a == entity_a || edge.b == entity_a || edge.a == entity_b || edge.b == entity_b;
         if !incident {
             continue;
         }
@@ -293,11 +291,12 @@ pub fn refine(
                     // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
                     // so it can never violate capacity when the starting partition is valid.
                     // No capacity check is needed here (unlike single moves).
-                    let gain = match gain_pair_swap(*entity_a, part_a, *entity_b, part_b, &current, edges)
-                    {
-                        Some(g) if g > config.min_gain => g,
-                        _ => continue,
-                    };
+                    let gain =
+                        match gain_pair_swap(*entity_a, part_a, *entity_b, part_b, &current, edges)
+                        {
+                            Some(g) if g > config.min_gain => g,
+                            _ => continue,
+                        };
 
                     if best_swap.is_none()
                         || gain > best_swap.unwrap().4
@@ -654,12 +653,30 @@ mod tests {
         assignment.insert(d, 1);
         let start = partition_from_map(assignment);
         let edges = vec![
-            WeightedEdge { a, b: d, weight: 10.0, colocation: Colocation::Soft },
-            WeightedEdge { a: b, b: c, weight: 10.0, colocation: Colocation::Soft },
+            WeightedEdge {
+                a,
+                b: d,
+                weight: 10.0,
+                colocation: Colocation::Soft,
+            },
+            WeightedEdge {
+                a: b,
+                b: c,
+                weight: 10.0,
+                colocation: Colocation::Soft,
+            },
         ];
-        let cfg = RefineConfig { max_passes: 8, capacity: 2, min_gain: 0.0 };
+        let cfg = RefineConfig {
+            max_passes: 8,
+            capacity: 2,
+            min_gain: 0.0,
+        };
         let refined = refine(&start, &edges, 2, &cfg);
-        assert_eq!(refined.cut_cost(&edges), 0.0, "optimal swap should zero the cut");
+        assert_eq!(
+            refined.cut_cost(&edges),
+            0.0,
+            "optimal swap should zero the cut"
+        );
         // capacity still respected after the swap
         assert!(refined.members(0).len() <= 2 && refined.members(1).len() <= 2);
     }
