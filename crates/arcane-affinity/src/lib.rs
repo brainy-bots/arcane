@@ -5,6 +5,7 @@ pub mod interaction_graph;
 pub mod partition;
 pub mod predictor;
 pub mod rate_field;
+pub mod region;
 pub mod scorer;
 pub mod staleness_bench;
 
