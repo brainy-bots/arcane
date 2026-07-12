@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::ownership_migration::OwnershipFlip;
 
 #[cfg(feature = "migration")]
-use arcane_affinity::interaction_graph::Colocation;
+use arcane_affinity::interaction_graph::{Colocation, InteractionGraph, InteractionKind};
 #[cfg(feature = "migration")]
 use arcane_affinity::partition::{
     GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
@@ -43,6 +43,14 @@ pub struct ArcaneManager {
     /// taxonomy).
     #[cfg(feature = "migration")]
     physics_edges: HashMap<(Uuid, Uuid), Colocation>,
+    /// Persistent, decaying interaction graph recording interactions across cycles.
+    /// Accumulates weight from party/guild/proximity/physics signals and decays over time,
+    /// so transient signals don't flap the partition but sustained interaction builds strong edges.
+    #[cfg(feature = "migration")]
+    interaction_graph: InteractionGraph,
+    /// Track last-seen entity set for removing departed entities from the graph.
+    #[cfg(feature = "migration")]
+    last_seen_entities: std::collections::HashSet<Uuid>,
     /// Migration guardrails (feature-gated).
     #[cfg(feature = "migration")]
     migration_state: MigrationState,
@@ -72,7 +80,7 @@ struct MigrationState {
 /// Build partition-based migration decisions from the world view.
 ///
 /// This function:
-/// 1. Builds a weighted edge list from party/guild/proximity signals in the view
+/// 1. Builds a weighted edge list from the persistent interaction graph
 /// 2. Runs the global GreedyGrowthPartitioner
 /// 3. Runs refinement
 /// 4. Maps partition indices to actual cluster ids deterministically
@@ -82,61 +90,8 @@ fn build_partition_decisions(
     view: &WorldStateView,
     current_assignments: &HashMap<Uuid, Uuid>,
     physics_edges: &HashMap<(Uuid, Uuid), Colocation>,
+    interaction_graph: &InteractionGraph,
 ) -> HashMap<Uuid, Uuid> {
-    // Constants from AffinityConfig (matching the affinity engine weights)
-    const WEIGHT_PARTY_MEMBER: f64 = 5.0;
-    const WEIGHT_GUILD_MEMBER: f64 = 1.0;
-    const WEIGHT_PROXIMITY: f64 = 0.1;
-    const PROXIMITY_RADIUS: f64 = 50.0;
-
-    // Build weighted edge list from view signals.
-    let mut edges: Vec<WeightedEdge> = Vec::new();
-    let players = &view.players;
-
-    // Party members (same party_id, both Some and equal)
-    for i in 0..players.len() {
-        for j in (i + 1)..players.len() {
-            let a = &players[i];
-            let b = &players[j];
-
-            if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
-                if pa == pb {
-                    edges.push(WeightedEdge {
-                        a: a.player_id,
-                        b: b.player_id,
-                        weight: WEIGHT_PARTY_MEMBER,
-                        colocation: Colocation::Soft,
-                    });
-                }
-            }
-
-            // Guild members (same guild_id)
-            if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
-                if ga == gb {
-                    edges.push(WeightedEdge {
-                        a: a.player_id,
-                        b: b.player_id,
-                        weight: WEIGHT_GUILD_MEMBER,
-                        colocation: Colocation::Soft,
-                    });
-                }
-            }
-
-            // Proximity (within radius)
-            let dx = a.position.x - b.position.x;
-            let dy = a.position.y - b.position.y;
-            let dist_sq = dx * dx + dy * dy;
-            if dist_sq <= PROXIMITY_RADIUS * PROXIMITY_RADIUS {
-                edges.push(WeightedEdge {
-                    a: a.player_id,
-                    b: b.player_id,
-                    weight: WEIGHT_PROXIMITY,
-                    colocation: Colocation::Soft,
-                });
-            }
-        }
-    }
-
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
 
@@ -144,11 +99,49 @@ fn build_partition_decisions(
         return HashMap::new();
     }
 
-    // Inject physics-coupling edges (Joint = Hard/uncuttable, SharedDeterministic = CutFree, etc.)
-    // for pairs where BOTH entities are currently in the view. These carry their co-location class
+    // Build weighted edge list from the interaction graph.
+    let mut edges: Vec<WeightedEdge> = Vec::new();
+    let present: std::collections::HashSet<Uuid> = entities.iter().copied().collect();
+
+    // Iterate all pairs from the graph with non-zero weight.
+    for (a, b, weight) in interaction_graph.pairs() {
+        // Skip pairs where one or both entities are not in the current view.
+        if !present.contains(&a) || !present.contains(&b) {
+            continue;
+        }
+
+        // Determine colocation class:
+        // - Hard if the pair has any uncuttable (Joint) edge
+        // - CutFree if all edges are CutFree
+        // - Soft otherwise (with weight = cut_cost for Soft aggregate)
+        let colocation = if interaction_graph.is_uncuttable(a, b) {
+            Colocation::Hard
+        } else {
+            let cut_cost = interaction_graph.cut_cost(a, b);
+            if cut_cost == 0.0 {
+                Colocation::CutFree
+            } else {
+                Colocation::Soft
+            }
+        };
+
+        edges.push(WeightedEdge {
+            a,
+            b,
+            weight: if colocation == Colocation::Soft {
+                interaction_graph.cut_cost(a, b)
+            } else {
+                weight
+            },
+            colocation,
+        });
+    }
+
+    // Inject physics-coupling edges on top (current behavior) so a just-registered joint
+    // constrains the very next cycle even before its graph weight exists.
+    // For pairs where BOTH entities are currently in the view, these carry their co-location class
     // straight into the partitioner, so a joint constraint forces co-location and is never cut.
     if !physics_edges.is_empty() {
-        let present: std::collections::HashSet<Uuid> = entities.iter().copied().collect();
         for (&(a, b), &colocation) in physics_edges {
             if present.contains(&a) && present.contains(&b) {
                 edges.push(WeightedEdge {
@@ -176,12 +169,15 @@ fn build_partition_decisions(
         std::cmp::max(1, clusters.len())
     };
 
+    // Capacity = ceil(n/k) * 1.5 (v1 balance stopgap; a real per-node resource ceiling replaces it later)
+    let capacity = std::cmp::max(1, entities.len().div_ceil(num_partitions) * 3 / 2);
+
     // Build partition input
     let input = PartitionInput {
         entities: entities.clone(),
         edges,
         num_partitions,
-        capacity: 0, // Unbounded for now
+        capacity,
     };
 
     // Run partitioner
@@ -270,6 +266,10 @@ impl ArcaneManager {
             entity_guild: HashMap::new(),
             #[cfg(feature = "migration")]
             physics_edges: HashMap::new(),
+            #[cfg(feature = "migration")]
+            interaction_graph: InteractionGraph::new(),
+            #[cfg(feature = "migration")]
+            last_seen_entities: std::collections::HashSet::new(),
             #[cfg(feature = "migration")]
             migration_state: MigrationState::new(),
         }
@@ -507,6 +507,78 @@ impl ArcaneManager {
 
         self.migration_state.advance_tick();
 
+        // Decay + GC the interaction graph. Constants from AffinityConfig defaults.
+        const DECAY_FACTOR: f64 = 0.97;
+        const GC_THRESHOLD: f64 = 0.001;
+        const GC_INTERVAL: u32 = 100;
+        self.interaction_graph
+            .tick(DECAY_FACTOR, GC_THRESHOLD, GC_INTERVAL);
+
+        // Record this cycle's signals into the graph.
+        let players = &view.players;
+        for i in 0..players.len() {
+            for j in (i + 1)..players.len() {
+                let a = &players[i];
+                let b = &players[j];
+
+                // Party pairs
+                if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
+                    if pa == pb {
+                        self.interaction_graph.record_interaction(
+                            a.player_id,
+                            b.player_id,
+                            5.0,
+                            InteractionKind::PartyMember,
+                        );
+                    }
+                }
+
+                // Guild pairs
+                if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
+                    if ga == gb {
+                        self.interaction_graph.record_interaction(
+                            a.player_id,
+                            b.player_id,
+                            1.0,
+                            InteractionKind::GuildMember,
+                        );
+                    }
+                }
+
+                // Proximity pairs
+                let dx = a.position.x - b.position.x;
+                let dy = a.position.y - b.position.y;
+                if dx * dx + dy * dy <= 50.0 * 50.0 {
+                    self.interaction_graph.record_interaction(
+                        a.player_id,
+                        b.player_id,
+                        0.1,
+                        InteractionKind::Proximity,
+                    );
+                }
+            }
+        }
+
+        // Record physics-coupling edges (also kept in physics_edges for hard injection).
+        for (&(a, b), &colocation) in &self.physics_edges {
+            let kind = match colocation {
+                Colocation::Hard => InteractionKind::Joint,
+                Colocation::CutFree => InteractionKind::SharedDeterministic,
+                Colocation::Soft => InteractionKind::Collision,
+            };
+            self.interaction_graph.record_interaction(a, b, 1.0, kind);
+        }
+
+        // Clean up departed entities from the graph.
+        let current_entities: std::collections::HashSet<Uuid> =
+            view.players.iter().map(|p| p.player_id).collect();
+        for entity in self.last_seen_entities.iter() {
+            if !current_entities.contains(entity) {
+                self.interaction_graph.remove_entity(*entity);
+            }
+        }
+        self.last_seen_entities = current_entities;
+
         // Build a map of current cluster assignment from the view for comparison.
         let mut current_assignments: HashMap<Uuid, Uuid> = HashMap::new();
         for (entity_id, cluster_id, _) in &entity_data {
@@ -514,7 +586,12 @@ impl ArcaneManager {
         }
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
-        let resolved = build_partition_decisions(&view, &current_assignments, &self.physics_edges);
+        let resolved = build_partition_decisions(
+            &view,
+            &current_assignments,
+            &self.physics_edges,
+            &self.interaction_graph,
+        );
 
         for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {
