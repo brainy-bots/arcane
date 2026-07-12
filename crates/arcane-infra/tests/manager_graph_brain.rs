@@ -268,8 +268,10 @@ fn three_way_interacting_group_co_locates() {
         let e = flip.entity_id;
         let t = flip.effective_tick;
         for tick in t.saturating_sub(2)..=(t + 2) {
-            let from_owns = resolve_authoritative(e, flip.from_cluster, &ownership_map, tick, Some(*flip));
-            let to_owns = resolve_authoritative(e, flip.to_cluster, &ownership_map, tick, Some(*flip));
+            let from_owns =
+                resolve_authoritative(e, flip.from_cluster, &ownership_map, tick, Some(*flip));
+            let to_owns =
+                resolve_authoritative(e, flip.to_cluster, &ownership_map, tick, Some(*flip));
             assert!(
                 from_owns != to_owns,
                 "tick {}: exactly one of from/to must own entity {} (XOR)",
