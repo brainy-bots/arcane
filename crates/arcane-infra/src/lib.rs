@@ -44,6 +44,8 @@ pub mod ws_server;
 pub mod rapier_cluster;
 
 #[cfg(feature = "migration")]
+pub mod convergence;
+#[cfg(feature = "migration")]
 pub mod ownership_migration;
 #[cfg(feature = "migration")]
 pub mod replication_gate;
