@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Coarse spectrum of refresh rates: full-fidelity, reduced, or no delivery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RateTier {
     Full,
     Low,
