@@ -1352,11 +1352,14 @@ mod tests {
                 entities: vec![],
             };
 
+            // Subscribe BEFORE publishing: InMemoryInboxBus does not retain frames
+            // for late subscribers (a publish with no subscribers is dropped).
             let bus = InMemoryInboxBus::new();
-            bus.publish(cluster_c2, frame).unwrap();
-
             let rx = bus.subscribe(cluster_c2);
-            let received_frame = rx.recv().expect("frame should be received");
+            bus.publish(cluster_c2, frame).unwrap();
+            let received_frame = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("frame should be received");
 
             let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
             let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
