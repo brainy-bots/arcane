@@ -46,12 +46,11 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// On re-sighting, keeps the runner's assignments in sync with the driver's
     /// cluster (after a flip, the manager must see the entity on its new cluster).
     pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
-        // Establish ownership on first sighting.
-        if !self.assignments.contains_key(&entity_id) {
-            self.assignments.insert(entity_id, cluster_id);
-        }
-        // Always feed the current assigned cluster to the manager, not the driver's original.
-        let current_cluster = self.assignments[&entity_id];
+        // Establish ownership on first sighting, or use current assignment on re-sighting.
+        let current_cluster = *self
+            .assignments
+            .entry(entity_id)
+            .or_insert(cluster_id);
         self.manager
             .update_entity(entity_id, current_cluster, position);
     }
