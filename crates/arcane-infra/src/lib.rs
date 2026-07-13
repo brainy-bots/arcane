@@ -49,6 +49,8 @@ pub mod node_inbox;
 pub mod ownership_migration;
 #[cfg(feature = "migration")]
 pub mod replication_gate;
+#[cfg(feature = "migration")]
+pub mod router_core;
 
 #[cfg(feature = "cluster-ws")]
 pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
