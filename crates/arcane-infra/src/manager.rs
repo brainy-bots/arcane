@@ -16,10 +16,16 @@ use uuid::Uuid;
 use crate::ownership_migration::OwnershipFlip;
 
 #[cfg(feature = "migration")]
+use arcane_affinity::cold_pair::{ColdCandidate, SweepConfig};
+#[cfg(feature = "migration")]
 use arcane_affinity::interaction_graph::{Colocation, InteractionGraph, InteractionKind};
 #[cfg(feature = "migration")]
 use arcane_affinity::partition::{
     GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
+};
+#[cfg(feature = "migration")]
+use arcane_affinity::predictor::{
+    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairFeatures,
 };
 #[cfg(feature = "migration")]
 use arcane_affinity::refinement::{refine, RefineConfig};
@@ -81,10 +87,11 @@ struct MigrationState {
 ///
 /// This function:
 /// 1. Builds a weighted edge list from the persistent interaction graph
-/// 2. Runs the global GreedyGrowthPartitioner
-/// 3. Runs refinement
-/// 4. Maps partition indices to actual cluster ids deterministically
-/// 5. Returns the desired assignments
+/// 2. Blends prediction into soft edge weights (cut_cost * (1 + PREDICTION_GAIN * p))
+/// 3. Runs the global GreedyGrowthPartitioner
+/// 4. Runs refinement
+/// 5. Maps partition indices to actual cluster ids deterministically
+/// 6. Returns the desired assignments
 #[cfg(feature = "migration")]
 fn build_partition_decisions(
     view: &WorldStateView,
@@ -92,12 +99,23 @@ fn build_partition_decisions(
     physics_edges: &HashMap<(Uuid, Uuid), Colocation>,
     interaction_graph: &InteractionGraph,
 ) -> HashMap<Uuid, Uuid> {
+    // Weighting constants
+    const PREDICTION_GAIN: f64 = 1.0;
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
 
     if entities.is_empty() {
         return HashMap::new();
     }
+
+    // Build player position/velocity map for predictor
+    let mut player_map: HashMap<Uuid, &PlayerInfo> = HashMap::new();
+    for player in &view.players {
+        player_map.insert(player.player_id, player);
+    }
+
+    // Instantiate predictor for edge weighting
+    let predictor = HeuristicPredictor::default();
 
     // Build weighted edge list from the interaction graph.
     let mut edges: Vec<WeightedEdge> = Vec::new();
@@ -125,14 +143,63 @@ fn build_partition_decisions(
             }
         };
 
+        // For Soft edges, blend prediction into the weight.
+        let final_weight = if colocation == Colocation::Soft {
+            let base_weight = interaction_graph.cut_cost(a, b);
+
+            // Compute predictive enhancement if both players are in view
+            let predicted_p = if let (Some(player_a), Some(player_b)) =
+                (player_map.get(&a), player_map.get(&b))
+            {
+                let closing_speed = {
+                    let dx = player_b.position.x - player_a.position.x;
+                    let dy = player_b.position.y - player_a.position.y;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    let rel_vel_x = player_b.velocity.x - player_a.velocity.x;
+                    let rel_vel_y = player_b.velocity.y - player_a.velocity.y;
+                    if distance > 1e-9 {
+                        -(rel_vel_x * dx + rel_vel_y * dy) / distance
+                    } else {
+                        0.0
+                    }
+                };
+
+                let features = PairFeatures {
+                    distance: {
+                        let dx = player_b.position.x - player_a.position.x;
+                        let dy = player_b.position.y - player_a.position.y;
+                        (dx * dx + dy * dy).sqrt()
+                    },
+                    closing_speed,
+                    horizon_secs: 5.0,
+                    history_weight: base_weight,
+                    latent_link: if player_a.party_id.is_some()
+                        && player_a.party_id == player_b.party_id
+                    {
+                        Some(arcane_affinity::predictor::LinkKind::Party)
+                    } else if player_a.guild_id.is_some() && player_a.guild_id == player_b.guild_id
+                    {
+                        Some(arcane_affinity::predictor::LinkKind::Guild)
+                    } else {
+                        None
+                    },
+                    game: Default::default(),
+                };
+                predictor.predict(&features)
+            } else {
+                0.0
+            };
+
+            // Prediction-amplified weight: history-anchored, prediction-amplified
+            base_weight * (1.0 + PREDICTION_GAIN * predicted_p)
+        } else {
+            weight
+        };
+
         edges.push(WeightedEdge {
             a,
             b,
-            weight: if colocation == Colocation::Soft {
-                interaction_graph.cut_cost(a, b)
-            } else {
-                weight
-            },
+            weight: final_weight,
             colocation,
         });
     }
@@ -567,6 +634,103 @@ impl ArcaneManager {
                 Colocation::Soft => InteractionKind::Collision,
             };
             self.interaction_graph.record_interaction(a, b, 1.0, kind);
+        }
+
+        // Cold-pair sweep -> graph promotions (after recording current signals).
+        // Build linkable candidate set from the view (party/guild groups).
+        const PROMOTION_WEIGHT_SCALE: f64 = 5.0;
+        const COLD_PAIR_HOT_FLOOR: f64 = 1.0;
+
+        // Group players by party_id and guild_id
+        let mut party_groups: HashMap<Uuid, Vec<&PlayerInfo>> = HashMap::new();
+        let mut guild_groups: HashMap<Uuid, Vec<&PlayerInfo>> = HashMap::new();
+
+        for player in &view.players {
+            if let Some(party_id) = player.party_id {
+                party_groups.entry(party_id).or_default().push(player);
+            }
+            if let Some(guild_id) = player.guild_id {
+                guild_groups.entry(guild_id).or_default().push(player);
+            }
+        }
+
+        // Collect candidates from party groups
+        let mut candidates: Vec<ColdCandidate> = Vec::new();
+        for party_members in party_groups.values() {
+            for i in 0..party_members.len() {
+                for j in (i + 1)..party_members.len() {
+                    let a = party_members[i];
+                    let b = party_members[j];
+
+                    // Skip if pair is already strongly connected (hot)
+                    let weight = self.interaction_graph.get_weight(a.player_id, b.player_id);
+                    if weight >= COLD_PAIR_HOT_FLOOR {
+                        continue;
+                    }
+
+                    let history_weight = weight;
+
+                    candidates.push(ColdCandidate {
+                        a: a.player_id,
+                        b: b.player_id,
+                        pos_a: a.position,
+                        pos_b: b.position,
+                        vel_a: a.velocity,
+                        vel_b: b.velocity,
+                        link: arcane_affinity::predictor::LinkKind::Party,
+                        history_weight,
+                    });
+                }
+            }
+        }
+
+        // Collect candidates from guild groups
+        for guild_members in guild_groups.values() {
+            for i in 0..guild_members.len() {
+                for j in (i + 1)..guild_members.len() {
+                    let a = guild_members[i];
+                    let b = guild_members[j];
+
+                    // Skip if pair is already strongly connected (hot)
+                    let weight = self.interaction_graph.get_weight(a.player_id, b.player_id);
+                    if weight >= COLD_PAIR_HOT_FLOOR {
+                        continue;
+                    }
+
+                    let history_weight = weight;
+
+                    candidates.push(ColdCandidate {
+                        a: a.player_id,
+                        b: b.player_id,
+                        pos_a: a.position,
+                        pos_b: b.position,
+                        vel_a: a.velocity,
+                        vel_b: b.velocity,
+                        link: arcane_affinity::predictor::LinkKind::Guild,
+                        history_weight,
+                    });
+                }
+            }
+        }
+
+        // Run sweep_cold_pairs and record promotions
+        if !candidates.is_empty() {
+            let promotions = arcane_affinity::cold_pair::sweep_cold_pairs(
+                &candidates,
+                &HeuristicPredictor::default(),
+                &NullFeatureProvider,
+                &SweepConfig::default(),
+            );
+
+            for promotion in promotions {
+                // Promoted pairs write with scaled weight; non-promoted pairs write nothing (zero-cost-on-zero)
+                self.interaction_graph.record_interaction(
+                    promotion.a,
+                    promotion.b,
+                    PROMOTION_WEIGHT_SCALE * promotion.p,
+                    InteractionKind::GameAction,
+                );
+            }
         }
 
         // Clean up departed entities from the graph.
