@@ -47,10 +47,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// cluster (after a flip, the manager must see the entity on its new cluster).
     pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
         // Establish ownership on first sighting, or use current assignment on re-sighting.
-        let current_cluster = *self
-            .assignments
-            .entry(entity_id)
-            .or_insert(cluster_id);
+        let current_cluster = *self.assignments.entry(entity_id).or_insert(cluster_id);
         self.manager
             .update_entity(entity_id, current_cluster, position);
     }
