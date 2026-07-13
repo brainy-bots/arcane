@@ -56,6 +56,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
+#[cfg(feature = "migration")]
+use crate::node_inbox::{InboxBus, NodeInboxFrame};
 #[cfg(feature = "cluster-ws")]
 use crate::node_stats::NodeStats;
 #[cfg(feature = "migration")]
@@ -69,6 +71,57 @@ use crate::{ArcaneNode, ReplicationChannelManager};
 const LOG_EVERY_TICKS: u64 = 100;
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 const NEIGHBOR_STALE_TICKS: u64 = 300;
+
+/// Apply one inbox frame to node-local state. Returns the number of ownership
+/// changes applied and proxies upserted.
+#[cfg(feature = "migration")]
+pub struct FrameApplyReport {
+    pub flips_applied: usize,
+    pub proxies_upserted: usize,
+    pub owned_skipped: usize,
+}
+
+/// Apply one inbox frame to node-local state. Returns the number of ownership
+/// changes applied and proxies upserted.
+#[cfg(feature = "migration")]
+pub fn apply_inbox_frame(
+    my_cluster: Uuid,
+    frame: &NodeInboxFrame,
+    ownership: &OwnershipMap,
+    neighbor_entities: &mut HashMap<Uuid, EntityStateEntry>,
+    neighbor_last_seen: &mut HashMap<Uuid, u64>,
+    current_tick: u64,
+) -> FrameApplyReport {
+    let mut flips_applied = 0;
+    let mut proxies_upserted = 0;
+    let mut owned_skipped = 0;
+
+    for flip in &frame.ownership {
+        ownership.set_owner(flip.entity_id, flip.to_cluster);
+        flips_applied += 1;
+        if flip.to_cluster == my_cluster {
+            neighbor_entities.remove(&flip.entity_id);
+            neighbor_last_seen.remove(&flip.entity_id);
+        }
+    }
+
+    for replicated in &frame.entities {
+        let entry = &replicated.entry;
+        if ownership.owns(entry.entity_id, my_cluster) {
+            owned_skipped += 1;
+        } else {
+            neighbor_entities.insert(entry.entity_id, entry.clone());
+            neighbor_last_seen.insert(entry.entity_id, current_tick);
+            proxies_upserted += 1;
+        }
+    }
+
+    FrameApplyReport {
+        flips_applied,
+        proxies_upserted,
+        owned_skipped,
+    }
+}
 
 /// Configuration for creating a `NodeCore`.
 #[derive(Clone, Debug)]
@@ -153,6 +206,8 @@ pub struct NodeCore {
     persist: Option<SpacetimeDbPersist>,
     #[cfg(feature = "migration")]
     ownership: OwnershipMap,
+    #[cfg(feature = "migration")]
+    inbox_rx: Option<std::sync::mpsc::Receiver<NodeInboxFrame>>,
 }
 
 impl NodeCore {
@@ -265,6 +320,8 @@ impl NodeCore {
             persist,
             #[cfg(feature = "migration")]
             ownership,
+            #[cfg(feature = "migration")]
+            inbox_rx: None,
         })
     }
 
@@ -275,6 +332,23 @@ impl NodeCore {
     /// **Query method.** Reads the tick counter; no I/O, no side effects.
     pub fn current_tick(&self) -> u64 {
         self.server.current_tick()
+    }
+
+    /// Attach an inbox bus and spawn a thread to subscribe to frames.
+    /// Frames are forwarded into an mpsc channel stored in `inbox_rx`.
+    #[cfg(feature = "migration")]
+    pub fn attach_inbox<B: InboxBus + Send + 'static>(&mut self, bus: B) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cluster_id = self.cluster_id;
+        std::thread::spawn(move || {
+            let frame_rx = bus.subscribe(cluster_id);
+            while let Ok(frame) = frame_rx.recv() {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        self.inbox_rx = Some(rx);
     }
 
     /// Core → driver. Drains client updates, game actions, inbound physics; accumulates & prunes
@@ -305,6 +379,19 @@ impl NodeCore {
             for removed_id in &delta.removed {
                 self.neighbor_entities.remove(removed_id);
                 self.neighbor_last_seen.remove(removed_id);
+            }
+        }
+        #[cfg(feature = "migration")]
+        if let Some(ref inbox_rx) = self.inbox_rx {
+            while let Ok(frame) = inbox_rx.try_recv() {
+                let _ = apply_inbox_frame(
+                    self.cluster_id,
+                    &frame,
+                    &self.ownership,
+                    &mut self.neighbor_entities,
+                    &mut self.neighbor_last_seen,
+                    self.tick_count,
+                );
             }
         }
         const PRUNE_INTERVAL_TICKS: u64 = 60;
@@ -1102,6 +1189,258 @@ mod tests {
             // from neighbor_entities, which has position 42.0, same as what A had written.
             // This test documents that assumption; the actual state preservation is tested
             // in the broader integration (neighbor state arrives before flip).
+        }
+
+        #[test]
+        fn gaining_node_starts_writing() {
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let entity_id = Uuid::from_u128(100);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let ownership = OwnershipMap::new();
+            ownership.set_owner(entity_id, cluster_c1);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_c1,
+                to_cluster: cluster_c2,
+                effective_tick: 50,
+            };
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![flip],
+                entities: vec![],
+            };
+
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c2,
+                &frame,
+                &ownership,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert_eq!(report.flips_applied, 1);
+            assert_eq!(report.proxies_upserted, 0);
+            assert_eq!(report.owned_skipped, 0);
+            assert!(ownership.owns(entity_id, cluster_c2));
+            assert!(!ownership.owns(entity_id, cluster_c1));
+        }
+
+        #[test]
+        fn losing_node_stops_writing() {
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let entity_id = Uuid::from_u128(101);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let ownership = OwnershipMap::new();
+            ownership.set_owner(entity_id, cluster_c1);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_c1,
+                to_cluster: cluster_c2,
+                effective_tick: 50,
+            };
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![flip],
+                entities: vec![],
+            };
+
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &ownership,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert!(!ownership.owns(entity_id, cluster_c1));
+            assert!(ownership.owns(entity_id, cluster_c2));
+        }
+
+        #[test]
+        fn proxies_upserted_not_owned() {
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::{NodeInboxFrame, ReplicatedEntity};
+            use arcane_affinity::rate_field::RateTier;
+
+            let entity_owned = Uuid::from_u128(200);
+            let entity_foreign = Uuid::from_u128(201);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let ownership = OwnershipMap::new();
+            ownership.set_owner(entity_owned, cluster_c1);
+
+            let entry_owned = mk_entry(entity_owned, cluster_c1, 10.0);
+            let entry_foreign = mk_entry(entity_foreign, cluster_c2, 20.0);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![
+                    ReplicatedEntity {
+                        entry: entry_owned.clone(),
+                        tier: RateTier::Full,
+                    },
+                    ReplicatedEntity {
+                        entry: entry_foreign.clone(),
+                        tier: RateTier::Full,
+                    },
+                ],
+            };
+
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &ownership,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert_eq!(report.owned_skipped, 1);
+            assert_eq!(report.proxies_upserted, 1);
+            assert!(neighbor_entities.contains_key(&entity_foreign));
+            assert!(!neighbor_entities.contains_key(&entity_owned));
+            assert_eq!(neighbor_last_seen.get(&entity_foreign), Some(&50));
+        }
+
+        #[test]
+        fn frame_over_inmemory_bus_end_to_end() {
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::{InMemoryInboxBus, InboxBus, NodeInboxFrame};
+
+            let entity_id = Uuid::from_u128(300);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let ownership = OwnershipMap::new();
+            ownership.set_owner(entity_id, cluster_c1);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_c1,
+                to_cluster: cluster_c2,
+                effective_tick: 100,
+            };
+
+            let frame = NodeInboxFrame {
+                tick: 100,
+                ownership: vec![flip],
+                entities: vec![],
+            };
+
+            // Subscribe BEFORE publishing: InMemoryInboxBus does not retain frames
+            // for late subscribers (a publish with no subscribers is dropped).
+            let bus = InMemoryInboxBus::new();
+            let rx = bus.subscribe(cluster_c2);
+            bus.publish(cluster_c2, frame).unwrap();
+            let received_frame = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("frame should be received");
+
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c2,
+                &received_frame,
+                &ownership,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                100,
+            );
+
+            assert_eq!(report.flips_applied, 1);
+            assert!(ownership.owns(entity_id, cluster_c2));
+        }
+
+        #[test]
+        fn exactly_once_through_frame() {
+            use crate::node_core::apply_inbox_frame;
+
+            let entity_id = Uuid::from_u128(400);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            let frame_a = crate::node_inbox::NodeInboxFrame {
+                tick: flip_tick,
+                ownership: vec![flip],
+                entities: vec![],
+            };
+
+            let ownership_a = OwnershipMap::new();
+            ownership_a.set_owner(entity_id, cluster_a);
+
+            let ownership_b = OwnershipMap::new();
+            ownership_b.set_owner(entity_id, cluster_a);
+
+            let mut neighbor_a: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen_a: HashMap<Uuid, u64> = HashMap::new();
+
+            let mut neighbor_b: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen_b: HashMap<Uuid, u64> = HashMap::new();
+
+            apply_inbox_frame(
+                cluster_a,
+                &frame_a,
+                &ownership_a,
+                &mut neighbor_a,
+                &mut neighbor_last_seen_a,
+                flip_tick,
+            );
+
+            apply_inbox_frame(
+                cluster_b,
+                &frame_a,
+                &ownership_b,
+                &mut neighbor_b,
+                &mut neighbor_last_seen_b,
+                flip_tick,
+            );
+
+            let a_writes =
+                resolve_authoritative(entity_id, cluster_a, &ownership_a, flip_tick, Some(flip));
+            let b_writes =
+                resolve_authoritative(entity_id, cluster_b, &ownership_b, flip_tick, Some(flip));
+
+            assert!(!a_writes, "cluster_a should not write at flip_tick");
+            assert!(b_writes, "cluster_b should write at flip_tick");
+            assert_eq!(
+                (a_writes as u8) + (b_writes as u8),
+                1,
+                "exactly one cluster should write"
+            );
         }
     }
 }
