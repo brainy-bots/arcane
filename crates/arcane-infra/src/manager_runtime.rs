@@ -1,0 +1,380 @@
+//! ManagerRuntime — the library-level control loop that drains flips, routes, and publishes.
+//!
+//! This module closes the Manager → Router → InboxBus circuit as a testable library loop,
+//! without binary/daemon wiring. The runtime manages world state fed by a driver,
+//! runs evaluation/routing each cycle, and publishes frames to the InboxBus.
+
+use crate::manager::ArcaneManager;
+use crate::node_inbox::InboxBus;
+use crate::router_core::{route, RouterConfig, RouterInput};
+use arcane_core::replication_channel::EntityStateEntry;
+use arcane_core::Vec3;
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// One cycle's report: tick number, flips applied, frames published.
+#[derive(Debug, Clone, Copy)]
+pub struct CycleReport {
+    pub tick: u64,
+    pub flips_applied: usize,
+    pub frames_published: usize,
+}
+
+/// Central runtime loop: holds the Manager, InboxBus, and config; runs cycles.
+pub struct ManagerRuntime<B: InboxBus> {
+    manager: ArcaneManager,
+    bus: B,
+    config: RouterConfig,
+    /// Authoritative entity → cluster assignment, updated by applying flips.
+    assignments: HashMap<Uuid, Uuid>,
+    tick: u64,
+}
+
+impl<B: InboxBus> ManagerRuntime<B> {
+    /// Create a new ManagerRuntime.
+    pub fn new(manager: ArcaneManager, bus: B, config: RouterConfig) -> Self {
+        Self {
+            manager,
+            bus,
+            config,
+            assignments: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// Feed entity position and cluster. On first sighting, establishes ownership.
+    /// On re-sighting, keeps the runner's assignments in sync with the driver's
+    /// cluster (after a flip, the manager must see the entity on its new cluster).
+    pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
+        // Establish ownership on first sighting, or use current assignment on re-sighting.
+        let current_cluster = *self.assignments.entry(entity_id).or_insert(cluster_id);
+        self.manager
+            .update_entity(entity_id, current_cluster, position);
+    }
+
+    /// Set entity velocity.
+    pub fn set_entity_velocity(&mut self, entity_id: Uuid, velocity: Vec3) {
+        self.manager.set_entity_velocity(entity_id, velocity);
+    }
+
+    /// Set entity party.
+    pub fn set_entity_party(&mut self, entity_id: Uuid, party_id: Option<Uuid>) {
+        self.manager.set_entity_party(entity_id, party_id);
+    }
+
+    /// Set entity guild.
+    pub fn set_entity_guild(&mut self, entity_id: Uuid, guild_id: Option<Uuid>) {
+        self.manager.set_entity_guild(entity_id, guild_id);
+    }
+
+    /// Set physics edge (feature-gated).
+    #[cfg(feature = "migration")]
+    pub fn set_physics_edge(
+        &mut self,
+        a: Uuid,
+        b: Uuid,
+        colocation: Option<arcane_affinity::interaction_graph::Colocation>,
+    ) {
+        self.manager.set_physics_edge(a, b, colocation);
+    }
+
+    /// Set observation radius.
+    pub fn set_observation_radius(&mut self, radius: f64) {
+        self.manager.set_observation_radius(radius);
+    }
+
+    /// Inspect current assignments.
+    pub fn assignments(&self) -> &HashMap<Uuid, Uuid> {
+        &self.assignments
+    }
+
+    /// Inspect the manager.
+    pub fn manager(&self) -> &ArcaneManager {
+        &self.manager
+    }
+
+    /// Run one control cycle: evaluate, route, publish.
+    pub fn run_cycle(&mut self) -> Result<CycleReport, String> {
+        self.tick += 1;
+
+        // 1. Evaluate the manager.
+        self.manager.run_evaluation_cycle()?;
+
+        // 2. Drain flips and apply them to assignments.
+        let flips = self.manager.take_pending_flips();
+        for flip in &flips {
+            self.assignments.insert(flip.entity_id, flip.to_cluster);
+        }
+
+        // 3. Build entity_states from the manager's spatial snapshot.
+        let snapshot_positions = self.manager.snapshot_positions();
+
+        // 3a. Actuate flips INSIDE the manager too: move each flipped entity to its
+        // new cluster in the spatial index. Without this the manager keeps seeing the
+        // entity on its old cluster and re-initiates the same migration after every
+        // cooldown window (flip ping-pong).
+        for flip in &flips {
+            if let Some((_, _, pos, _)) = snapshot_positions
+                .iter()
+                .find(|(id, _, _, _)| *id == flip.entity_id)
+            {
+                self.manager
+                    .update_entity(flip.entity_id, flip.to_cluster, *pos);
+            }
+        }
+
+        let mut entity_states: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        for (entity_id, cluster_id, position, velocity) in snapshot_positions {
+            // Ownership source of truth is `assignments` (post-flip), not the
+            // pre-flip spatial snapshot.
+            let owner = self
+                .assignments
+                .get(&entity_id)
+                .copied()
+                .unwrap_or(cluster_id);
+            entity_states.insert(
+                entity_id,
+                EntityStateEntry::new(entity_id, owner, position, velocity),
+            );
+        }
+
+        // 4. Route via RouterCore.
+        let router_input = RouterInput {
+            tick: self.tick,
+            assignments: &self.assignments,
+            flips: &flips,
+            entity_states: &entity_states,
+            interaction_graph: self.manager.interaction_graph(),
+        };
+
+        let frames = route(&router_input, &self.config);
+
+        // 5. Publish frames to the bus.
+        let mut published = 0;
+        for (cluster_id, frame) in frames {
+            self.bus.publish(cluster_id, frame)?;
+            published += 1;
+        }
+
+        Ok(CycleReport {
+            tick: self.tick,
+            flips_applied: flips.len(),
+            frames_published: published,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node_inbox::InMemoryInboxBus;
+
+    fn make_manager() -> ArcaneManager {
+        // The affinity model is required: it is the only model that produces
+        // co-location flips, which these tests assert unconditionally.
+        ArcaneManager::with_model("affinity")
+    }
+
+    fn make_config() -> RouterConfig {
+        RouterConfig::default()
+    }
+
+    /// flips_are_actuated_to_the_bus: Two entities on clusters C1/C2, same party,
+    /// positions within proximity radius. Subscribe before cycling. Assert: at least
+    /// one frame contains the flip, assignments updated, and frame matches.
+    #[test]
+    fn flips_are_actuated_to_the_bus() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+        let e2 = Uuid::from_u128(0x200);
+        let party = Uuid::from_u128(0x3);
+
+        // Subscribe to both clusters' inboxes BEFORE cycling.
+        let rx1 = runtime.bus.subscribe(c1);
+        let rx2 = runtime.bus.subscribe(c2);
+
+        // Set up entities in the same party, on different clusters, within proximity.
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0)); // Within 50-unit proximity
+        runtime.set_entity_party(e1, Some(party));
+        runtime.set_entity_party(e2, Some(party));
+        runtime.set_observation_radius(500.0);
+
+        // Run up to 300 cycles.
+        let mut flip_found = false;
+        let mut bus_flips: Vec<crate::ownership_migration::OwnershipFlip> = Vec::new();
+        for _ in 0..300 {
+            runtime.run_cycle().expect("run_cycle failed");
+
+            // Check if any frame on either cluster contains a flip.
+            while let Ok(frame) = rx1.try_recv() {
+                if !frame.ownership.is_empty() {
+                    flip_found = true;
+                    // Verify the flip matches what was recorded.
+                    for flip in &frame.ownership {
+                        assert!(flip.entity_id == e1 || flip.entity_id == e2);
+                        assert_ne!(flip.from_cluster, flip.to_cluster);
+                        bus_flips.push(*flip);
+                    }
+                }
+            }
+
+            while let Ok(frame) = rx2.try_recv() {
+                if !frame.ownership.is_empty() {
+                    flip_found = true;
+                    for flip in &frame.ownership {
+                        assert!(flip.entity_id == e1 || flip.entity_id == e2);
+                        assert_ne!(flip.from_cluster, flip.to_cluster);
+                        bus_flips.push(*flip);
+                    }
+                }
+            }
+        }
+
+        // UNCONDITIONAL: the decision must have left the Manager and arrived on a
+        // node inbox without any test-side draining of take_pending_flips.
+        assert!(
+            flip_found,
+            "no ownership flip was ever actuated to the bus in 300 cycles"
+        );
+
+        // Both entities co-located in assignments...
+        let a1 = *runtime.assignments.get(&e1).expect("e1 assigned");
+        let a2 = *runtime.assignments.get(&e2).expect("e2 assigned");
+        assert_eq!(a1, a2, "party pair must co-locate; e1={a1:?} e2={a2:?}");
+
+        // ...and the assignments state is exactly what replaying the bus flips yields.
+        let mut replay: HashMap<Uuid, Uuid> = HashMap::from([(e1, c1), (e2, c2)]);
+        for flip in &bus_flips {
+            replay.insert(flip.entity_id, flip.to_cluster);
+        }
+        assert_eq!(
+            replay.get(&e1),
+            Some(&a1),
+            "bus flips must replay to assignments"
+        );
+        assert_eq!(
+            replay.get(&e2),
+            Some(&a2),
+            "bus flips must replay to assignments"
+        );
+    }
+
+    /// frames_carry_interest_state: two 3-entity party cliques on C1/C2 (capacity keeps
+    /// them split) plus a cross-boundary guild edge A—B. The partitioner must cut the
+    /// guild edge (the cheapest cut), so A and B stay on different clusters, and interest
+    /// set v1 must deliver B to C1 as a foreign proxy. Unconditional: fails if C1 never
+    /// receives B's proxy or if the boundary pair co-locates (which would make it vacuous).
+    #[test]
+    fn frames_carry_interest_state() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let a = Uuid::from_u128(0x100);
+        let b = Uuid::from_u128(0x200);
+        let a2 = Uuid::from_u128(0x101);
+        let a3 = Uuid::from_u128(0x102);
+        let b2 = Uuid::from_u128(0x201);
+        let b3 = Uuid::from_u128(0x202);
+        let party1 = Uuid::from_u128(0x3);
+        let party2 = Uuid::from_u128(0x4);
+        let guild = Uuid::from_u128(0x5);
+
+        let rx1 = runtime.bus.subscribe(c1);
+
+        // Clique 1 on C1 (party1), clique 2 on C2 (party2), far apart.
+        for (e, x) in [(a, 0.0), (a2, 5.0), (a3, 10.0)] {
+            runtime.update_entity(e, c1, Vec3::new(x, 0.0, 0.0));
+            runtime.set_entity_party(e, Some(party1));
+        }
+        for (e, x) in [(b, 1000.0), (b2, 1005.0), (b3, 1010.0)] {
+            runtime.update_entity(e, c2, Vec3::new(x, 0.0, 0.0));
+            runtime.set_entity_party(e, Some(party2));
+        }
+        // Cross-boundary guild edge A—B: weight 1.0/cycle, the cheapest cut in the
+        // graph — the partitioner keeps the cliques whole and cuts this edge, so
+        // A and B remain split while staying interesting to each other.
+        runtime.set_entity_guild(a, Some(guild));
+        runtime.set_entity_guild(b, Some(guild));
+        runtime.set_observation_radius(500.0);
+
+        let mut proxy_seen = false;
+        for _ in 0..100 {
+            runtime.run_cycle().expect("run_cycle failed");
+
+            while let Ok(frame) = rx1.try_recv() {
+                // Check if B appears as a foreign entity in C1's frame.
+                for entity in &frame.entities {
+                    if entity.entry.entity_id == b {
+                        proxy_seen = true;
+                    }
+                }
+            }
+        }
+
+        // The boundary pair must have stayed split (cliques + capacity forbid a merge)...
+        assert_ne!(
+            runtime.assignments.get(&a),
+            runtime.assignments.get(&b),
+            "boundary pair unexpectedly co-located; the proxy assertion would be vacuous"
+        );
+        // ...and interest set v1 must have delivered the foreign proxy across the cut.
+        assert!(
+            proxy_seen,
+            "C1 never received foreign proxy of B across the cut boundary"
+        );
+    }
+
+    /// assignments_follow_flips: After colocating two entities, verify that subsequent
+    /// cycles don't generate flip ping-pong (no additional flips for 50 cycles).
+    #[test]
+    fn assignments_follow_flips() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+        let e2 = Uuid::from_u128(0x200);
+        let party = Uuid::from_u128(0x3);
+
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0));
+        runtime.set_entity_party(e1, Some(party));
+        runtime.set_entity_party(e2, Some(party));
+        runtime.set_observation_radius(500.0);
+
+        // Run until colocated.
+        let mut colocated = false;
+        for _ in 0..300 {
+            runtime.run_cycle().expect("run_cycle failed");
+            if let (Some(&ca), Some(&cb)) =
+                (runtime.assignments.get(&e1), runtime.assignments.get(&e2))
+            {
+                if ca == cb {
+                    colocated = true;
+                    break;
+                }
+            }
+        }
+
+        // UNCONDITIONAL: the pair must co-locate, then stay put (zero flips for 50 cycles).
+        assert!(colocated, "party pair never co-located in 300 cycles");
+        let frozen_a1 = *runtime.assignments.get(&e1).unwrap();
+        let frozen_a2 = *runtime.assignments.get(&e2).unwrap();
+
+        for _ in 0..50 {
+            let report = runtime.run_cycle().expect("run_cycle failed");
+            assert_eq!(report.flips_applied, 0, "flip ping-pong after co-location");
+        }
+
+        assert_eq!(*runtime.assignments.get(&e1).unwrap(), frozen_a1);
+        assert_eq!(*runtime.assignments.get(&e2).unwrap(), frozen_a2);
+    }
+}

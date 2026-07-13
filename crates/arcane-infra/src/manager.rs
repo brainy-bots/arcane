@@ -829,6 +829,29 @@ impl ArcaneManager {
     pub fn snapshot_for_view(&self) -> Vec<arcane_core::ClusterGeometry> {
         self.spatial_index.snapshot_for_view()
     }
+
+    /// Accessor for the interaction graph (feature-gated, used by ManagerRuntime).
+    #[cfg(feature = "migration")]
+    pub fn interaction_graph(&self) -> &InteractionGraph {
+        &self.interaction_graph
+    }
+
+    /// Snapshot of entity positions and velocities (feature-gated, used by ManagerRuntime).
+    /// Returns (entity_id, cluster_id, position, velocity) for all known entities.
+    #[cfg(feature = "migration")]
+    pub fn snapshot_positions(&self) -> Vec<(Uuid, Uuid, arcane_core::Vec3, arcane_core::Vec3)> {
+        self.spatial_index
+            .snapshot_entities()
+            .into_iter()
+            .map(|(entity_id, cluster_id, position)| {
+                let velocity = self
+                    .spatial_index
+                    .velocity_of(entity_id)
+                    .unwrap_or(arcane_core::Vec3::new(0.0, 0.0, 0.0));
+                (entity_id, cluster_id, position, velocity)
+            })
+            .collect()
+    }
 }
 
 #[cfg(feature = "migration")]
