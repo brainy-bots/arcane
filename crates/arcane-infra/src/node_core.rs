@@ -79,6 +79,14 @@ pub struct FrameApplyReport {
     pub flips_applied: usize,
     pub proxies_upserted: usize,
     pub owned_skipped: usize,
+    /// Entities this node just GAINED ownership of, with their last replicated
+    /// state (§8 adoption: B was already replicating X; on flip B starts writing
+    /// X **from its replicated copy**). The driver must insert these into its
+    /// world so the entity keeps existing on its new owner.
+    pub adopted: Vec<EntityStateEntry>,
+    /// Entities this node just LOST ownership of (flip away from my_cluster).
+    /// The driver should stop simulating them (drop local controllers/agents).
+    pub lost: Vec<Uuid>,
 }
 
 /// Apply one inbox frame to node-local state. Returns the number of ownership
@@ -95,13 +103,28 @@ pub fn apply_inbox_frame(
     let mut flips_applied = 0;
     let mut proxies_upserted = 0;
     let mut owned_skipped = 0;
+    let mut adopted = Vec::new();
+    let mut lost = Vec::new();
 
     for flip in &frame.ownership {
+        let previously_mine = ownership.owns(flip.entity_id, my_cluster);
         ownership.set_owner(flip.entity_id, flip.to_cluster);
         flips_applied += 1;
         if flip.to_cluster == my_cluster {
-            neighbor_entities.remove(&flip.entity_id);
+            // Adoption: prefer the freshest state in THIS frame (the gate
+            // force-included it), else the proxy copy we were replicating.
+            let from_frame = frame
+                .entities
+                .iter()
+                .find(|e| e.entry.entity_id == flip.entity_id)
+                .map(|e| e.entry.clone());
+            let proxy = neighbor_entities.remove(&flip.entity_id);
             neighbor_last_seen.remove(&flip.entity_id);
+            if let Some(entry) = from_frame.or(proxy) {
+                adopted.push(entry);
+            }
+        } else if previously_mine {
+            lost.push(flip.entity_id);
         }
     }
 
@@ -120,6 +143,8 @@ pub fn apply_inbox_frame(
         flips_applied,
         proxies_upserted,
         owned_skipped,
+        adopted,
+        lost,
     }
 }
 
@@ -149,6 +174,16 @@ pub struct NodeInputs {
     pub game_actions: Vec<GameAction>,
     pub neighbor_entities: HashMap<Uuid, EntityStateEntry>,
     pub inbound_physics: Vec<arcane_core::physics_events::PhysicsEventBatch>,
+    /// Entities this node gained ownership of via inbox flips this drain (§8
+    /// adoption). The driver must insert them into its world map so it starts
+    /// simulating + submitting them; their last replicated state is the seed.
+    #[cfg(feature = "migration")]
+    pub adopted_entities: Vec<EntityStateEntry>,
+    /// Entities this node lost ownership of via inbox flips this drain. The
+    /// driver should remove them from its world map (the new owner simulates
+    /// them now; we keep seeing them as replicated proxies).
+    #[cfg(feature = "migration")]
+    pub lost_entities: Vec<Uuid>,
 }
 
 /// Outcome of one `pump()` iteration: tick number, sequence number, and entity count.
@@ -393,6 +428,10 @@ impl NodeCore {
         out.client_updates.clear();
         out.game_actions.clear();
         out.inbound_physics.clear();
+        #[cfg(feature = "migration")]
+        out.adopted_entities.clear();
+        #[cfg(feature = "migration")]
+        out.lost_entities.clear();
 
         while let Ok(entry) = self.client_updates_rx.try_recv() {
             out.client_updates.push(entry);
@@ -414,7 +453,7 @@ impl NodeCore {
         #[cfg(feature = "migration")]
         if let Some(ref inbox_rx) = self.inbox_rx {
             while let Ok(frame) = inbox_rx.try_recv() {
-                let _ = apply_inbox_frame(
+                let report = apply_inbox_frame(
                     self.cluster_id,
                     &frame,
                     &self.ownership,
@@ -422,6 +461,10 @@ impl NodeCore {
                     &mut self.neighbor_last_seen,
                     self.tick_count,
                 );
+                // §8 adoption: hand gained entities to the driver so it starts
+                // simulating them from their replicated state.
+                out.adopted_entities.extend(report.adopted);
+                out.lost_entities.extend(report.lost);
             }
         }
         const PRUNE_INTERVAL_TICKS: u64 = 60;

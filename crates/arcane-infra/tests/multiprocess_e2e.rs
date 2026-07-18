@@ -275,6 +275,32 @@ fn full_control_plane_over_real_redis() {
     // Settling: observe another 10s; no entity may flip AGAIN (ping-pong guard).
     let settle_deadline = Instant::now() + Duration::from_secs(10);
     let mut post_settle_flips = 0;
+    // Adoption proof: after the flip, node B must actually SIMULATE the adopted
+    // entities — observable as B's own replication topic carrying them with
+    // cluster_id = B. Subscribe to B's per-cluster replication channel.
+    let mut b_writes_migrated = false;
+    let replication_rx = {
+        let client = redis::Client::open(REDIS_URL).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            if let Ok(mut conn) = client.get_connection() {
+                let mut pubsub = conn.as_pubsub();
+                if pubsub
+                    .subscribe(format!("arcane:replication:{CLUSTER_B}"))
+                    .is_ok()
+                {
+                    while let Ok(msg) = pubsub.get_message() {
+                        if let Ok(payload) = msg.get_payload::<String>() {
+                            if tx.send(payload).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        rx
+    };
     while Instant::now() < settle_deadline {
         while let Ok(frame) = observer.rx_b.try_recv() {
             post_settle_flips += frame
@@ -290,15 +316,30 @@ fn full_control_plane_over_real_redis() {
                 .filter(|f| flip_to_b_at.contains_key(&f.entity_id) && f.to_cluster == ca)
                 .count();
         }
+        while let Ok(payload) = replication_rx.try_recv() {
+            // B's delta payloads are JSON EntityStateDelta; a migrated entity id
+            // appearing in B's OWN outbound replication means B is writing it.
+            if flip_to_b_at
+                .keys()
+                .any(|e| payload.contains(&e.to_string()))
+            {
+                b_writes_migrated = true;
+            }
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(
         post_settle_flips, 0,
         "migrated entities flipped back within the settle window (ping-pong)"
     );
+    assert!(
+        b_writes_migrated,
+        "node B never wrote a migrated entity to its replication topic — adoption failed \
+         (the flip changed the map but B is not simulating the entity)"
+    );
 
     eprintln!(
-        "[e2e] PASS: {} entities migrated A->B; gate order verified for all; no ping-pong.",
+        "[e2e] PASS: {} entities migrated A->B; gate order verified; B simulates adopted entities; no ping-pong.",
         flip_to_b_at.len()
     );
 }

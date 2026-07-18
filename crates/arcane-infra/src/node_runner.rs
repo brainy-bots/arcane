@@ -122,6 +122,22 @@ where
             e.cluster_id = cluster_id;
             world.insert(e.entity_id, e);
         }
+        // §8 adoption/loss: entities whose ownership flipped TO this node enter the
+        // world seeded from their replicated state; entities flipped AWAY leave it
+        // (the new owner simulates them; we see them as proxies).
+        #[cfg(feature = "migration")]
+        {
+            for mut e in inputs.adopted_entities.drain(..) {
+                e.cluster_id = cluster_id;
+                eprintln!("adopted entity {} (ownership flip)", e.entity_id);
+                world.insert(e.entity_id, e);
+            }
+            for id in inputs.lost_entities.drain(..) {
+                if world.remove(&id).is_some() {
+                    eprintln!("released entity {} (ownership flip away)", id);
+                }
+            }
+        }
         for mut e in extra_entities_for_tick(core.current_tick()) {
             e.cluster_id = cluster_id;
             world.insert(e.entity_id, e);
