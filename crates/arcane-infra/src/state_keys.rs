@@ -210,6 +210,17 @@ impl RedisStateSource {
     pub fn last_observed_edges(&self) -> Vec<(Uuid, Uuid, f64)> {
         self.last_observed_edges.lock().unwrap().clone()
     }
+
+    /// Latest known (cluster_id, tick) per cluster from the doc cache. Used for
+    /// staleness detection: a cluster whose tick stops advancing is stale even if
+    /// it still has cached entities; an EMPTY cluster that keeps publishing
+    /// (advancing tick, zero entities — a warm spare) is NOT stale.
+    pub fn last_docs(&self) -> Vec<(Uuid, u64)> {
+        let cache = self.cache.lock().unwrap();
+        let mut out: Vec<(Uuid, u64)> = cache.iter().map(|(id, doc)| (*id, doc.tick)).collect();
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
 }
 
 impl IEntityStateSource for RedisStateSource {
