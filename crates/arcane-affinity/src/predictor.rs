@@ -33,17 +33,20 @@ pub trait InteractionPredictor: Send + Sync {
 /// Configuration for the heuristic spatial+history predictor.
 #[derive(Clone, Debug)]
 pub struct HeuristicConfig {
-    /// Coefficient for spatial term (future distance falloff).
-    pub spatial_coeff: f64,
-    /// Coefficient for history term (existing interaction weight).
-    pub history_coeff: f64,
+    /// Distance at which the spatial term ~halves (world units). Larger = wider reach.
+    pub distance_scale: f64,
+    /// Normalizer for history_weight: the graph weight at which the history term saturates.
+    pub history_scale: f64,
+    /// Maximum additive contribution of the (saturated) history term.
+    pub history_max: f64,
 }
 
 impl Default for HeuristicConfig {
     fn default() -> Self {
         Self {
-            spatial_coeff: 1.0,
-            history_coeff: 0.5,
+            distance_scale: 50.0,
+            history_scale: 10.0,
+            history_max: 0.2,
         }
     }
 }
@@ -68,15 +71,17 @@ impl HeuristicPredictor {
 
 impl InteractionPredictor for HeuristicPredictor {
     fn predict(&self, ctx: &PairContext) -> f64 {
+        // Effective future distance: where the pair will be after `horizon_secs`
+        // at the current closing rate. Same falloff as the original C4 baseline:
+        // p_spatial = 1 / (1 + eff_dist / distance_scale)  → 1 as eff_dist → 0,
+        // ~0.5 at distance_scale.
         let effective_distance = (ctx.distance - ctx.closing_speed * ctx.horizon_secs).max(0.0);
+        let spatial_term = 1.0 / (1.0 + effective_distance / self.config.distance_scale);
 
-        let spatial_term = if effective_distance > 0.0 {
-            1.0 / (1.0 + self.config.spatial_coeff * effective_distance)
-        } else {
-            1.0
-        };
-
-        let history_term = self.config.history_coeff * ctx.history_weight;
+        // Bounded history term: saturates at history_max so accumulated weight can
+        // bias but never dominate/saturate p on its own.
+        let history_term = self.config.history_max
+            * (ctx.history_weight / self.config.history_scale).clamp(0.0, 1.0);
 
         (spatial_term + history_term).clamp(0.0, 1.0)
     }
