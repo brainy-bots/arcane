@@ -27,7 +27,7 @@ use arcane_affinity::partition::{
 };
 #[cfg(feature = "migration")]
 use arcane_affinity::predictor::{
-    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairContext, PairFeatures,
+    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairContext,
 };
 #[cfg(feature = "migration")]
 use arcane_affinity::refinement::{refine, RefineConfig};

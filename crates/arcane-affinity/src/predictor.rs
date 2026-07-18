@@ -237,7 +237,7 @@ mod tests {
             };
             let p = predictor.predict(&ctx);
             assert!(
-                p >= 0.0 && p <= 1.0,
+                (0.0..=1.0).contains(&p),
                 "p={} for ctx {:?}",
                 p,
                 (distance, closing_speed, horizon_secs, history_weight)
