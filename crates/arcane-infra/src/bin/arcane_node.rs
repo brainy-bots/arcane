@@ -7,8 +7,15 @@
 //!   NEIGHBOR_IDS — optional; comma-separated UUIDs of neighbor clusters.
 //!   NODE_WS_PORT — optional (when built with --features cluster-ws); default 8080.
 //!
+//! Features:
+//!   When built with `--features migration`, enables the control-plane paths:
+//!   - Inbox consumption at `arcane:inbox:<NODE_ID>` for ownership flip events.
+//!   - State publication at `arcane:state:<NODE_ID>` every `NODE_STATE_PUBLISH_TICKS`.
+//!   - First-sight ownership claiming for entities with no recorded owner.
+//!
 //! Example:
 //!   NODE_ID=550e8400-e29b-41d4-a716-446655440000 cargo run -p arcane-infra --bin arcane-node --features cluster-ws
+//!   NODE_ID=550e8400-e29b-41d4-a716-446655440000 cargo run -p arcane-infra --bin arcane-node --features cluster-ws,migration
 
 use std::sync::Arc;
 
