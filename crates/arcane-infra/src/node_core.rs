@@ -120,7 +120,20 @@ pub fn apply_inbox_frame(
                 .map(|e| e.entry.clone());
             let proxy = neighbor_entities.remove(&flip.entity_id);
             neighbor_last_seen.remove(&flip.entity_id);
-            if let Some(entry) = from_frame.or(proxy) {
+            // Manager-built frame entities are spine-only (kinematics); the proxy
+            // copy carries the full replicated state including bucket-2 user_data.
+            // §8: "B starts writing X from its REPLICATED copy" — so merge: frame
+            // kinematics win (freshest), proxy fills in user_data the frame lacks.
+            let merged = match (from_frame, proxy) {
+                (Some(mut f), Some(p)) => {
+                    if f.user_data.is_null() {
+                        f.user_data = p.user_data;
+                    }
+                    Some(f)
+                }
+                (f, p) => f.or(p),
+            };
+            if let Some(entry) = merged {
                 adopted.push(entry);
             }
         } else if previously_mine {
@@ -133,7 +146,15 @@ pub fn apply_inbox_frame(
         if ownership.owns(entry.entity_id, my_cluster) {
             owned_skipped += 1;
         } else {
-            neighbor_entities.insert(entry.entity_id, entry.clone());
+            // Same spine-only caveat as adoption: don't let a manager-built frame
+            // entity erase user_data the legacy replication path already gave us.
+            let mut incoming = entry.clone();
+            if incoming.user_data.is_null() {
+                if let Some(existing) = neighbor_entities.get(&entry.entity_id) {
+                    incoming.user_data = existing.user_data.clone();
+                }
+            }
+            neighbor_entities.insert(entry.entity_id, incoming);
             neighbor_last_seen.insert(entry.entity_id, current_tick);
             proxies_upserted += 1;
         }
