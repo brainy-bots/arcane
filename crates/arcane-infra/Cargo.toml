@@ -42,7 +42,7 @@ required-features = ["cluster-ws"]
 [[bin]]
 name = "arcane-manager"
 path = "src/bin/arcane_manager.rs"
-required-features = ["manager"]
+required-features = ["manager", "migration"]
 
 [[bin]]
 name = "arcane-rapier-node"

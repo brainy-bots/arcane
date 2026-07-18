@@ -57,6 +57,8 @@ pub struct ManagerRuntime<B: InboxBus> {
     skip_confirmed: HashSet<Uuid>,
     /// Entities on their first pending cycle (for skip rule check).
     first_cycle_flips: HashSet<Uuid>,
+    /// Clusters where flips are blocked (gate keeps counting, promotion deferred).
+    blocked_destinations: HashSet<Uuid>,
     tick: u64,
 }
 
@@ -85,6 +87,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             gate: ReplicationGate::new(),
             skip_confirmed: HashSet::new(),
             first_cycle_flips: HashSet::new(),
+            blocked_destinations: HashSet::new(),
             tick: 0,
         }
     }
@@ -138,6 +141,13 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// Inspect the manager.
     pub fn manager(&self) -> &ArcaneManager {
         &self.manager
+    }
+
+    /// Set clusters where flips are blocked (e.g., stale clusters).
+    /// Pending flips to blocked destinations stay pending; gate keeps counting.
+    /// Once unblocked, they can be promoted to confirmed on the next cycle.
+    pub fn set_blocked_destinations(&mut self, blocked: HashSet<Uuid>) {
+        self.blocked_destinations = blocked;
     }
 
     /// Run one control cycle: evaluate, route, publish.
@@ -287,6 +297,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
         // 9. Promote gate-confirmed pending flips to `confirmed_flips` — they will be
         //    routed (published in `ownership`) on the NEXT cycle and applied after.
         //    Drop pending flips whose entity disappeared from the view.
+        //    Flips to blocked destinations stay pending even if gate-confirmed.
         let known_entities: HashSet<Uuid> = entity_states.keys().copied().collect();
         let mut remaining_pending = Vec::new();
         for flip in self.pending_flips.drain(..) {
@@ -296,7 +307,10 @@ impl<B: InboxBus> ManagerRuntime<B> {
                 self.first_cycle_flips.remove(&flip.entity_id);
                 continue; // dropped
             }
-            if self.skip_confirmed.contains(&flip.entity_id)
+            if self.blocked_destinations.contains(&flip.to_cluster) {
+                // Destination is stale/blocked; keep pending.
+                remaining_pending.push(flip);
+            } else if self.skip_confirmed.contains(&flip.entity_id)
                 || self
                     .gate
                     .is_confirmed(flip.entity_id, self.config.confirmation_cycles)
@@ -753,5 +767,97 @@ mod tests {
             flip_published |= frame.ownership.iter().any(|f| f.entity_id == e1);
         }
         assert!(!flip_published, "departed entity's flip was published");
+    }
+
+    #[test]
+    fn set_blocked_destinations_defers_promotion() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+        let party_value = 3.0;
+
+        // Subscribe and set up entities.
+        runtime.bus.subscribe(c1);
+        runtime.bus.subscribe(c2);
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.set_entity_feature(e1, "party", party_value);
+        runtime.set_observation_radius(500.0);
+
+        // Inject a flip manually (simplified test).
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: e1,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: 0,
+        });
+        runtime.first_cycle_flips.insert(e1);
+
+        // Run one cycle to get the flip to the gate.
+        runtime.run_cycle().expect("run_cycle failed");
+        assert!(
+            !runtime.pending_flips.is_empty(),
+            "flip should still be pending after 1 cycle"
+        );
+
+        // Run 2 more cycles to meet confirmation_cycles (3).
+        runtime.run_cycle().expect("run_cycle failed");
+        runtime.run_cycle().expect("run_cycle failed");
+
+        // Before blocking: flip should promote to confirmed.
+        runtime.run_cycle().expect("run_cycle failed");
+        let was_confirmed = !runtime.confirmed_flips.is_empty();
+
+        // Reset and redo with blocking.
+        runtime.confirmed_flips.clear();
+        runtime.pending_flips.clear();
+        runtime.gate = ReplicationGate::new();
+        runtime.first_cycle_flips.clear();
+
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: e1,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: 0,
+        });
+        runtime.first_cycle_flips.insert(e1);
+
+        // Block c2 and run cycles.
+        let mut blocked = std::collections::HashSet::new();
+        blocked.insert(c2);
+        runtime.set_blocked_destinations(blocked);
+
+        for _ in 0..10 {
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+
+        // Flip should still be pending (not promoted) because c2 is blocked.
+        assert!(
+            runtime.pending_flips.iter().any(|f| f.entity_id == e1),
+            "flip to blocked destination should stay pending"
+        );
+        assert!(
+            !runtime.confirmed_flips.iter().any(|f| f.entity_id == e1),
+            "flip to blocked destination should not be confirmed"
+        );
+
+        // Unblock c2.
+        runtime.set_blocked_destinations(std::collections::HashSet::new());
+
+        // Run cycles until promoted.
+        let mut promoted = false;
+        for _ in 0..10 {
+            runtime.run_cycle().expect("run_cycle failed");
+            if runtime.confirmed_flips.iter().any(|f| f.entity_id == e1) {
+                promoted = true;
+                break;
+            }
+        }
+        assert!(
+            promoted,
+            "flip should be promoted after unblocking destination"
+        );
     }
 }
