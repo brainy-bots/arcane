@@ -208,6 +208,10 @@ pub struct NodeCore {
     ownership: OwnershipMap,
     #[cfg(feature = "migration")]
     inbox_rx: Option<std::sync::mpsc::Receiver<NodeInboxFrame>>,
+    #[cfg(feature = "migration")]
+    state_publisher: Option<crate::state_keys::StatePublisher>,
+    #[cfg(feature = "migration")]
+    state_publish_interval: u64,
 }
 
 impl NodeCore {
@@ -301,6 +305,28 @@ impl NodeCore {
             map
         };
 
+        #[cfg(feature = "migration")]
+        let (state_publisher, state_publish_interval) = {
+            let interval = std::env::var("NODE_STATE_PUBLISH_TICKS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            let publisher = match crate::state_keys::StatePublisher::new(&cfg.redis_url) {
+                Ok(p) => {
+                    eprintln!("state publisher initialized (interval={} ticks)", interval);
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "state publisher init failed ({}); continuing without state publication",
+                        e
+                    );
+                    None
+                }
+            };
+            (publisher, interval)
+        };
+
         Ok(Self {
             server,
             state_tx,
@@ -322,6 +348,10 @@ impl NodeCore {
             ownership,
             #[cfg(feature = "migration")]
             inbox_rx: None,
+            #[cfg(feature = "migration")]
+            state_publisher,
+            #[cfg(feature = "migration")]
+            state_publish_interval,
         })
     }
 
@@ -487,6 +517,36 @@ impl NodeCore {
         let our_delta = self.server.tick();
         let tick_elapsed = tick_start.elapsed();
         let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
+
+        #[cfg(feature = "migration")]
+        if self.tick_count.is_multiple_of(self.state_publish_interval) {
+            if let Some(ref publisher) = self.state_publisher {
+                let snapshot = self.server.snapshot();
+                let entities: Vec<arcane_affinity::feature_map::EntityRecord> = snapshot
+                    .into_iter()
+                    .filter(|e| self.ownership.owns(e.entity_id, self.cluster_id))
+                    .map(|entry| arcane_affinity::feature_map::EntityRecord {
+                        entity_id: entry.entity_id,
+                        cluster_id: entry.cluster_id,
+                        position: arcane_core::types::Vec2::new(entry.position.x, entry.position.z),
+                        velocity: arcane_core::types::Vec2::new(entry.velocity.x, entry.velocity.z),
+                        features: arcane_affinity::feature_map::FeatureMap::new(),
+                    })
+                    .collect();
+
+                let doc = crate::state_keys::ClusterStateDoc {
+                    cluster_id: self.cluster_id,
+                    tick: self.server.current_tick(),
+                    entities,
+                    observed_edges: vec![],
+                };
+
+                if let Err(e) = publisher.publish(&doc) {
+                    eprintln!("state doc publish error: {}", e);
+                }
+            }
+        }
+
         let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
         let outcome_tick = merged_delta.tick;
         let outcome_seq = merged_delta.seq;
