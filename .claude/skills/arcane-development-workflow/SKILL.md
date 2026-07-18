@@ -1,15 +1,17 @@
 ---
 name: arcane-development-workflow
-description: How work flows through the Arcane repos — when to file an epic vs a standalone issue, how epic branches work, how sub-PRs route, who merges what, and how agents log decisions for the founder's final review. Apply when filing any issue or PR, when deciding which branch to target, when reviewing/merging, and when implementing a sub-issue of an epic.
+description: How work flows through the Arcane repos — when to file an epic vs a standalone issue vs a multi-epic initiative, how epic branches and long-lived initiative dev branches work, how sub-PRs route, who merges what, when main is touched, and how agents log decisions for the founder's final review. Apply when filing any issue or PR, when deciding which branch to target, when reviewing/merging, and when implementing a sub-issue of an epic or initiative.
 ---
 
 # Arcane Development Workflow
 
 How a feature gets from idea to merged code in the Arcane repos. The whole workflow exists to **minimize the founder's per-task interrupts** — design at the start of an epic, review at the end of an epic, agents and automation handle everything in between.
 
-## Two paths
+## Two paths (plus the initiative wrapper)
 
-There are exactly two ways work flows through the repos. Pick the right one up-front.
+There are two-and-a-half ways work flows through the repos. Pick the right one up-front.
+The **initiative path** below is a wrapper over the epic path — read it whenever an epic
+is one of several that ship together as a unit.
 
 ### Epic path — for architectural / multi-chunk work
 
@@ -32,6 +34,33 @@ Use when the work meets the merge-authority rubric (see `feedback_pr_merge_autho
 - Code is direct — not introducing new abstractions
 - Stays scoped to what the issue body asked for
 - Doesn't touch architectural pillars or benchmark code
+
+### Initiative path — for a multi-epic effort that ships as one unit
+
+Use when several epics together deliver one capability and **must land on `main` all at
+once, only after the whole thing is implemented and validated end-to-end** — not epic by
+epic. Signals: a founder-declared "initiative", a design doc spanning multiple epics,
+cross-repo changes that are meaningless in isolation, a new subsystem whose pieces are
+useless until they compose.
+
+**How it differs from a plain epic — this is the load-bearing distinction:**
+
+- There is **one long-lived initiative dev branch per repo** (e.g. `initiative/<slug>`),
+  created from `main`, that **accumulates ALL the initiative's epics**.
+- Each epic's sub-PRs merge into the **initiative dev branch**, not into a throwaway
+  per-epic branch. An epic being "done" is a **milestone on the dev branch, not a merge
+  to `main`**.
+- **Nothing merges to `main` until the entire initiative is complete and validated.**
+  Then a **single `initiative/<slug>` → `main` PR** opens once — that is the founder
+  review point for the whole initiative.
+- **Do NOT open a per-epic `epic → main` PR inside an initiative.** The "Final epic →
+  main PR — founder review" step below applies to *standalone* epics; for an initiative
+  it is replaced by the one end-of-initiative `initiative → main` PR.
+- The coordinator still reviews and merges each sub-PR into the dev branch (mechanical,
+  spec-scoped, per the epic rules). Only the final initiative→main merge is founder-only.
+
+If you are unsure whether an epic is standalone or part of an initiative, **ask the
+founder** — the answer changes where PRs target and when `main` is touched.
 
 ### Quick discriminator
 
@@ -82,6 +111,13 @@ Because the architecture was approved at epic creation, sub-PR review is mechani
 When all sub-issues are done, a single PR opens from `epic/<N>-<slug>` to `main`. **This is the founder's review point.** It contains the aggregated diff of all sub-PRs plus a consolidated decision log (see "Decision logging" below).
 
 The founder reviews, asks for changes if needed (which become new sub-PRs into the epic branch), and merges to `main`.
+
+> **Exception — epics inside an initiative do NOT do this.** If this epic is part of an
+> initiative (see "Initiative path" above), there is **no** per-epic → main PR. Its
+> sub-PRs merge into the long-lived `initiative/<slug>` dev branch, and `main` is touched
+> only once — a single `initiative/<slug>` → `main` PR at the very end, after the whole
+> initiative is validated. Opening a per-epic → main PR inside an initiative is a mistake;
+> close it and let the work keep accumulating on the dev branch.
 
 ## Standalone path — mechanics
 
