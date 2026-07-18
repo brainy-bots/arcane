@@ -1,5 +1,6 @@
 pub mod cold_pair;
 pub mod config;
+pub mod feature_map;
 pub mod hysteresis;
 pub mod interaction_graph;
 pub mod partition;
