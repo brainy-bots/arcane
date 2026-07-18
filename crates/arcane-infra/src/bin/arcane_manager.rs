@@ -185,17 +185,62 @@ async fn join_handler(State(s): State<ManagerState>) -> Json<JoinResponse> {
     })
 }
 
+/// Tick-based staleness tracker: a cluster is stale when its published tick has not
+/// advanced within the stale window. An EMPTY cluster that keeps publishing (warm
+/// spare: advancing tick, zero entities) is NOT stale — "no entities = stale" would
+/// block flips to warm spares and deadlock the spread-from-one-cluster regime.
+/// A cluster never seen at all is stale (it has not proven liveness yet).
+struct StaleTracker {
+    /// cluster -> (last observed tick, instant when that tick was first observed)
+    seen: HashMap<Uuid, (u64, std::time::Instant)>,
+}
+
+impl StaleTracker {
+    fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Feed the latest (cluster, tick) observations; returns the stale set.
+    fn update(
+        &mut self,
+        docs: &[(Uuid, u64)],
+        registered: &[Uuid],
+        stale_limit: Duration,
+        now: std::time::Instant,
+    ) -> HashSet<Uuid> {
+        for (cluster, tick) in docs {
+            match self.seen.get(cluster) {
+                Some((last_tick, _)) if last_tick == tick => {} // not advancing
+                _ => {
+                    self.seen.insert(*cluster, (*tick, now));
+                }
+            }
+        }
+        registered
+            .iter()
+            .filter(|c| match self.seen.get(c) {
+                None => true, // never published
+                Some((_, since)) => now.duration_since(*since) > stale_limit,
+            })
+            .copied()
+            .collect()
+    }
+}
+
 /// Control loop: fetches state, updates runtime, detects staleness, runs cycles.
 async fn control_loop(
     clusters: Vec<ClusterReg>,
     redis_url: String,
     cadence_ms: u64,
     capacity_factor: Option<f64>,
-    _stale_limit_ms: u64,
+    stale_limit_ms: u64,
     join_state: Arc<Mutex<JoinState>>,
 ) {
     let cluster_ids: Vec<Uuid> = clusters.iter().map(|c| c.id).collect();
     let mut cycle_count = 0u64;
+    let stale_limit = Duration::from_millis(stale_limit_ms);
 
     loop {
         // Try to build/rebuild runtime and state source each cycle.
@@ -230,6 +275,8 @@ async fn control_loop(
 
         let router_config = RouterConfig::default();
         let mut runtime = ManagerRuntime::new(manager, bus, router_config);
+        let mut stale_tracker = StaleTracker::new();
+        let mut last_stale: HashSet<Uuid> = HashSet::new();
 
         loop {
             // a. Fetch entities from all cluster state keys.
@@ -247,14 +294,18 @@ async fn control_loop(
             }
 
             // c. Staleness check: detect clusters whose ticks haven't advanced.
-            // For v1, we check if a cluster has any records at all.
-            let reporting_clusters: HashSet<Uuid> = records.iter().map(|r| r.cluster_id).collect();
-            let mut stale_clusters = HashSet::new();
-            for cluster_id in &cluster_ids {
-                if !reporting_clusters.contains(cluster_id) {
-                    // No entities from this cluster in this fetch = stale.
-                    stale_clusters.insert(*cluster_id);
-                }
+            // Tick-based (ADR-005 Decision 3 guard): a cluster is stale when its
+            // published tick stops advancing for stale_limit; empty-but-publishing
+            // warm spares stay live.
+            let docs = state_source.last_docs();
+            let stale_clusters =
+                stale_tracker.update(&docs, &cluster_ids, stale_limit, std::time::Instant::now());
+            if stale_clusters != last_stale {
+                eprintln!(
+                    "arcane-manager: stale set changed: {:?}",
+                    stale_clusters.iter().collect::<Vec<_>>()
+                );
+                last_stale = stale_clusters.clone();
             }
 
             // d. Block stale destinations and run cycle.
@@ -431,6 +482,45 @@ mod tests {
         let input = "invalid:entry";
         let result = parse_clusters(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stale_tracker_semantics() {
+        use std::time::{Duration, Instant};
+        let c1 = Uuid::from_u128(1); // advancing ticks
+        let c2 = Uuid::from_u128(2); // frozen tick
+        let c3 = Uuid::from_u128(3); // never publishes
+        let spare = Uuid::from_u128(4); // warm spare: advancing tick, would have zero entities
+        let registered = vec![c1, c2, c3, spare];
+        let limit = Duration::from_millis(300);
+
+        let mut tracker = StaleTracker::new();
+        let t0 = Instant::now();
+
+        // First observation: everyone who published is fresh; c3 (never seen) is stale.
+        let stale = tracker.update(&[(c1, 10), (c2, 5), (spare, 1)], &registered, limit, t0);
+        assert!(stale.contains(&c3), "never-published cluster must be stale");
+        assert!(!stale.contains(&c1) && !stale.contains(&c2) && !stale.contains(&spare));
+
+        // 400ms later: c1 and spare advanced, c2 frozen at 5 → c2 goes stale; the
+        // EMPTY-but-publishing spare stays live (the warm-spare guarantee).
+        let t1 = t0 + Duration::from_millis(400);
+        let stale = tracker.update(&[(c1, 22), (c2, 5), (spare, 2)], &registered, limit, t1);
+        assert!(stale.contains(&c2), "frozen-tick cluster must be stale");
+        assert!(stale.contains(&c3));
+        assert!(!stale.contains(&c1), "advancing cluster must not be stale");
+        assert!(
+            !stale.contains(&spare),
+            "publishing warm spare must not be stale"
+        );
+
+        // c2 resumes advancing → recovers.
+        let t2 = t1 + Duration::from_millis(100);
+        let stale = tracker.update(&[(c1, 30), (c2, 6), (spare, 3)], &registered, limit, t2);
+        assert!(
+            !stale.contains(&c2),
+            "recovered cluster must clear staleness"
+        );
     }
 
     #[test]
