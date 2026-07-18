@@ -59,36 +59,8 @@ impl AffinityEngine {
             self.config.gc_interval,
         );
 
-        // Phase 1b: inject party/guild signals
+        // Phase 1b: social signals removed (now handled via feature-based EdgeRules in ArcaneManager)
         let players = &view.players;
-        for i in 0..players.len() {
-            for j in (i + 1)..players.len() {
-                let a = &players[i];
-                let b = &players[j];
-
-                if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
-                    if pa == pb {
-                        graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            self.config.weight_party_member,
-                            InteractionKind::PartyMember,
-                        );
-                    }
-                }
-
-                if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
-                    if ga == gb {
-                        graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            self.config.weight_guild_member,
-                            InteractionKind::GuildMember,
-                        );
-                    }
-                }
-            }
-        }
 
         // Phase 1c: inject proximity signals
         let r_sq = self.config.proximity_radius * self.config.proximity_radius;
@@ -434,8 +406,6 @@ mod tests {
             cluster_id,
             position: Vec2::new(x, y),
             velocity: Vec2::new(0.0, 0.0),
-            guild_id: None,
-            party_id: None,
         }
     }
 

@@ -104,14 +104,14 @@ impl<B: InboxBus> ManagerRuntime<B> {
         self.manager.set_entity_velocity(entity_id, velocity);
     }
 
-    /// Set entity party.
-    pub fn set_entity_party(&mut self, entity_id: Uuid, party_id: Option<Uuid>) {
-        self.manager.set_entity_party(entity_id, party_id);
+    /// Set a named feature value for an entity.
+    pub fn set_entity_feature(&mut self, entity_id: Uuid, name: &str, value: f64) {
+        self.manager.set_entity_feature(entity_id, name, value);
     }
 
-    /// Set entity guild.
-    pub fn set_entity_guild(&mut self, entity_id: Uuid, guild_id: Option<Uuid>) {
-        self.manager.set_entity_guild(entity_id, guild_id);
+    /// Clear a named feature for an entity.
+    pub fn clear_entity_feature(&mut self, entity_id: Uuid, name: &str) {
+        self.manager.clear_entity_feature(entity_id, name);
     }
 
     /// Set physics edge (feature-gated).
@@ -325,7 +325,23 @@ mod tests {
     fn make_manager() -> ArcaneManager {
         // The affinity model is required: it is the only model that produces
         // co-location flips, which these tests assert unconditionally.
-        ArcaneManager::with_model("affinity")
+        // Edge rules make the test-declared "party"/"guild" features attract —
+        // the game (here: the test) declares the vocabulary, not the library.
+        let mut mgr = ArcaneManager::with_model("affinity");
+        mgr.set_affinity_config(arcane_affinity::config::AffinityConfig {
+            edge_rules: vec![
+                arcane_affinity::config::EdgeRule {
+                    feature: "party".to_string(),
+                    weight: 5.0,
+                },
+                arcane_affinity::config::EdgeRule {
+                    feature: "guild".to_string(),
+                    weight: 1.0,
+                },
+            ],
+            ..arcane_affinity::config::AffinityConfig::default()
+        });
+        mgr
     }
 
     fn make_config() -> RouterConfig {
@@ -344,7 +360,7 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party = Uuid::from_u128(0x3);
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         // Subscribe to both clusters' inboxes BEFORE cycling.
         let rx1 = runtime.bus.subscribe(c1);
@@ -353,8 +369,8 @@ mod tests {
         // Set up entities in the same party, on different clusters, within proximity.
         runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
         runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0)); // Within 50-unit proximity
-        runtime.set_entity_party(e1, Some(party));
-        runtime.set_entity_party(e2, Some(party));
+        runtime.set_entity_feature(e1, "party", party_value);
+        runtime.set_entity_feature(e2, "party", party_value);
         runtime.set_observation_radius(500.0);
 
         // Run up to 300 cycles.
@@ -435,26 +451,26 @@ mod tests {
         let a3 = Uuid::from_u128(0x102);
         let b2 = Uuid::from_u128(0x201);
         let b3 = Uuid::from_u128(0x202);
-        let party1 = Uuid::from_u128(0x3);
-        let party2 = Uuid::from_u128(0x4);
-        let guild = Uuid::from_u128(0x5);
+        let party1_value = 3.0; // was Uuid::from_u128(0x3)
+        let party2_value = 4.0; // was Uuid::from_u128(0x4)
+        let guild_value = 5.0; // was Uuid::from_u128(0x5)
 
         let rx1 = runtime.bus.subscribe(c1);
 
         // Clique 1 on C1 (party1), clique 2 on C2 (party2), far apart.
         for (e, x) in [(a, 0.0), (a2, 5.0), (a3, 10.0)] {
             runtime.update_entity(e, c1, Vec3::new(x, 0.0, 0.0));
-            runtime.set_entity_party(e, Some(party1));
+            runtime.set_entity_feature(e, "party", party1_value);
         }
         for (e, x) in [(b, 1000.0), (b2, 1005.0), (b3, 1010.0)] {
             runtime.update_entity(e, c2, Vec3::new(x, 0.0, 0.0));
-            runtime.set_entity_party(e, Some(party2));
+            runtime.set_entity_feature(e, "party", party2_value);
         }
         // Cross-boundary guild edge A—B: weight 1.0/cycle, the cheapest cut in the
         // graph — the partitioner keeps the cliques whole and cuts this edge, so
         // A and B remain split while staying interesting to each other.
-        runtime.set_entity_guild(a, Some(guild));
-        runtime.set_entity_guild(b, Some(guild));
+        runtime.set_entity_feature(a, "guild", guild_value);
+        runtime.set_entity_feature(b, "guild", guild_value);
         runtime.set_observation_radius(500.0);
 
         let mut proxy_seen = false;
@@ -495,12 +511,12 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party = Uuid::from_u128(0x3);
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
         runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0));
-        runtime.set_entity_party(e1, Some(party));
-        runtime.set_entity_party(e2, Some(party));
+        runtime.set_entity_feature(e1, "party", party_value);
+        runtime.set_entity_feature(e2, "party", party_value);
         runtime.set_observation_radius(500.0);
 
         // Run until colocated.
@@ -621,7 +637,7 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party = Uuid::from_u128(0x3);
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         let rx1 = runtime.bus.subscribe(c1);
         let rx2 = runtime.bus.subscribe(c2);
@@ -629,8 +645,8 @@ mod tests {
         // Set up a pair with strong interest (guild edge).
         runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
         runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0));
-        runtime.set_entity_party(e1, Some(party));
-        runtime.set_entity_party(e2, Some(party));
+        runtime.set_entity_feature(e1, "party", party_value);
+        runtime.set_entity_feature(e2, "party", party_value);
         runtime.set_observation_radius(500.0);
 
         // Run until co-located; the pair should co-locate quickly.

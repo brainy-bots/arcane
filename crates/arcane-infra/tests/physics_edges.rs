@@ -10,6 +10,7 @@
 
 #![cfg(feature = "migration")]
 
+use arcane_affinity::config::{AffinityConfig, EdgeRule};
 use arcane_affinity::interaction_graph::Colocation;
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
@@ -18,6 +19,32 @@ use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
     Uuid::from_bytes([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// Affinity manager configured with the TEST-declared social vocabulary:
+/// "party" (5.0) / "guild" (1.0) are feature names this test chose — the
+/// library knows nothing about them (#272 de-game).
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(AffinityConfig {
+        edge_rules: vec![
+            EdgeRule {
+                feature: "party".to_string(),
+                weight: 5.0,
+            },
+            EdgeRule {
+                feature: "guild".to_string(),
+                weight: 1.0,
+            },
+        ],
+        ..AffinityConfig::default()
+    });
+    mgr
+}
+
+/// Declare party membership through the dynamic feature map (uuid -> stable f64).
+fn set_party(mgr: &mut ArcaneManager, entity: Uuid, party: Uuid) {
+    mgr.set_entity_feature(entity, "party", party.as_u128() as f64);
 }
 
 /// Drive the Manager for `cycles`, applying every flip to a local ownership map, and return it.
@@ -47,7 +74,7 @@ fn run<F: FnMut(&mut ArcaneManager)>(
 /// each is otherwise pulled toward a different cluster by a strong party edge.
 #[test]
 fn joint_forces_colocation_against_opposing_pulls() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(500.0);
 
     // A and B are jointed. A is also partied with X (on cluster A), B with Y (on cluster B),
@@ -80,10 +107,10 @@ fn joint_forces_colocation_against_opposing_pulls() {
             m.update_entity(x, cluster_a, Vec3::new(2.0, 0.0, 0.0));
             m.update_entity(b, cluster_b, Vec3::new(1000.0, 0.0, 0.0));
             m.update_entity(y, cluster_b, Vec3::new(1002.0, 0.0, 0.0));
-            m.set_entity_party(a, Some(party_ax));
-            m.set_entity_party(x, Some(party_ax));
-            m.set_entity_party(b, Some(party_by));
-            m.set_entity_party(y, Some(party_by));
+            set_party(m, a, party_ax);
+            set_party(m, x, party_ax);
+            set_party(m, b, party_by);
+            set_party(m, y, party_by);
         },
     );
 
@@ -100,7 +127,7 @@ fn joint_forces_colocation_against_opposing_pulls() {
 /// the joint alone must keep them together (a bare joint reaching the Manager).
 #[test]
 fn bare_joint_never_split() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let a = uuid(10);
@@ -127,7 +154,7 @@ fn bare_joint_never_split() {
 /// with no coupling, no co-location is forced (they stay on their own clusters).
 #[test]
 fn clearing_joint_releases_constraint() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let a = uuid(10);

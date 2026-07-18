@@ -94,40 +94,6 @@ impl InteractionPredictor for HeuristicPredictor {
     }
 }
 
-// Compatibility shims for migration period.
-// TODO(#272-A4): removed with the sweep rewrite
-
-/// Link kind designation (deprecated).
-#[derive(Clone, Copy, Debug)]
-pub enum LinkKind {
-    Party,
-    Guild,
-}
-
-/// Old pair features struct (deprecated).
-pub struct PairFeatures {
-    pub distance: f64,
-    pub closing_speed: f64,
-    pub horizon_secs: f64,
-    pub history_weight: f64,
-    pub latent_link: Option<LinkKind>,
-    pub game: FeatureMap,
-}
-
-/// Game feature provider interface (deprecated).
-pub trait GameFeatureProvider {
-    fn features_for_pair(&self, a: uuid::Uuid, b: uuid::Uuid) -> FeatureMap;
-}
-
-/// Null feature provider for testing (deprecated).
-pub struct NullFeatureProvider;
-
-impl GameFeatureProvider for NullFeatureProvider {
-    fn features_for_pair(&self, _a: uuid::Uuid, _b: uuid::Uuid) -> FeatureMap {
-        FeatureMap::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

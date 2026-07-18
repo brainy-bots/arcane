@@ -15,12 +15,14 @@
 
 #![cfg(feature = "migration")]
 
+use arcane_affinity::config::{AffinityConfig, EdgeRule};
 use arcane_core::replication_channel::EntityStateEntry;
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
 use arcane_infra::manager_runtime::ManagerRuntime;
 use arcane_infra::node_core::{apply_inbox_frame, resolve_authoritative};
-use arcane_infra::node_inbox::{InMemoryInboxBus, InboxBus, NodeInboxFrame};
+use arcane_infra::node_inbox::InboxBus as _;
+use arcane_infra::node_inbox::{InMemoryInboxBus, NodeInboxFrame};
 use arcane_infra::ownership_migration::{OwnershipFlip, OwnershipMap};
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
@@ -28,6 +30,35 @@ use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
     Uuid::from_bytes([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// Affinity manager configured with the TEST-declared "party"/"guild" vocabulary
+/// (ordinary feature names + edge rules; the library knows neither word — #272).
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(AffinityConfig {
+        edge_rules: vec![
+            EdgeRule {
+                feature: "party".to_string(),
+                weight: 5.0,
+            },
+            EdgeRule {
+                feature: "guild".to_string(),
+                weight: 1.0,
+            },
+        ],
+        ..AffinityConfig::default()
+    });
+    mgr
+}
+
+/// Declare party membership through the runtime's dynamic feature passthrough.
+fn set_party_rt<B: arcane_infra::node_inbox::InboxBus>(
+    runtime: &mut ManagerRuntime<B>,
+    entity: Uuid,
+    party: Uuid,
+) {
+    runtime.set_entity_feature(entity, "party", party.as_u128() as f64);
 }
 
 /// Node-side state, exactly what NodeCore maintains for the inbox path.
@@ -87,16 +118,12 @@ fn full_loop_two_nodes_converge_with_exactly_once() {
     node2.ownership.set_owner(e1, c1);
     node2.ownership.set_owner(e2, c2);
 
-    let mut runtime = ManagerRuntime::new(
-        ArcaneManager::with_model("affinity"),
-        bus,
-        Default::default(),
-    );
+    let mut runtime = ManagerRuntime::new(affinity_manager(), bus, Default::default());
     runtime.set_observation_radius(500.0);
     runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
     runtime.update_entity(e2, c2, Vec3::new(5.0, 0.0, 0.0));
-    runtime.set_entity_party(e1, Some(party));
-    runtime.set_entity_party(e2, Some(party));
+    set_party_rt(&mut runtime, e1, party);
+    set_party_rt(&mut runtime, e2, party);
 
     for tick in 0..300u64 {
         runtime.run_cycle().expect("run_cycle failed");
@@ -185,23 +212,19 @@ fn full_loop_boundary_proxies_flow_to_nodes() {
         }
     }
 
-    let mut runtime = ManagerRuntime::new(
-        ArcaneManager::with_model("affinity"),
-        bus,
-        Default::default(),
-    );
+    let mut runtime = ManagerRuntime::new(affinity_manager(), bus, Default::default());
     runtime.set_observation_radius(500.0);
     for (e, x) in [(a, 0.0), (a2, 5.0), (a3, 10.0)] {
         runtime.update_entity(e, c1, Vec3::new(x, 0.0, 0.0));
-        runtime.set_entity_party(e, Some(uuid(40)));
+        set_party_rt(&mut runtime, e, uuid(40));
     }
     for (e, x) in [(b, 1000.0), (b2, 1005.0), (b3, 1010.0)] {
         runtime.update_entity(e, c2, Vec3::new(x, 0.0, 0.0));
-        runtime.set_entity_party(e, Some(uuid(41)));
+        set_party_rt(&mut runtime, e, uuid(41));
     }
     // Cross-boundary guild edge a—b: cheapest cut, stays cut, stays interesting.
-    runtime.set_entity_guild(a, Some(uuid(50)));
-    runtime.set_entity_guild(b, Some(uuid(50)));
+    runtime.set_entity_feature(a, "guild", 50.0);
+    runtime.set_entity_feature(b, "guild", 50.0);
 
     for tick in 0..100u64 {
         runtime.run_cycle().expect("run_cycle failed");
