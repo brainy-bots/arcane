@@ -51,10 +51,6 @@ pub struct PlayerInfo {
     pub position: Vec2,
     /// Current velocity vector (units/second).
     pub velocity: Vec2,
-    /// Guild this player belongs to, if any.
-    pub guild_id: Option<Uuid>,
-    /// Party this player belongs to, if any.
-    pub party_id: Option<Uuid>,
 }
 
 /// A single merge or split decision from the model.

@@ -16,7 +16,9 @@ use uuid::Uuid;
 use crate::ownership_migration::OwnershipFlip;
 
 #[cfg(feature = "migration")]
-use arcane_affinity::cold_pair::{ColdCandidate, SweepConfig};
+use arcane_affinity::cold_pair::sweep_cold_pairs;
+#[cfg(feature = "migration")]
+use arcane_affinity::config::AffinityConfig;
 #[cfg(feature = "migration")]
 use arcane_affinity::feature_map::FeatureMap;
 #[cfg(feature = "migration")]
@@ -26,11 +28,15 @@ use arcane_affinity::partition::{
     GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
 };
 #[cfg(feature = "migration")]
-use arcane_affinity::predictor::{
-    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairContext,
-};
+use arcane_affinity::predictor::{HeuristicPredictor, InteractionPredictor, PairContext};
 #[cfg(feature = "migration")]
 use arcane_affinity::refinement::{refine, RefineConfig};
+
+// Stubs for non-migration mode
+#[cfg(not(feature = "migration"))]
+type AffinityConfig = ();
+#[cfg(not(feature = "migration"))]
+type FeatureMap = ();
 
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ArcaneManager {
@@ -39,10 +45,10 @@ pub struct ArcaneManager {
     spatial_index: SpatialIndex,
     /// Allocated nodes. active_count = allocated_servers.len().
     allocated_servers: Vec<ServerHandle>,
-    /// entity_id -> party_id mapping for social membership.
-    entity_party: HashMap<Uuid, Uuid>,
-    /// entity_id -> guild_id mapping for social membership.
-    entity_guild: HashMap<Uuid, Uuid>,
+    /// Entity dynamic features for edge rule matching.
+    features: HashMap<Uuid, FeatureMap>,
+    /// Affinity configuration: tuning constants and edge rules.
+    config: AffinityConfig,
     /// Physics-coupling edges between entity pairs (Joint / Collision / PhysicsImpulse), keyed
     /// by the canonical ordered pair. These carry a `Colocation` class into the partitioner:
     /// `Hard` (Joint) is uncuttable, `CutFree` (SharedDeterministic) is free to cut. This is the
@@ -52,7 +58,7 @@ pub struct ArcaneManager {
     #[cfg(feature = "migration")]
     physics_edges: HashMap<(Uuid, Uuid), Colocation>,
     /// Persistent, decaying interaction graph recording interactions across cycles.
-    /// Accumulates weight from party/guild/proximity/physics signals and decays over time,
+    /// Accumulates weight from proximity/physics/feature-rule signals and decays over time,
     /// so transient signals don't flap the partition but sustained interaction builds strong edges.
     #[cfg(feature = "migration")]
     interaction_graph: InteractionGraph,
@@ -89,7 +95,7 @@ struct MigrationState {
 ///
 /// This function:
 /// 1. Builds a weighted edge list from the persistent interaction graph
-/// 2. Blends prediction into soft edge weights (cut_cost * (1 + PREDICTION_GAIN * p))
+/// 2. Blends prediction into soft edge weights (cut_cost * (1 + config.prediction_gain * p))
 /// 3. Runs the global GreedyGrowthPartitioner
 /// 4. Runs refinement
 /// 5. Maps partition indices to actual cluster ids deterministically
@@ -100,9 +106,8 @@ fn build_partition_decisions(
     current_assignments: &HashMap<Uuid, Uuid>,
     physics_edges: &HashMap<(Uuid, Uuid), Colocation>,
     interaction_graph: &InteractionGraph,
+    config: &AffinityConfig,
 ) -> HashMap<Uuid, Uuid> {
-    // Weighting constants
-    const PREDICTION_GAIN: f64 = 1.0;
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
 
@@ -172,28 +177,16 @@ fn build_partition_decisions(
                     (dx * dx + dy * dy).sqrt()
                 };
 
-                // TODO(#272-A4): removed with the sweep rewrite
-                // LinkKind (Party/Guild) is no longer used in the predictor API.
-                let _latent_link = if player_a.party_id.is_some()
-                    && player_a.party_id == player_b.party_id
-                {
-                    Some(arcane_affinity::predictor::LinkKind::Party)
-                } else if player_a.guild_id.is_some() && player_a.guild_id == player_b.guild_id {
-                    Some(arcane_affinity::predictor::LinkKind::Guild)
-                } else {
-                    None
-                };
-
-                let features_a = FeatureMap::new();
-                let features_b = FeatureMap::new();
-
+                // Prediction is already incorporated into graph weights via the screen+predict pipeline.
+                // Use empty feature maps here since features don't apply to graph edge blending.
+                let empty_features = FeatureMap::new();
                 let ctx = PairContext {
                     distance,
                     closing_speed,
                     horizon_secs: 5.0,
                     history_weight: base_weight,
-                    features_a: &features_a,
-                    features_b: &features_b,
+                    features_a: &empty_features,
+                    features_b: &empty_features,
                 };
                 predictor.predict(&ctx)
             } else {
@@ -201,7 +194,7 @@ fn build_partition_decisions(
             };
 
             // Prediction-amplified weight: history-anchored, prediction-amplified
-            base_weight * (1.0 + PREDICTION_GAIN * predicted_p)
+            base_weight * (1.0 + config.prediction_gain * predicted_p)
         } else {
             weight
         };
@@ -246,8 +239,9 @@ fn build_partition_decisions(
         std::cmp::max(1, clusters.len())
     };
 
-    // Capacity = ceil(n/k) * 1.5 (v1 balance stopgap; a real per-node resource ceiling replaces it later)
-    let capacity = std::cmp::max(1, entities.len().div_ceil(num_partitions) * 3 / 2);
+    // Capacity = ceil(n/k) * capacity_factor
+    let base_capacity = entities.len().div_ceil(num_partitions);
+    let capacity = std::cmp::max(1, (base_capacity as f64 * config.capacity_factor) as usize);
 
     // Build partition input
     let input = PartitionInput {
@@ -339,8 +333,8 @@ impl ArcaneManager {
             pool,
             spatial_index,
             allocated_servers: Vec::new(),
-            entity_party: HashMap::new(),
-            entity_guild: HashMap::new(),
+            features: HashMap::new(),
+            config: AffinityConfig::default(),
             #[cfg(feature = "migration")]
             physics_edges: HashMap::new(),
             #[cfg(feature = "migration")]
@@ -394,27 +388,57 @@ impl ArcaneManager {
             .update_entity_velocity(entity_id, velocity);
     }
 
-    /// Set the party ID for an entity (insert or remove if None).
-    pub fn set_entity_party(&mut self, entity_id: Uuid, party_id: Option<Uuid>) {
-        match party_id {
-            Some(id) => {
-                self.entity_party.insert(entity_id, id);
-            }
-            None => {
-                self.entity_party.remove(&entity_id);
-            }
+    /// Set a named feature value for an entity.
+    pub fn set_entity_feature(&mut self, entity_id: Uuid, name: &str, value: f64) {
+        #[cfg(feature = "migration")]
+        {
+            self.features
+                .entry(entity_id)
+                .or_insert_with(FeatureMap::new)
+                .insert(name.to_string(), value);
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            let _ = (entity_id, name, value);
         }
     }
 
-    /// Set the guild ID for an entity (insert or remove if None).
-    pub fn set_entity_guild(&mut self, entity_id: Uuid, guild_id: Option<Uuid>) {
-        match guild_id {
-            Some(id) => {
-                self.entity_guild.insert(entity_id, id);
+    /// Clear a named feature for an entity.
+    pub fn clear_entity_feature(&mut self, entity_id: Uuid, name: &str) {
+        #[cfg(feature = "migration")]
+        {
+            if let Some(fm) = self.features.get_mut(&entity_id) {
+                fm.remove(name);
             }
-            None => {
-                self.entity_guild.remove(&entity_id);
-            }
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            let _ = (entity_id, name);
+        }
+    }
+
+    /// Retrieve the FeatureMap for an entity, if any.
+    pub fn entity_features(&self, entity_id: Uuid) -> Option<&FeatureMap> {
+        #[cfg(feature = "migration")]
+        {
+            self.features.get(&entity_id)
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            let _ = entity_id;
+            None
+        }
+    }
+
+    /// Set the affinity configuration for tuning constants and edge rules.
+    pub fn set_affinity_config(&mut self, config: AffinityConfig) {
+        #[cfg(feature = "migration")]
+        {
+            self.config = config;
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            let _ = config;
         }
     }
 
@@ -493,8 +517,6 @@ impl ArcaneManager {
                     cluster_id,
                     position: Vec2::new(pos.x, pos.z),
                     velocity: Vec2::new(v.x, v.z),
-                    guild_id: self.entity_guild.get(&entity_id).copied(),
-                    party_id: self.entity_party.get(&entity_id).copied(),
                 }
             })
             .collect();
@@ -566,8 +588,6 @@ impl ArcaneManager {
                     cluster_id,
                     position: Vec2::new(pos.x, pos.z),
                     velocity: Vec2::new(v.x, v.z),
-                    guild_id: self.entity_guild.get(&entity_id).copied(),
-                    party_id: self.entity_party.get(&entity_id).copied(),
                 }
             })
             .collect();
@@ -584,12 +604,12 @@ impl ArcaneManager {
 
         self.migration_state.advance_tick();
 
-        // Decay + GC the interaction graph. Constants from AffinityConfig defaults.
-        const DECAY_FACTOR: f64 = 0.97;
-        const GC_THRESHOLD: f64 = 0.001;
-        const GC_INTERVAL: u32 = 100;
-        self.interaction_graph
-            .tick(DECAY_FACTOR, GC_THRESHOLD, GC_INTERVAL);
+        // Decay + GC the interaction graph using config values.
+        self.interaction_graph.tick(
+            self.config.decay_factor,
+            self.config.gc_threshold,
+            self.config.gc_interval,
+        );
 
         // Record this cycle's signals into the graph.
         let players = &view.players;
@@ -598,40 +618,46 @@ impl ArcaneManager {
                 let a = &players[i];
                 let b = &players[j];
 
-                // Party pairs
-                if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
-                    if pa == pb {
-                        self.interaction_graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            5.0,
-                            InteractionKind::PartyMember,
-                        );
-                    }
-                }
-
-                // Guild pairs
-                if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
-                    if ga == gb {
-                        self.interaction_graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            1.0,
-                            InteractionKind::GuildMember,
-                        );
-                    }
-                }
-
-                // Proximity pairs
+                // Proximity pairs (using config radius and weight)
                 let dx = a.position.x - b.position.x;
                 let dy = a.position.y - b.position.y;
-                if dx * dx + dy * dy <= 50.0 * 50.0 {
+                let radius_sq = self.config.proximity_radius * self.config.proximity_radius;
+                if dx * dx + dy * dy <= radius_sq {
                     self.interaction_graph.record_interaction(
                         a.player_id,
                         b.player_id,
-                        0.1,
+                        self.config.proximity_weight,
                         InteractionKind::Proximity,
                     );
+                }
+            }
+        }
+
+        // Edge accumulation from edge rules: group entities by feature values.
+        for edge_rule in &self.config.edge_rules {
+            let mut feature_groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+            for player in players {
+                if let Some(fm) = self.features.get(&player.player_id) {
+                    if let Some(value) = fm.get(&edge_rule.feature) {
+                        feature_groups
+                            .entry(value.to_string())
+                            .or_default()
+                            .push(player.player_id);
+                    }
+                }
+            }
+
+            // Record pairwise edges within each group.
+            for group in feature_groups.values() {
+                for i in 0..group.len() {
+                    for j in (i + 1)..group.len() {
+                        self.interaction_graph.record_interaction(
+                            group[i],
+                            group[j],
+                            edge_rule.weight,
+                            InteractionKind::GameAction,
+                        );
+                    }
                 }
             }
         }
@@ -646,100 +672,58 @@ impl ArcaneManager {
             self.interaction_graph.record_interaction(a, b, 1.0, kind);
         }
 
-        // Cold-pair sweep -> graph promotions (after recording current signals).
-        // Build linkable candidate set from the view (party/guild groups).
-        const PROMOTION_WEIGHT_SCALE: f64 = 5.0;
-        const COLD_PAIR_HOT_FLOOR: f64 = 1.0;
+        // Unified screen+predict pipeline for cold-pair promotion.
+        // Screen pass: find candidate pairs from spatial + graph + feature proximity.
+        let players_array: Vec<(Uuid, Vec2, Vec2)> = view
+            .players
+            .iter()
+            .map(|p| (p.player_id, p.position, p.velocity))
+            .collect();
+        let features_array: Vec<(Uuid, FeatureMap)> = view
+            .players
+            .iter()
+            .map(|p| {
+                let fm = self
+                    .features
+                    .get(&p.player_id)
+                    .cloned()
+                    .unwrap_or_else(FeatureMap::new);
+                (p.player_id, fm)
+            })
+            .collect();
+        let edge_rules_array: Vec<(String, f64)> = self
+            .config
+            .edge_rules
+            .iter()
+            .map(|r| (r.feature.clone(), r.weight))
+            .collect();
 
-        // Group players by party_id and guild_id
-        let mut party_groups: HashMap<Uuid, Vec<&PlayerInfo>> = HashMap::new();
-        let mut guild_groups: HashMap<Uuid, Vec<&PlayerInfo>> = HashMap::new();
+        let screen_radius = self.config.proximity_radius * self.config.screen_radius_factor;
+        let candidates = arcane_affinity::cold_pair::screen_candidates(
+            &players_array,
+            &features_array,
+            &self.interaction_graph,
+            screen_radius,
+            self.config.screen_min_closing_speed,
+            &edge_rules_array,
+        );
 
-        for player in &view.players {
-            if let Some(party_id) = player.party_id {
-                party_groups.entry(party_id).or_default().push(player);
-            }
-            if let Some(guild_id) = player.guild_id {
-                guild_groups.entry(guild_id).or_default().push(player);
-            }
-        }
-
-        // Collect candidates from party groups
-        let mut candidates: Vec<ColdCandidate> = Vec::new();
-        for party_members in party_groups.values() {
-            for i in 0..party_members.len() {
-                for j in (i + 1)..party_members.len() {
-                    let a = party_members[i];
-                    let b = party_members[j];
-
-                    // Skip if pair is already strongly connected (hot)
-                    let weight = self.interaction_graph.get_weight(a.player_id, b.player_id);
-                    if weight >= COLD_PAIR_HOT_FLOOR {
-                        continue;
-                    }
-
-                    let history_weight = weight;
-
-                    candidates.push(ColdCandidate {
-                        a: a.player_id,
-                        b: b.player_id,
-                        pos_a: a.position,
-                        pos_b: b.position,
-                        vel_a: a.velocity,
-                        vel_b: b.velocity,
-                        // TODO(#272-A4): removed with the sweep rewrite
-                        link: arcane_affinity::predictor::LinkKind::Party,
-                        history_weight,
-                    });
-                }
-            }
-        }
-
-        // Collect candidates from guild groups
-        for guild_members in guild_groups.values() {
-            for i in 0..guild_members.len() {
-                for j in (i + 1)..guild_members.len() {
-                    let a = guild_members[i];
-                    let b = guild_members[j];
-
-                    // Skip if pair is already strongly connected (hot)
-                    let weight = self.interaction_graph.get_weight(a.player_id, b.player_id);
-                    if weight >= COLD_PAIR_HOT_FLOOR {
-                        continue;
-                    }
-
-                    let history_weight = weight;
-
-                    candidates.push(ColdCandidate {
-                        a: a.player_id,
-                        b: b.player_id,
-                        pos_a: a.position,
-                        pos_b: b.position,
-                        vel_a: a.velocity,
-                        vel_b: b.velocity,
-                        // TODO(#272-A4): removed with the sweep rewrite
-                        link: arcane_affinity::predictor::LinkKind::Guild,
-                        history_weight,
-                    });
-                }
-            }
-        }
-
-        // Run sweep_cold_pairs and record promotions
+        // Predict pass: run predictor on candidates.
         if !candidates.is_empty() {
-            let promotions = arcane_affinity::cold_pair::sweep_cold_pairs(
+            let feature_lookup: HashMap<Uuid, FeatureMap> = features_array.into_iter().collect();
+            let promotions = sweep_cold_pairs(
                 &candidates,
                 &HeuristicPredictor::default(),
-                &NullFeatureProvider,
-                &SweepConfig::default(),
+                &feature_lookup,
+                self.config.horizon_secs,
             );
 
             for promotion in promotions {
-                // Promoted pairs write with scaled weight; non-promoted pairs write nothing (zero-cost-on-zero)
+                // Promoted pairs write with scaled weight
                 self.interaction_graph.record_interaction(
                     promotion.a,
                     promotion.b,
-                    PROMOTION_WEIGHT_SCALE * promotion.p,
+                    self.config.promotion_weight_scale * promotion.p,
                     InteractionKind::GameAction,
                 );
             }
@@ -767,6 +751,7 @@ impl ArcaneManager {
             &current_assignments,
             &self.physics_edges,
             &self.interaction_graph,
+            &self.config,
         );
 
         for (entity_id, desired_cluster) in resolved {
@@ -1068,46 +1053,46 @@ mod view_enrichment_tests {
     }
 
     #[test]
-    fn test_social_membership_storage() {
+    fn test_entity_feature_storage() {
         let mut manager = ArcaneManager::with_defaults();
         let entity_id = Uuid::from_u128(1);
-        let party_id = Uuid::from_u128(200);
-        let guild_id = Uuid::from_u128(300);
 
-        // Set party and guild
-        manager.set_entity_party(entity_id, Some(party_id));
-        manager.set_entity_guild(entity_id, Some(guild_id));
+        // Set features
+        manager.set_entity_feature(entity_id, "party", 200.0);
+        manager.set_entity_feature(entity_id, "guild", 300.0);
 
         // Verify storage
-        assert_eq!(
-            manager.entity_party.get(&entity_id).copied(),
-            Some(party_id)
-        );
-        assert_eq!(
-            manager.entity_guild.get(&entity_id).copied(),
-            Some(guild_id)
-        );
+        let features = manager.entity_features(entity_id);
+        assert!(features.is_some());
+        assert_eq!(features.unwrap().get("party"), Some(200.0));
+        assert_eq!(features.unwrap().get("guild"), Some(300.0));
     }
 
     #[test]
-    fn test_social_membership_removal() {
+    fn test_entity_feature_removal() {
         let mut manager = ArcaneManager::with_defaults();
         let entity_id = Uuid::from_u128(1);
-        let party_id = Uuid::from_u128(200);
 
-        // Set and then remove party
-        manager.set_entity_party(entity_id, Some(party_id));
+        // Set and then remove feature
+        manager.set_entity_feature(entity_id, "party", 200.0);
         assert_eq!(
-            manager.entity_party.get(&entity_id).copied(),
-            Some(party_id)
+            manager
+                .entity_features(entity_id)
+                .and_then(|f| f.get("party")),
+            Some(200.0)
         );
 
-        manager.set_entity_party(entity_id, None);
-        assert_eq!(manager.entity_party.get(&entity_id).copied(), None);
+        manager.clear_entity_feature(entity_id, "party");
+        assert_eq!(
+            manager
+                .entity_features(entity_id)
+                .and_then(|f| f.get("party")),
+            None
+        );
     }
 
     #[test]
-    fn test_worldstateview_reflects_real_signals() {
+    fn test_worldstateview_reflects_entity_features() {
         let mut manager = ArcaneManager::with_defaults();
         manager.set_observation_radius(100.0);
 
@@ -1115,7 +1100,6 @@ mod view_enrichment_tests {
         let entity2_id = Uuid::from_u128(2);
         let cluster1_id = Uuid::from_u128(100);
         let cluster2_id = Uuid::from_u128(101);
-        let party_id = Uuid::from_u128(500);
 
         let pos1 = arcane_core::Vec3 {
             x: 0.0,
@@ -1138,19 +1122,19 @@ mod view_enrichment_tests {
             z: -2.0,
         };
 
-        // Set up two entities with party membership and velocities
+        // Set up two entities with features and velocities
         manager.update_entity(entity1_id, cluster1_id, pos1);
         manager.update_entity(entity2_id, cluster2_id, pos2);
         manager.set_entity_velocity(entity1_id, vel1);
         manager.set_entity_velocity(entity2_id, vel2);
-        manager.set_entity_party(entity1_id, Some(party_id));
-        manager.set_entity_party(entity2_id, Some(party_id));
+        manager.set_entity_feature(entity1_id, "party", 500.0);
+        manager.set_entity_feature(entity2_id, "party", 500.0);
 
         // Run evaluation cycle
         let result = manager.run_evaluation_cycle();
         assert!(result.is_ok());
 
-        // Verify snapshot contains the real signals
+        // Verify snapshot contains the entities
         let snapshot_entities = manager.spatial_index.snapshot_entities();
         assert_eq!(snapshot_entities.len(), 2);
 
@@ -1165,14 +1149,18 @@ mod view_enrichment_tests {
             }
         }
 
-        // Verify party membership is accessible
+        // Verify features are accessible
         assert_eq!(
-            manager.entity_party.get(&entity1_id).copied(),
-            Some(party_id)
+            manager
+                .entity_features(entity1_id)
+                .and_then(|f| f.get("party")),
+            Some(500.0)
         );
         assert_eq!(
-            manager.entity_party.get(&entity2_id).copied(),
-            Some(party_id)
+            manager
+                .entity_features(entity2_id)
+                .and_then(|f| f.get("party")),
+            Some(500.0)
         );
     }
 
