@@ -1,4 +1,0 @@
-FINDSTR: Cannot open world.state
-FINDSTR: Cannot open subscribes
-FINDSTR: Cannot open replication.channel
-FINDSTR: Cannot open spine"

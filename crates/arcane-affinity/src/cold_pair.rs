@@ -232,13 +232,14 @@ pub fn screen_candidates(
 /// Sweeps screened candidate pairs and returns promotions.
 ///
 /// For each candidate, computes the predicted interaction probability using the predictor.
-/// Only pairs whose predicted p > 0 are promoted (returned).
+/// Only pairs whose predicted p clears `config.promote_threshold` are promoted —
+/// zero-cost-on-zero (design §4): a sub-threshold sweep result writes NOTHING.
 /// Features come from the lookup map; empty FeatureMap if entity has no features.
 pub fn sweep_cold_pairs<P>(
     candidates: &[ScreenCandidate],
     predictor: &P,
     feature_lookup: &std::collections::HashMap<uuid::Uuid, FeatureMap>,
-    horizon_secs: f64,
+    config: &SweepConfig,
 ) -> Vec<Promotion>
 where
     P: InteractionPredictor,
@@ -268,7 +269,7 @@ where
         let ctx = PairContext {
             distance,
             closing_speed: cs,
-            horizon_secs,
+            horizon_secs: config.horizon_secs,
             history_weight: candidate.history_weight,
             features_a,
             features_b,
@@ -277,8 +278,8 @@ where
         // 5. Predict
         let p = predictor.predict(&ctx);
 
-        // 6. Promote if p > 0 (zero-cost-on-zero)
-        if p > 0.0 {
+        // 6. Promote only above threshold (zero-cost-on-zero).
+        if p >= config.promote_threshold {
             promotions.push(Promotion {
                 a: candidate.a,
                 b: candidate.b,
@@ -306,7 +307,12 @@ mod tests {
         let feature_lookup = std::collections::HashMap::new();
         let horizon_secs = 5.0;
 
-        let result = sweep_cold_pairs(&[], &predictor, &feature_lookup, horizon_secs);
+        let result = sweep_cold_pairs(
+            &[],
+            &predictor,
+            &feature_lookup,
+            &SweepConfig::new(horizon_secs, 0.1),
+        );
 
         assert!(result.is_empty());
     }
@@ -358,13 +364,19 @@ mod tests {
             a: uuid(1),
             b: uuid(2),
             pos_a: Vec2::new(0.0, 0.0),
-            pos_b: Vec2::new(100.0, 0.0),
+            // Genuinely far (2000x distance_scale): the C4 baseline falloff gives p ≈ 0.0005.
+            pos_b: Vec2::new(100_000.0, 0.0),
             vel_a: Vec2::new(0.0, 0.0),
             vel_b: Vec2::new(0.0, 0.0),
             history_weight: 0.0,
         };
 
-        let result = sweep_cold_pairs(&[candidate], &predictor, &feature_lookup, horizon_secs);
+        let result = sweep_cold_pairs(
+            &[candidate],
+            &predictor,
+            &feature_lookup,
+            &SweepConfig::new(horizon_secs, 0.1),
+        );
 
         // With no history and far apart (100 units), predicted p should be very low
         // so it won't produce a promotion

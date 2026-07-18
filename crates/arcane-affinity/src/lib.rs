@@ -406,8 +406,6 @@ mod tests {
             cluster_id,
             position: Vec2::new(x, y),
             velocity: Vec2::new(0.0, 0.0),
-            guild_id: None,
-            party_id: None,
         }
     }
 

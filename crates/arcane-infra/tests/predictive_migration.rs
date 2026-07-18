@@ -19,6 +19,7 @@
 
 #![cfg(feature = "migration")]
 
+use arcane_affinity::config::{AffinityConfig, EdgeRule};
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
 use arcane_infra::ownership_migration::OwnershipMap;
@@ -26,6 +27,32 @@ use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
     Uuid::from_bytes([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// Affinity manager configured with the TEST-declared social vocabulary:
+/// "party" (5.0) / "guild" (1.0) are feature names this test chose — the
+/// library knows nothing about them (#272 de-game).
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(AffinityConfig {
+        edge_rules: vec![
+            EdgeRule {
+                feature: "party".to_string(),
+                weight: 5.0,
+            },
+            EdgeRule {
+                feature: "guild".to_string(),
+                weight: 1.0,
+            },
+        ],
+        ..AffinityConfig::default()
+    });
+    mgr
+}
+
+/// Declare party membership through the dynamic feature map (uuid -> stable f64).
+fn set_party(mgr: &mut ArcaneManager, entity: Uuid, party: Uuid) {
+    mgr.set_entity_feature(entity, "party", party.as_u128() as f64);
 }
 
 /// Drive a two-entity scenario for `cycles` evaluation cycles.
@@ -50,8 +77,10 @@ fn run_closing_pair(
     ownership.set_owner(a, cluster_a);
     ownership.set_owner(b, cluster_b);
 
-    mgr.set_entity_party(a, party);
-    mgr.set_entity_party(b, party);
+    if let Some(p) = party {
+        set_party(mgr, a, p);
+        set_party(mgr, b, p);
+    }
 
     let mut xa = 0.0_f64;
     let mut xb = start_separation;
@@ -96,7 +125,7 @@ fn run_closing_pair(
 /// not accumulated contact.
 #[test]
 fn predicted_pair_co_locates_before_contact() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(1000.0);
 
     let (colocated, min_fed) = run_closing_pair(
@@ -126,12 +155,12 @@ fn predicted_pair_co_locates_before_contact() {
     );
 }
 
-/// Control: identical geometry/velocities but NO party link and distance kept > 100.
-/// No signal of any kind exists for this pair, so it must NOT co-locate. Guards against
-/// the partitioner collapsing the pair for an unrelated reason.
+/// Spine-only screening (#272 unified pipeline): a CONVERGING pair with NO declared
+/// features and no proximity contact co-locates purely from kinematics — the screen
+/// pass surfaces the closing pair, the predictor scores it, promotion drives the cut.
 #[test]
-fn no_prediction_no_colocation() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+fn converging_pair_co_locates_spine_only() {
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(1000.0);
 
     let (colocated, min_fed) = run_closing_pair(
@@ -140,7 +169,7 @@ fn no_prediction_no_colocation() {
         uuid(11),
         uuid(1),
         uuid(2),
-        None,
+        None, // NO features — spine only
         20.0,
         400.0,
         120.0,
@@ -149,10 +178,52 @@ fn no_prediction_no_colocation() {
 
     assert!(min_fed > 100.0, "test invariant broken (min {min_fed})");
     assert!(
-        colocated.is_none(),
-        "control pair with no link must not co-locate, but did at cycle {colocated:?}"
+        colocated.is_some(),
+        "converging pair must co-locate from spine-only screening+prediction"
     );
-    eprintln!("✓ control pair (no link) never co-located");
+    eprintln!("✓ converging pair (no features) co-located at cycle {colocated:?}");
+}
+
+/// Control (per #272-A4): a PARALLEL-moving pair at constant distance — inside the
+/// screen radius but with zero closing speed and no features — must NOT co-locate.
+/// This is what makes the converging test meaningful: the discriminator is the
+/// closing-velocity signal, not mere spatial coexistence.
+#[test]
+fn parallel_control_does_not_colocate() {
+    let mut mgr = affinity_manager();
+    mgr.set_observation_radius(1000.0);
+
+    let a = uuid(10);
+    let b = uuid(11);
+    let (c1, c2) = (uuid(1), uuid(2));
+    let ownership = arcane_infra::ownership_migration::OwnershipMap::new();
+    ownership.set_owner(a, c1);
+    ownership.set_owner(b, c2);
+
+    // Constant 150 apart (inside screen radius 200, outside proximity 50), both
+    // moving +x at the same speed: closing speed exactly 0.
+    let mut x = 0.0_f64;
+    let mut colocated = false;
+    for _ in 0..150 {
+        x += 5.0;
+        mgr.update_entity(a, c1, arcane_core::Vec3::new(x, 0.0, 0.0));
+        mgr.update_entity(b, c2, arcane_core::Vec3::new(x + 150.0, 0.0, 0.0));
+        mgr.set_entity_velocity(a, arcane_core::Vec3::new(5.0, 0.0, 0.0));
+        mgr.set_entity_velocity(b, arcane_core::Vec3::new(5.0, 0.0, 0.0));
+        mgr.run_evaluation_cycle().expect("cycle failed");
+        for flip in mgr.take_pending_flips() {
+            ownership.set_owner(flip.entity_id, flip.to_cluster);
+        }
+        if ownership.owner_of(a) == ownership.owner_of(b) {
+            colocated = true;
+        }
+    }
+
+    assert!(
+        !colocated,
+        "parallel pair (zero closing speed, no features) must not co-locate"
+    );
+    eprintln!("✓ parallel control pair never co-located");
 }
 
 /// Isolate the predictor's closing-velocity term: two same-party cross-cluster pairs,
@@ -161,7 +232,7 @@ fn no_prediction_no_colocation() {
 /// co-locate in fewer cycles than the static pair.
 #[test]
 fn closing_velocity_beats_static() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(10000.0);
 
     // Closing pair: same party P1, clusters C1/C2.
@@ -170,10 +241,10 @@ fn closing_velocity_beats_static() {
     let (sa, sb) = (uuid(20), uuid(21));
     let (c1, c2, c3, c4) = (uuid(1), uuid(2), uuid(3), uuid(4));
 
-    mgr.set_entity_party(ca, Some(uuid(101)));
-    mgr.set_entity_party(cb, Some(uuid(101)));
-    mgr.set_entity_party(sa, Some(uuid(102)));
-    mgr.set_entity_party(sb, Some(uuid(102)));
+    set_party(&mut mgr, ca, uuid(101));
+    set_party(&mut mgr, cb, uuid(101));
+    set_party(&mut mgr, sa, uuid(102));
+    set_party(&mut mgr, sb, uuid(102));
 
     let ownership = OwnershipMap::new();
     ownership.set_owner(ca, c1);

@@ -10,12 +10,39 @@
 
 #![cfg(feature = "migration")]
 
+use arcane_affinity::config::{AffinityConfig, EdgeRule};
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
 use uuid::Uuid;
 
 fn uuid(i: u8) -> Uuid {
     Uuid::from_bytes([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+}
+
+/// Affinity manager configured with the TEST-declared social vocabulary:
+/// "party" (5.0) / "guild" (1.0) are feature names this test chose — the
+/// library knows nothing about them (#272 de-game).
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(AffinityConfig {
+        edge_rules: vec![
+            EdgeRule {
+                feature: "party".to_string(),
+                weight: 5.0,
+            },
+            EdgeRule {
+                feature: "guild".to_string(),
+                weight: 1.0,
+            },
+        ],
+        ..AffinityConfig::default()
+    });
+    mgr
+}
+
+/// Declare party membership through the dynamic feature map (uuid -> stable f64).
+fn set_party(mgr: &mut ArcaneManager, entity: Uuid, party: Uuid) {
+    mgr.set_entity_feature(entity, "party", party.as_u128() as f64);
 }
 
 /// ANTI-THRASH: an adversarial scenario that tries to make a "swing" entity flip every single
@@ -26,7 +53,7 @@ fn uuid(i: u8) -> Uuid {
 /// than the number of ticks — the cooldown must damp the oscillation.
 #[test]
 fn cooldown_bounds_migration_churn_under_oscillation() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let swing = uuid(99);
@@ -45,16 +72,16 @@ fn cooldown_bounds_migration_churn_under_oscillation() {
         // Static anchors near their clusters.
         for &e in &a_group {
             mgr.update_entity(e, ca, Vec3::new(0.0, 0.0, 0.0));
-            mgr.set_entity_party(e, Some(party_a));
+            set_party(&mut mgr, e, party_a);
         }
         for &e in &b_group {
             mgr.update_entity(e, cb, Vec3::new(1000.0, 0.0, 0.0));
-            mgr.set_entity_party(e, Some(party_b));
+            set_party(&mut mgr, e, party_b);
         }
         // Swing entity: alternate its party allegiance every tick, and place it spatially with
         // whichever group it currently belongs to (adversarial: maximize migration pressure).
         let with_a = t % 2 == 0;
-        mgr.set_entity_party(swing, Some(if with_a { party_a } else { party_b }));
+        set_party(&mut mgr, swing, if with_a { party_a } else { party_b });
         let pos = if with_a { 0.0 } else { 1000.0 };
         mgr.update_entity(swing, swing_owner, Vec3::new(pos, 0.0, 0.0));
 
@@ -96,7 +123,7 @@ fn cooldown_bounds_migration_churn_under_oscillation() {
 /// groups on two clusters is a valid partition — no collapse, no churn.
 #[test]
 fn two_groups_are_stable() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let ca = uuid(200);
@@ -111,11 +138,11 @@ fn two_groups_are_stable() {
     for _ in 0..ticks {
         for &e in &a_group {
             mgr.update_entity(e, ca, Vec3::new(0.0, 0.0, 0.0));
-            mgr.set_entity_party(e, Some(party_a));
+            set_party(&mut mgr, e, party_a);
         }
         for &e in &b_group {
             mgr.update_entity(e, cb, Vec3::new(1000.0, 0.0, 0.0));
-            mgr.set_entity_party(e, Some(party_b));
+            set_party(&mut mgr, e, party_b);
         }
         mgr.run_evaluation_cycle().unwrap();
         total_flips += mgr.take_pending_flips().len();
@@ -134,7 +161,7 @@ fn two_groups_are_stable() {
 /// keep migrating it (no perpetual churn on a settled configuration).
 #[test]
 fn converged_group_settles() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let a = uuid(10);
@@ -151,8 +178,8 @@ fn converged_group_settles() {
     for t in 0..200 {
         mgr.update_entity(a, owner_a, Vec3::new(0.0, 0.0, 0.0));
         mgr.update_entity(b, owner_b, Vec3::new(5.0, 0.0, 0.0));
-        mgr.set_entity_party(a, Some(party));
-        mgr.set_entity_party(b, Some(party));
+        set_party(&mut mgr, a, party);
+        set_party(&mut mgr, b, party);
         mgr.run_evaluation_cycle().unwrap();
         for flip in mgr.take_pending_flips() {
             if flip.entity_id == a {
@@ -184,7 +211,7 @@ fn converged_group_settles() {
 /// proving the graph has memory (persistent weight accumulation across cycles).
 #[test]
 fn proximity_accumulation_forces_co_location_without_social_signals() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let entity_a = uuid(10);
@@ -235,7 +262,7 @@ fn weight_decays_when_signals_stop() {
     // decays, the partition should no longer see a strong edge, and we assert fewer
     // migrations occur (or co-location breaks after the decay period).
 
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(5000.0);
 
     let entity_a = uuid(10);
@@ -252,8 +279,8 @@ fn weight_decays_when_signals_stop() {
     for _ in 0..buildup_ticks {
         mgr.update_entity(entity_a, owner_a, Vec3::new(0.0, 0.0, 0.0));
         mgr.update_entity(entity_b, owner_b, Vec3::new(1000.0, 0.0, 0.0));
-        mgr.set_entity_party(entity_a, Some(party_id));
-        mgr.set_entity_party(entity_b, Some(party_id));
+        set_party(&mut mgr, entity_a, party_id);
+        set_party(&mut mgr, entity_b, party_id);
         mgr.run_evaluation_cycle().unwrap();
         for flip in mgr.take_pending_flips() {
             if flip.entity_id == entity_a {

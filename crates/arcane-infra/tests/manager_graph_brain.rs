@@ -8,6 +8,7 @@
 
 #![cfg(feature = "migration")]
 
+use arcane_affinity::config::{AffinityConfig, EdgeRule};
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
 use arcane_infra::node_core::resolve_authoritative;
@@ -18,11 +19,37 @@ fn uuid(i: u8) -> Uuid {
     Uuid::from_bytes([i, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 }
 
+/// Affinity manager configured with the TEST-declared social vocabulary:
+/// "party" (weight 5.0) and "guild" (1.0) are ordinary feature names the game
+/// (here: this test) chose — the library knows nothing about them (#272).
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(AffinityConfig {
+        edge_rules: vec![
+            EdgeRule {
+                feature: "party".to_string(),
+                weight: 5.0,
+            },
+            EdgeRule {
+                feature: "guild".to_string(),
+                weight: 1.0,
+            },
+        ],
+        ..AffinityConfig::default()
+    });
+    mgr
+}
+
+/// Declare same-party membership via the dynamic feature map (uuid → stable f64).
+fn set_party(mgr: &mut ArcaneManager, entity: Uuid, party: Uuid) {
+    mgr.set_entity_feature(entity, "party", party.as_u128() as f64);
+}
+
 /// Test 1: Two entities on different clusters, heavily interacting across the boundary,
 /// end up co-located on one cluster via affinity-driven migration.
 #[test]
 fn cross_boundary_pair_merges_onto_one_cluster() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(500.0);
 
     // Set up two entities on different clusters.
@@ -37,8 +64,8 @@ fn cross_boundary_pair_merges_onto_one_cluster() {
 
     // Put both in the same party so party weight (5.0) drives co-location.
     let party_id = uuid(30);
-    mgr.set_entity_party(entity_a, Some(party_id));
-    mgr.set_entity_party(entity_b, Some(party_id));
+    set_party(&mut mgr, entity_a, party_id);
+    set_party(&mut mgr, entity_b, party_id);
 
     // Track ownership via local map.
     let ownership_map = OwnershipMap::new();
@@ -89,7 +116,7 @@ fn cross_boundary_pair_merges_onto_one_cluster() {
 /// resolve_authoritative on cluster_b} is true at each tick (XOR).
 #[test]
 fn exactly_once_ownership_holds_through_merge() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(500.0);
 
     // Set up two entities on different clusters.
@@ -104,8 +131,8 @@ fn exactly_once_ownership_holds_through_merge() {
 
     // Put both in the same party so party weight (5.0) drives co-location.
     let party_id = uuid(30);
-    mgr.set_entity_party(entity_a, Some(party_id));
-    mgr.set_entity_party(entity_b, Some(party_id));
+    set_party(&mut mgr, entity_a, party_id);
+    set_party(&mut mgr, entity_b, party_id);
 
     // Track ownership via local map.
     let ownership_map = OwnershipMap::new();
@@ -165,7 +192,7 @@ fn exactly_once_ownership_holds_through_merge() {
 /// This guards against spurious migration.
 #[test]
 fn no_flip_for_distant_non_interacting_pair() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(50.0); // Observation radius is smaller than distance.
 
     // Set up two entities far apart (distance >> proximity_radius).
@@ -209,7 +236,7 @@ fn no_flip_for_distant_non_interacting_pair() {
 /// all three in one partition, so they converge. Exactly-once ownership must hold throughout.
 #[test]
 fn three_way_interacting_group_co_locates() {
-    let mut mgr = ArcaneManager::with_model("affinity");
+    let mut mgr = affinity_manager();
     mgr.set_observation_radius(500.0);
 
     let a = uuid(10);
@@ -236,9 +263,9 @@ fn three_way_interacting_group_co_locates() {
         mgr.update_entity(a, cluster_a, Vec3::new(0.0, 0.0, 0.0));
         mgr.update_entity(b, cluster_b, Vec3::new(4.0, 0.0, 0.0));
         mgr.update_entity(c, cluster_c, Vec3::new(8.0, 0.0, 0.0));
-        mgr.set_entity_party(a, Some(party_id));
-        mgr.set_entity_party(b, Some(party_id));
-        mgr.set_entity_party(c, Some(party_id));
+        set_party(&mut mgr, a, party_id);
+        set_party(&mut mgr, b, party_id);
+        set_party(&mut mgr, c, party_id);
 
         mgr.run_evaluation_cycle().expect("evaluation cycle failed");
         for flip in mgr.take_pending_flips() {

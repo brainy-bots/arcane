@@ -325,7 +325,23 @@ mod tests {
     fn make_manager() -> ArcaneManager {
         // The affinity model is required: it is the only model that produces
         // co-location flips, which these tests assert unconditionally.
-        ArcaneManager::with_model("affinity")
+        // Edge rules make the test-declared "party"/"guild" features attract —
+        // the game (here: the test) declares the vocabulary, not the library.
+        let mut mgr = ArcaneManager::with_model("affinity");
+        mgr.set_affinity_config(arcane_affinity::config::AffinityConfig {
+            edge_rules: vec![
+                arcane_affinity::config::EdgeRule {
+                    feature: "party".to_string(),
+                    weight: 5.0,
+                },
+                arcane_affinity::config::EdgeRule {
+                    feature: "guild".to_string(),
+                    weight: 1.0,
+                },
+            ],
+            ..arcane_affinity::config::AffinityConfig::default()
+        });
+        mgr
     }
 
     fn make_config() -> RouterConfig {
@@ -344,7 +360,7 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party_value = 3 as f64; // was Uuid::from_u128(0x3)
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         // Subscribe to both clusters' inboxes BEFORE cycling.
         let rx1 = runtime.bus.subscribe(c1);
@@ -435,9 +451,9 @@ mod tests {
         let a3 = Uuid::from_u128(0x102);
         let b2 = Uuid::from_u128(0x201);
         let b3 = Uuid::from_u128(0x202);
-        let party1_value = 3 as f64; // was Uuid::from_u128(0x3)
-        let party2_value = 4 as f64; // was Uuid::from_u128(0x4)
-        let guild_value = 5 as f64; // was Uuid::from_u128(0x5)
+        let party1_value = 3.0; // was Uuid::from_u128(0x3)
+        let party2_value = 4.0; // was Uuid::from_u128(0x4)
+        let guild_value = 5.0; // was Uuid::from_u128(0x5)
 
         let rx1 = runtime.bus.subscribe(c1);
 
@@ -495,7 +511,7 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party_value = 3 as f64; // was Uuid::from_u128(0x3)
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
         runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0));
@@ -621,7 +637,7 @@ mod tests {
         let c2 = Uuid::from_u128(0x2);
         let e1 = Uuid::from_u128(0x100);
         let e2 = Uuid::from_u128(0x200);
-        let party_value = 3 as f64; // was Uuid::from_u128(0x3)
+        let party_value = 3.0; // was Uuid::from_u128(0x3)
 
         let rx1 = runtime.bus.subscribe(c1);
         let rx2 = runtime.bus.subscribe(c2);

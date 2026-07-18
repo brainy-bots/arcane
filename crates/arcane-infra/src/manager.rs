@@ -394,7 +394,7 @@ impl ArcaneManager {
         {
             self.features
                 .entry(entity_id)
-                .or_insert_with(FeatureMap::new)
+                .or_default()
                 .insert(name.to_string(), value);
         }
         #[cfg(not(feature = "migration"))]
@@ -715,7 +715,10 @@ impl ArcaneManager {
                 &candidates,
                 &HeuristicPredictor::default(),
                 &feature_lookup,
-                self.config.horizon_secs,
+                &arcane_affinity::cold_pair::SweepConfig {
+                    horizon_secs: self.config.horizon_secs,
+                    promote_threshold: 0.1,
+                },
             );
 
             for promotion in promotions {
@@ -1064,8 +1067,8 @@ mod view_enrichment_tests {
         // Verify storage
         let features = manager.entity_features(entity_id);
         assert!(features.is_some());
-        assert_eq!(features.unwrap().get("party"), Some(200.0));
-        assert_eq!(features.unwrap().get("guild"), Some(300.0));
+        assert_eq!(features.unwrap().get("party"), Some(&200.0));
+        assert_eq!(features.unwrap().get("guild"), Some(&300.0));
     }
 
     #[test]
@@ -1079,7 +1082,7 @@ mod view_enrichment_tests {
             manager
                 .entity_features(entity_id)
                 .and_then(|f| f.get("party")),
-            Some(200.0)
+            Some(&200.0)
         );
 
         manager.clear_entity_feature(entity_id, "party");
@@ -1154,13 +1157,13 @@ mod view_enrichment_tests {
             manager
                 .entity_features(entity1_id)
                 .and_then(|f| f.get("party")),
-            Some(500.0)
+            Some(&500.0)
         );
         assert_eq!(
             manager
                 .entity_features(entity2_id)
                 .and_then(|f| f.get("party")),
-            Some(500.0)
+            Some(&500.0)
         );
     }
 
