@@ -290,7 +290,8 @@ fn build_partition_decisions(
         cs.dedup();
         cs
     };
-    let mut free_clusters: std::collections::BTreeSet<Uuid> = all_clusters.iter().copied().collect();
+    let mut free_clusters: std::collections::BTreeSet<Uuid> =
+        all_clusters.iter().copied().collect();
     let mut order: Vec<usize> = (0..num_partitions).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(refined_partition.members(i).len()));
 

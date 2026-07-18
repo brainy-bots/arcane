@@ -176,7 +176,9 @@ fn full_control_plane_over_real_redis() {
         let client = redis::Client::open(REDIS_URL).unwrap();
         let mut conn = client.get_connection().unwrap();
         for c in [CLUSTER_A, CLUSTER_B] {
-            let _: Result<i32, _> = redis::cmd("DEL").arg(format!("arcane:state:{c}")).query(&mut conn);
+            let _: Result<i32, _> = redis::cmd("DEL")
+                .arg(format!("arcane:state:{c}"))
+                .query(&mut conn);
         }
     }
 
