@@ -150,6 +150,12 @@ impl<B: InboxBus> ManagerRuntime<B> {
         self.blocked_destinations = blocked;
     }
 
+    /// Register the known cluster topology (passthrough; see
+    /// `ArcaneManager::set_known_clusters`). Warm spares count as partitions.
+    pub fn set_known_clusters(&mut self, clusters: Vec<Uuid>) {
+        self.manager.set_known_clusters(clusters);
+    }
+
     /// Run one control cycle: evaluate, route, publish.
     pub fn run_cycle(&mut self) -> Result<CycleReport, String> {
         self.tick += 1;

@@ -70,6 +70,11 @@ pub struct ArcaneManager {
     /// Migration guardrails (feature-gated).
     #[cfg(feature = "migration")]
     migration_state: MigrationState,
+    /// Registered cluster topology (bootstrap + warm spares). Partitioning counts
+    /// these as available partitions even when they own zero entities; without
+    /// this an everyone-on-one-cluster world can never spread (k would be 1).
+    #[cfg(feature = "migration")]
+    known_clusters: Vec<Uuid>,
 }
 
 /// Migration guardrails: cooldown, in-flight cap, and per-node CPU cap config.
@@ -109,6 +114,7 @@ fn build_partition_decisions(
     physics_edges: &HashMap<(Uuid, Uuid), Colocation>,
     interaction_graph: &InteractionGraph,
     config: &AffinityConfig,
+    known_clusters: &[Uuid],
 ) -> HashMap<Uuid, Uuid> {
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
@@ -233,9 +239,14 @@ fn build_partition_decisions(
         return current_assignments.clone();
     }
 
-    // Number of partitions = number of distinct current clusters (at least 1)
+    // Number of partitions = number of KNOWN clusters (registered topology, including
+    // empty warm spares), not merely clusters that currently own entities. With the
+    // old "distinct current clusters" rule, a world where everyone starts on one
+    // cluster yields k=1 forever — capacity can never force a spread because no
+    // second partition exists to spread INTO. Warm spares must count.
     let num_partitions = {
         let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
+        clusters.extend_from_slice(known_clusters);
         clusters.sort();
         clusters.dedup();
         std::cmp::max(1, clusters.len())
@@ -265,50 +276,47 @@ fn build_partition_decisions(
         &RefineConfig::default(),
     );
 
-    // Map partition indices to cluster ids deterministically.
-    // For each partition index, seed it from the cluster that currently holds the plurality
-    // of that partition's members (tie-break: lowest Uuid).
+    // Map partition indices to cluster ids deterministically and INJECTIVELY:
+    // two partitions must never map to the same cluster (the old plurality-only
+    // rule collapsed all partitions onto the crowded cluster, so migrations to a
+    // warm spare could never be emitted). Greedy assignment: process partitions
+    // by decreasing size; each takes its plurality cluster if still free, else
+    // the free known cluster with the most of its members, else any free known
+    // cluster (sorted for determinism).
+    let all_clusters: Vec<Uuid> = {
+        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
+        cs.extend_from_slice(known_clusters);
+        cs.sort();
+        cs.dedup();
+        cs
+    };
+    let mut free_clusters: std::collections::BTreeSet<Uuid> =
+        all_clusters.iter().copied().collect();
+    let mut order: Vec<usize> = (0..num_partitions).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(refined_partition.members(i).len()));
+
     let mut partition_to_cluster_id: HashMap<usize, Uuid> = HashMap::new();
-    for part_idx in 0..num_partitions {
+    for part_idx in order {
         let members = refined_partition.members(part_idx);
-        if members.is_empty() {
-            // Empty partition: assign to the lowest current cluster (shouldn't happen)
-            let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
-            clusters.sort();
-            if !clusters.is_empty() {
-                partition_to_cluster_id.insert(part_idx, clusters[0]);
-            }
-            continue;
-        }
-
-        // Count which cluster currently holds the plurality of this partition's members
-        let mut cluster_counts: HashMap<Uuid, usize> = HashMap::new();
+        // Rank this partition's preference over FREE clusters by member plurality,
+        // tie-break lowest Uuid (deterministic).
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
         for member in &members {
-            if let Some(&current_cluster) = current_assignments.get(member) {
-                *cluster_counts.entry(current_cluster).or_insert(0) += 1;
+            if let Some(&c) = current_assignments.get(member) {
+                if free_clusters.contains(&c) {
+                    *counts.entry(c).or_insert(0) += 1;
+                }
             }
         }
-
-        // Pick the cluster with the highest count, tie-break with lowest Uuid
-        let chosen_cluster = cluster_counts
+        let chosen = counts
             .into_iter()
-            .max_by(|a, b| {
-                let cmp = a.1.cmp(&b.1); // Compare counts
-                if cmp == std::cmp::Ordering::Equal {
-                    b.0.cmp(&a.0) // Tie-break: higher comes first (we want lower), so reverse
-                } else {
-                    cmp
-                }
-            })
-            .map(|(cluster, _)| cluster)
-            .unwrap_or_else(|| {
-                // Fallback: use lowest current cluster
-                let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
-                clusters.sort();
-                clusters[0]
-            });
-
-        partition_to_cluster_id.insert(part_idx, chosen_cluster);
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(c, _)| c)
+            .or_else(|| free_clusters.iter().next().copied());
+        if let Some(c) = chosen {
+            free_clusters.remove(&c);
+            partition_to_cluster_id.insert(part_idx, c);
+        }
     }
 
     // Produce final desired assignments from the partition
@@ -345,6 +353,8 @@ impl ArcaneManager {
             last_seen_entities: std::collections::HashSet::new(),
             #[cfg(feature = "migration")]
             migration_state: MigrationState::new(),
+            #[cfg(feature = "migration")]
+            known_clusters: Vec::new(),
         }
     }
 
@@ -442,6 +452,15 @@ impl ArcaneManager {
         {
             let _ = config;
         }
+    }
+
+    /// Register the known cluster topology (bootstrap list + warm spares). The
+    /// partitioner treats every known cluster as an available partition even when
+    /// it currently owns nothing — this is what lets capacity pressure spread an
+    /// everyone-on-one-cluster world onto empty spares.
+    #[cfg(feature = "migration")]
+    pub fn set_known_clusters(&mut self, clusters: Vec<Uuid>) {
+        self.known_clusters = clusters;
     }
 
     /// Register (or clear) a physics-coupling edge between two entities, carrying its co-location
@@ -757,6 +776,7 @@ impl ArcaneManager {
             &self.physics_edges,
             &self.interaction_graph,
             &self.config,
+            &self.known_clusters,
         );
 
         for (entity_id, desired_cluster) in resolved {
