@@ -455,12 +455,27 @@ impl NodeCore {
     pub fn submit_entities(&mut self, spine: &[EntityStateEntry], removed: &[Uuid]) {
         #[cfg(feature = "migration")]
         {
+            let mut claims_this_batch = 0;
             for entry in spine {
+                // First-sight ownership claiming: an entity submitted by this node's driver with no
+                // recorded owner anywhere is a new spawn on this node — claim it immediately.
+                // A remote owner recorded later (via inbox flip) will supersede this normally.
+                if self.ownership.owner_of(entry.entity_id).is_none() {
+                    self.ownership.set_owner(entry.entity_id, self.cluster_id);
+                    claims_this_batch += 1;
+                }
+
                 if self.ownership.owns(entry.entity_id, self.cluster_id) {
                     let mut e = entry.clone();
                     e.cluster_id = self.cluster_id;
                     self.server.add_entity(e);
                 }
+            }
+            if claims_this_batch > 0 {
+                eprintln!(
+                    "first-sight ownership claimed {} entities this batch",
+                    claims_this_batch
+                );
             }
         }
         #[cfg(not(feature = "migration"))]
@@ -1501,6 +1516,55 @@ mod tests {
                 1,
                 "exactly one cluster should write"
             );
+        }
+
+        #[test]
+        fn submit_claims_unowned_entities() {
+            let my_cluster = Uuid::from_u128(1);
+            let entity_1 = Uuid::from_u128(100);
+            let entity_2 = Uuid::from_u128(101);
+
+            let ownership = OwnershipMap::new();
+            // Verify no owner initially
+            assert!(ownership.owner_of(entity_1).is_none());
+            assert!(ownership.owner_of(entity_2).is_none());
+
+            // Simulate submit_entities claiming unowned entities
+            let mut claims = 0;
+            for entity_id in [entity_1, entity_2] {
+                if ownership.owner_of(entity_id).is_none() {
+                    ownership.set_owner(entity_id, my_cluster);
+                    claims += 1;
+                }
+            }
+
+            // Verify claims were made
+            assert_eq!(claims, 2);
+            assert_eq!(ownership.owner_of(entity_1), Some(my_cluster));
+            assert_eq!(ownership.owner_of(entity_2), Some(my_cluster));
+            assert!(ownership.owns(entity_1, my_cluster));
+            assert!(ownership.owns(entity_2, my_cluster));
+        }
+
+        #[test]
+        fn submit_respects_foreign_owner() {
+            let my_cluster = Uuid::from_u128(1);
+            let foreign_cluster = Uuid::from_u128(2);
+            let entity_id = Uuid::from_u128(100);
+
+            let ownership = OwnershipMap::new();
+            // Set up foreign ownership
+            ownership.set_owner(entity_id, foreign_cluster);
+
+            // Try to claim it (should not re-claim)
+            if ownership.owner_of(entity_id).is_none() {
+                ownership.set_owner(entity_id, my_cluster);
+            }
+
+            // Verify foreign ownership is respected (not changed)
+            assert_eq!(ownership.owner_of(entity_id), Some(foreign_cluster));
+            assert!(!ownership.owns(entity_id, my_cluster));
+            assert!(ownership.owns(entity_id, foreign_cluster));
         }
     }
 }

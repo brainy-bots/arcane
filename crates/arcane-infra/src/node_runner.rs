@@ -84,12 +84,24 @@ where
 {
     let mut core = NodeCore::new(NodeConfig {
         cluster_id,
-        redis_url,
+        redis_url: redis_url.clone(),
         neighbor_ids,
         ws_port,
         // The standalone production node requires Redis; single-node mode is for the C-ABI/dev path.
         allow_single_node: false,
     })?;
+
+    #[cfg(feature = "migration")]
+    match crate::node_inbox::RedisInboxBus::new(&redis_url) {
+        Ok(bus) => {
+            core.attach_inbox(bus);
+            eprintln!("node inbox attached (arcane:inbox:{})", cluster_id);
+        }
+        Err(e) => eprintln!(
+            "node inbox attach failed ({}); running on legacy channels only",
+            e
+        ),
+    }
 
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     let interval = Duration::from_millis(1000 / tick_rate_hz);
