@@ -18,6 +18,8 @@ use crate::ownership_migration::OwnershipFlip;
 #[cfg(feature = "migration")]
 use arcane_affinity::cold_pair::{ColdCandidate, SweepConfig};
 #[cfg(feature = "migration")]
+use arcane_affinity::feature_map::FeatureMap;
+#[cfg(feature = "migration")]
 use arcane_affinity::interaction_graph::{Colocation, InteractionGraph, InteractionKind};
 #[cfg(feature = "migration")]
 use arcane_affinity::partition::{
@@ -25,7 +27,7 @@ use arcane_affinity::partition::{
 };
 #[cfg(feature = "migration")]
 use arcane_affinity::predictor::{
-    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairFeatures,
+    HeuristicPredictor, InteractionPredictor, NullFeatureProvider, PairContext,
 };
 #[cfg(feature = "migration")]
 use arcane_affinity::refinement::{refine, RefineConfig};
@@ -164,28 +166,36 @@ fn build_partition_decisions(
                     }
                 };
 
-                let features = PairFeatures {
-                    distance: {
-                        let dx = player_b.position.x - player_a.position.x;
-                        let dy = player_b.position.y - player_a.position.y;
-                        (dx * dx + dy * dy).sqrt()
-                    },
+                let distance = {
+                    let dx = player_b.position.x - player_a.position.x;
+                    let dy = player_b.position.y - player_a.position.y;
+                    (dx * dx + dy * dy).sqrt()
+                };
+
+                // TODO(#272-A4): removed with the sweep rewrite
+                // LinkKind (Party/Guild) is no longer used in the predictor API.
+                let _latent_link = if player_a.party_id.is_some()
+                    && player_a.party_id == player_b.party_id
+                {
+                    Some(arcane_affinity::predictor::LinkKind::Party)
+                } else if player_a.guild_id.is_some() && player_a.guild_id == player_b.guild_id {
+                    Some(arcane_affinity::predictor::LinkKind::Guild)
+                } else {
+                    None
+                };
+
+                let features_a = FeatureMap::new();
+                let features_b = FeatureMap::new();
+
+                let ctx = PairContext {
+                    distance,
                     closing_speed,
                     horizon_secs: 5.0,
                     history_weight: base_weight,
-                    latent_link: if player_a.party_id.is_some()
-                        && player_a.party_id == player_b.party_id
-                    {
-                        Some(arcane_affinity::predictor::LinkKind::Party)
-                    } else if player_a.guild_id.is_some() && player_a.guild_id == player_b.guild_id
-                    {
-                        Some(arcane_affinity::predictor::LinkKind::Guild)
-                    } else {
-                        None
-                    },
-                    game: Default::default(),
+                    features_a: &features_a,
+                    features_b: &features_b,
                 };
-                predictor.predict(&features)
+                predictor.predict(&ctx)
             } else {
                 0.0
             };
@@ -677,6 +687,7 @@ impl ArcaneManager {
                         pos_b: b.position,
                         vel_a: a.velocity,
                         vel_b: b.velocity,
+                        // TODO(#272-A4): removed with the sweep rewrite
                         link: arcane_affinity::predictor::LinkKind::Party,
                         history_weight,
                     });
@@ -706,6 +717,7 @@ impl ArcaneManager {
                         pos_b: b.position,
                         vel_a: a.velocity,
                         vel_b: b.velocity,
+                        // TODO(#272-A4): removed with the sweep rewrite
                         link: arcane_affinity::predictor::LinkKind::Guild,
                         history_weight,
                     });
