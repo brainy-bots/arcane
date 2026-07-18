@@ -275,6 +275,9 @@ async fn control_loop(
 
         let router_config = RouterConfig::default();
         let mut runtime = ManagerRuntime::new(manager, bus, router_config);
+        // Warm spares count as partitions: without this, an everyone-on-one-cluster
+        // world has k=1 and can never spread.
+        runtime.set_known_clusters(cluster_ids.clone());
         let mut stale_tracker = StaleTracker::new();
         let mut last_stale: HashSet<Uuid> = HashSet::new();
 
