@@ -46,8 +46,10 @@ pub struct ArcaneManager {
     /// Allocated nodes. active_count = allocated_servers.len().
     allocated_servers: Vec<ServerHandle>,
     /// Entity dynamic features for edge rule matching.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     features: HashMap<Uuid, FeatureMap>,
     /// Affinity configuration: tuning constants and edge rules.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     config: AffinityConfig,
     /// Physics-coupling edges between entity pairs (Joint / Collision / PhysicsImpulse), keyed
     /// by the canonical ordered pair. These carry a `Colocation` class into the partitioner:
@@ -1055,6 +1057,8 @@ mod view_enrichment_tests {
         assert_eq!(manager.spatial_index.velocity_of(entity_id), Some(velocity));
     }
 
+    // Feature-map storage is migration-only (FeatureMap is a () stub otherwise).
+    #[cfg(feature = "migration")]
     #[test]
     fn test_entity_feature_storage() {
         let mut manager = ArcaneManager::with_defaults();
@@ -1071,6 +1075,7 @@ mod view_enrichment_tests {
         assert_eq!(features.unwrap().get("guild"), Some(&300.0));
     }
 
+    #[cfg(feature = "migration")]
     #[test]
     fn test_entity_feature_removal() {
         let mut manager = ArcaneManager::with_defaults();
@@ -1094,6 +1099,7 @@ mod view_enrichment_tests {
         );
     }
 
+    #[cfg(feature = "migration")]
     #[test]
     fn test_worldstateview_reflects_entity_features() {
         let mut manager = ArcaneManager::with_defaults();
