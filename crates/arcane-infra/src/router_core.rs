@@ -65,6 +65,13 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
         clusters.insert(flip.from_cluster);
         clusters.insert(flip.to_cluster);
     }
+    // Force-include targets must receive frames even if they own nothing and no
+    // flip references them yet — an EMPTY destination (warm spare) being warmed by
+    // the replication gate would otherwise never get a frame and the pending flip
+    // could never confirm (§8 step-1-from-scratch case).
+    for (_, to_cluster) in input.force_include {
+        clusters.insert(*to_cluster);
+    }
 
     let mut frames = Vec::new();
 
