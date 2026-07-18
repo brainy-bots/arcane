@@ -30,6 +30,9 @@ pub struct RouterInput<'a> {
     pub entity_states: &'a HashMap<Uuid, EntityStateEntry>,
     /// The Manager's interaction graph (edge weights drive interest).
     pub interaction_graph: &'a InteractionGraph,
+    /// Entities to force-include in specific clusters regardless of interest.
+    /// (entity_id, to_cluster) pairs for pending-flip entities awaiting replication confirmation.
+    pub force_include: &'a [(Uuid, Uuid)],
 }
 
 /// Router configuration: rate law and per-entity dynamism placeholder.
@@ -61,6 +64,13 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
     for flip in input.flips {
         clusters.insert(flip.from_cluster);
         clusters.insert(flip.to_cluster);
+    }
+    // Force-include targets must receive frames even if they own nothing and no
+    // flip references them yet — an EMPTY destination (warm spare) being warmed by
+    // the replication gate would otherwise never get a frame and the pending flip
+    // could never confirm (§8 step-1-from-scratch case).
+    for (_, to_cluster) in input.force_include {
+        clusters.insert(*to_cluster);
     }
 
     let mut frames = Vec::new();
@@ -125,6 +135,28 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
                     })
                     .or_insert_with(|| (neighbor_state.clone(), tier));
             }
+        }
+
+        // Force-include entities for pending flips (replication gate): add with tier Full.
+        for (entity_id, to_cluster) in input.force_include {
+            if *to_cluster != cluster_id {
+                continue;
+            }
+
+            // Get the entity state; skip if missing.
+            let Some(entity_state) = input.entity_states.get(entity_id) else {
+                continue;
+            };
+
+            // Force with tier Full (highest priority), dedup by keeping highest tier.
+            entity_interest
+                .entry(*entity_id)
+                .and_modify(|(_, existing_tier)| {
+                    if tier_order(RateTier::Full) > tier_order(*existing_tier) {
+                        *existing_tier = RateTier::Full;
+                    }
+                })
+                .or_insert_with(|| (entity_state.clone(), RateTier::Full));
         }
 
         // Step 5: Frame assembly.
@@ -223,6 +255,7 @@ mod tests {
             flips: &flips,
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -276,6 +309,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -328,6 +362,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -364,6 +399,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -406,6 +442,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -444,6 +481,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();
@@ -477,6 +515,7 @@ mod tests {
             flips: &[],
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
+            force_include: &[],
         };
 
         let config = RouterConfig::default();

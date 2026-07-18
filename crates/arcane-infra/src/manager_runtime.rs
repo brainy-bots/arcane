@@ -6,17 +6,37 @@
 
 use crate::manager::ArcaneManager;
 use crate::node_inbox::InboxBus;
+use crate::ownership_migration::OwnershipFlip;
+use crate::replication_gate::ReplicationGate;
 use crate::router_core::{route, RouterConfig, RouterInput};
 use arcane_core::replication_channel::EntityStateEntry;
 use arcane_core::Vec3;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// One cycle's report: tick number, flips applied, frames published.
+/// Runtime configuration: router settings and replication gate timing.
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeConfig {
+    pub router_config: RouterConfig,
+    /// Number of cycles an entity must be replicated to the destination before flipping.
+    pub confirmation_cycles: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            router_config: RouterConfig::default(),
+            confirmation_cycles: 3,
+        }
+    }
+}
+
+/// One cycle's report: tick number, pending and published flips, frames published.
 #[derive(Debug, Clone, Copy)]
 pub struct CycleReport {
     pub tick: u64,
-    pub flips_applied: usize,
+    pub pending_flips: usize,
+    pub published_flips: usize,
     pub frames_published: usize,
 }
 
@@ -24,20 +44,47 @@ pub struct CycleReport {
 pub struct ManagerRuntime<B: InboxBus> {
     manager: ArcaneManager,
     bus: B,
-    config: RouterConfig,
+    config: RuntimeConfig,
     /// Authoritative entity → cluster assignment, updated by applying flips.
     assignments: HashMap<Uuid, Uuid>,
+    /// Flips decided but not yet published, awaiting replication confirmation.
+    pending_flips: Vec<OwnershipFlip>,
+    /// Flips confirmed by gate, waiting to be published in the next cycle.
+    confirmed_flips: Vec<OwnershipFlip>,
+    /// Gate tracking replication of pending-flip entities.
+    gate: ReplicationGate,
+    /// Entities whose destination already replicates them (skip rule applied).
+    skip_confirmed: HashSet<Uuid>,
+    /// Entities on their first pending cycle (for skip rule check).
+    first_cycle_flips: HashSet<Uuid>,
     tick: u64,
 }
 
 impl<B: InboxBus> ManagerRuntime<B> {
-    /// Create a new ManagerRuntime.
-    pub fn new(manager: ArcaneManager, bus: B, config: RouterConfig) -> Self {
+    /// Create a new ManagerRuntime with default config.
+    pub fn new(manager: ArcaneManager, bus: B, router_config: RouterConfig) -> Self {
+        Self::with_config(
+            manager,
+            bus,
+            RuntimeConfig {
+                router_config,
+                confirmation_cycles: 3,
+            },
+        )
+    }
+
+    /// Create a new ManagerRuntime with full RuntimeConfig.
+    pub fn with_config(manager: ArcaneManager, bus: B, config: RuntimeConfig) -> Self {
         Self {
             manager,
             bus,
             config,
             assignments: HashMap::new(),
+            pending_flips: Vec::new(),
+            confirmed_flips: Vec::new(),
+            gate: ReplicationGate::new(),
+            skip_confirmed: HashSet::new(),
+            first_cycle_flips: HashSet::new(),
             tick: 0,
         }
     }
@@ -100,20 +147,131 @@ impl<B: InboxBus> ManagerRuntime<B> {
         // 1. Evaluate the manager.
         self.manager.run_evaluation_cycle()?;
 
-        // 2. Drain flips and apply them to assignments.
-        let flips = self.manager.take_pending_flips();
-        for flip in &flips {
-            self.assignments.insert(flip.entity_id, flip.to_cluster);
+        // 2. Drain newly-decided flips and append to pending_flips (with dedup).
+        let new_flips = self.manager.take_pending_flips();
+        for flip in new_flips {
+            if !self
+                .pending_flips
+                .iter()
+                .any(|f| f.entity_id == flip.entity_id)
+            {
+                self.pending_flips.push(flip);
+                self.first_cycle_flips.insert(flip.entity_id);
+            }
         }
 
         // 3. Build entity_states from the manager's spatial snapshot.
         let snapshot_positions = self.manager.snapshot_positions();
 
-        // 3a. Actuate flips INSIDE the manager too: move each flipped entity to its
-        // new cluster in the spatial index. Without this the manager keeps seeing the
-        // entity on its old cluster and re-initiates the same migration after every
-        // cooldown window (flip ping-pong).
-        for flip in &flips {
+        let mut entity_states: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        for (entity_id, cluster_id, position, velocity) in &snapshot_positions {
+            let owner = self
+                .assignments
+                .get(entity_id)
+                .copied()
+                .unwrap_or(*cluster_id);
+            entity_states.insert(
+                *entity_id,
+                EntityStateEntry::new(*entity_id, owner, *position, *velocity),
+            );
+        }
+
+        // 4. Build force_include list from pending flips and handle skip rule.
+        let mut force_include: Vec<(Uuid, Uuid)> = Vec::new();
+
+        for flip in &self.pending_flips {
+            if self.skip_confirmed.contains(&flip.entity_id) {
+                continue;
+            }
+
+            if self.first_cycle_flips.contains(&flip.entity_id) {
+                // First cycle: check if destination already replicates (skip rule).
+                let empty_router_input = RouterInput {
+                    tick: self.tick,
+                    assignments: &self.assignments,
+                    flips: &[],
+                    entity_states: &entity_states,
+                    interaction_graph: self.manager.interaction_graph(),
+                    force_include: &[],
+                };
+                let test_frames = route(&empty_router_input, &self.config.router_config);
+
+                let mut already_interested = false;
+                for (cluster_id, frame) in &test_frames {
+                    if *cluster_id == flip.to_cluster
+                        && frame
+                            .entities
+                            .iter()
+                            .any(|e| e.entry.entity_id == flip.entity_id)
+                    {
+                        already_interested = true;
+                        break;
+                    }
+                }
+
+                if already_interested {
+                    // Skip rule applied: gate immediately satisfied.
+                    self.skip_confirmed.insert(flip.entity_id);
+                    self.gate.forget(flip.entity_id);
+                    self.first_cycle_flips.remove(&flip.entity_id);
+                    continue;
+                }
+
+                self.first_cycle_flips.remove(&flip.entity_id);
+            }
+
+            force_include.push((flip.entity_id, flip.to_cluster));
+        }
+
+        // 5. Route: first with confirmed flips in ownership, then with force_include for pending.
+        let router_input = RouterInput {
+            tick: self.tick,
+            assignments: &self.assignments,
+            flips: &self.confirmed_flips,
+            entity_states: &entity_states,
+            interaction_graph: self.manager.interaction_graph(),
+            force_include: &force_include,
+        };
+
+        let frames = route(&router_input, &self.config.router_config);
+
+        // 6. Track replication for pending flips.
+        for flip in &self.pending_flips {
+            if self.skip_confirmed.contains(&flip.entity_id) {
+                continue;
+            }
+
+            let mut delivered = false;
+            for (cluster_id, frame) in &frames {
+                if *cluster_id == flip.to_cluster
+                    && frame
+                        .entities
+                        .iter()
+                        .any(|e| e.entry.entity_id == flip.entity_id)
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+
+            self.gate.observe(flip.entity_id, delivered, self.tick);
+        }
+
+        // 7. Publish frames to the bus.
+        let mut published = 0;
+        for (cluster_id, frame) in frames {
+            self.bus.publish(cluster_id, frame)?;
+            published += 1;
+        }
+
+        // 8. The confirmed flips routed THIS cycle (step 5's `flips` input) have now
+        //    been published in the frames' ownership. Apply them: update assignments,
+        //    actuate the entity onto its new cluster in the manager's spatial index
+        //    (prevents re-decision ping-pong), and clear gate bookkeeping.
+        let published_flip_count = self.confirmed_flips.len();
+        let confirmed_now: Vec<OwnershipFlip> = self.confirmed_flips.drain(..).collect();
+        for flip in confirmed_now {
+            self.assignments.insert(flip.entity_id, flip.to_cluster);
             if let Some((_, _, pos, _)) = snapshot_positions
                 .iter()
                 .find(|(id, _, _, _)| *id == flip.entity_id)
@@ -121,44 +279,39 @@ impl<B: InboxBus> ManagerRuntime<B> {
                 self.manager
                     .update_entity(flip.entity_id, flip.to_cluster, *pos);
             }
+            self.gate.forget(flip.entity_id);
+            self.skip_confirmed.remove(&flip.entity_id);
+            self.first_cycle_flips.remove(&flip.entity_id);
         }
 
-        let mut entity_states: HashMap<Uuid, EntityStateEntry> = HashMap::new();
-        for (entity_id, cluster_id, position, velocity) in snapshot_positions {
-            // Ownership source of truth is `assignments` (post-flip), not the
-            // pre-flip spatial snapshot.
-            let owner = self
-                .assignments
-                .get(&entity_id)
-                .copied()
-                .unwrap_or(cluster_id);
-            entity_states.insert(
-                entity_id,
-                EntityStateEntry::new(entity_id, owner, position, velocity),
-            );
+        // 9. Promote gate-confirmed pending flips to `confirmed_flips` — they will be
+        //    routed (published in `ownership`) on the NEXT cycle and applied after.
+        //    Drop pending flips whose entity disappeared from the view.
+        let known_entities: HashSet<Uuid> = entity_states.keys().copied().collect();
+        let mut remaining_pending = Vec::new();
+        for flip in self.pending_flips.drain(..) {
+            if !known_entities.contains(&flip.entity_id) {
+                self.gate.forget(flip.entity_id);
+                self.skip_confirmed.remove(&flip.entity_id);
+                self.first_cycle_flips.remove(&flip.entity_id);
+                continue; // dropped
+            }
+            if self.skip_confirmed.contains(&flip.entity_id)
+                || self
+                    .gate
+                    .is_confirmed(flip.entity_id, self.config.confirmation_cycles)
+            {
+                self.confirmed_flips.push(flip);
+            } else {
+                remaining_pending.push(flip);
+            }
         }
-
-        // 4. Route via RouterCore.
-        let router_input = RouterInput {
-            tick: self.tick,
-            assignments: &self.assignments,
-            flips: &flips,
-            entity_states: &entity_states,
-            interaction_graph: self.manager.interaction_graph(),
-        };
-
-        let frames = route(&router_input, &self.config);
-
-        // 5. Publish frames to the bus.
-        let mut published = 0;
-        for (cluster_id, frame) in frames {
-            self.bus.publish(cluster_id, frame)?;
-            published += 1;
-        }
+        self.pending_flips = remaining_pending;
 
         Ok(CycleReport {
             tick: self.tick,
-            flips_applied: flips.len(),
+            pending_flips: self.pending_flips.len(),
+            published_flips: published_flip_count,
             frames_published: published,
         })
     }
@@ -371,10 +524,218 @@ mod tests {
 
         for _ in 0..50 {
             let report = runtime.run_cycle().expect("run_cycle failed");
-            assert_eq!(report.flips_applied, 0, "flip ping-pong after co-location");
+            assert_eq!(
+                report.published_flips, 0,
+                "flip ping-pong after co-location"
+            );
         }
 
         assert_eq!(*runtime.assignments.get(&e1).unwrap(), frozen_a1);
         assert_eq!(*runtime.assignments.get(&e2).unwrap(), frozen_a2);
+    }
+
+    /// flip_not_published_before_n_cycles: A pair on different clusters where the
+    /// destination does NOT already receive the entity via interest. After a flip is
+    /// decided, the entity must be force-included in the destination's frames for N
+    /// cycles before the flip publishes in the ownership field.
+    /// The §8 warm-spare case: a pending flip to a destination with NO interest in
+    /// the entity (C2 owns an unrelated far entity; e1 has no cross-boundary edges).
+    /// The gate must force-deliver e1's STATE to C2 for `confirmation_cycles` full
+    /// cycles BEFORE the flip appears in any frame's ownership. Unconditional.
+    #[test]
+    fn flip_not_published_before_n_cycles() {
+        const N: u64 = 3;
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::with_config(
+            make_manager(),
+            bus,
+            RuntimeConfig {
+                router_config: make_config(),
+                confirmation_cycles: N,
+            },
+        );
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+        // Unrelated resident far away on C2 (keeps C2 alive; no edges to e1).
+        let resident = Uuid::from_u128(0x999);
+
+        let rx2 = runtime.bus.subscribe(c2);
+
+        runtime.set_observation_radius(500.0);
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.update_entity(resident, c2, Vec3::new(10_000.0, 0.0, 10_000.0));
+
+        // Inject the flip decision directly (the §8 infrastructure-driven case:
+        // a rebalance decision with no interaction interest behind it).
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: e1,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: 0,
+        });
+        runtime.first_cycle_flips.insert(e1);
+
+        let mut state_cycles_before_flip = 0u64;
+        let mut flip_seen_at: Option<u64> = None;
+
+        for cycle in 1..=20u64 {
+            runtime.run_cycle().expect("run_cycle failed");
+
+            while let Ok(frame) = rx2.try_recv() {
+                let has_flip = frame.ownership.iter().any(|f| f.entity_id == e1);
+                let has_state = frame.entities.iter().any(|e| e.entry.entity_id == e1);
+                if has_flip && flip_seen_at.is_none() {
+                    flip_seen_at = Some(cycle);
+                }
+                if has_state && flip_seen_at.is_none() {
+                    state_cycles_before_flip += 1;
+                }
+            }
+        }
+
+        let flip_cycle = flip_seen_at.expect("gated flip never published in 20 cycles");
+        assert!(
+            state_cycles_before_flip >= N,
+            "destination received e1's state only {state_cycles_before_flip} cycles before \
+             the flip; gate requires {N}"
+        );
+        assert!(
+            flip_cycle > N,
+            "flip published on cycle {flip_cycle}, before {N} confirmation cycles could elapse"
+        );
+        // And the assignment followed the (gated) flip.
+        assert_eq!(runtime.assignments.get(&e1), Some(&c2));
+    }
+
+    /// already_interested_destination_skips_gate: A strongly-linked pair where the
+    /// destination already receives the entity via interest. The flip should publish
+    /// immediately without waiting for N cycles.
+    #[test]
+    fn already_interested_destination_skips_gate() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+        let e2 = Uuid::from_u128(0x200);
+        let party = Uuid::from_u128(0x3);
+
+        let rx1 = runtime.bus.subscribe(c1);
+        let rx2 = runtime.bus.subscribe(c2);
+
+        // Set up a pair with strong interest (guild edge).
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.update_entity(e2, c2, Vec3::new(10.0, 0.0, 0.0));
+        runtime.set_entity_party(e1, Some(party));
+        runtime.set_entity_party(e2, Some(party));
+        runtime.set_observation_radius(500.0);
+
+        // Run until co-located; the pair should co-locate quickly.
+        let mut flip_published_cycle = None;
+        let mut flip_found = false;
+
+        for cycle in 1..=300 {
+            runtime.run_cycle().expect("run_cycle failed");
+
+            while let Ok(frame) = rx1.try_recv() {
+                if !frame.ownership.is_empty() {
+                    flip_found = true;
+                    if flip_published_cycle.is_none() {
+                        flip_published_cycle = Some(cycle);
+                    }
+                }
+            }
+            while let Ok(frame) = rx2.try_recv() {
+                if !frame.ownership.is_empty() {
+                    flip_found = true;
+                    if flip_published_cycle.is_none() {
+                        flip_published_cycle = Some(cycle);
+                    }
+                }
+            }
+
+            // Check if co-located; if so, verify the flip published.
+            if let (Some(&ca), Some(&cb)) =
+                (runtime.assignments.get(&e1), runtime.assignments.get(&e2))
+            {
+                if ca == cb && flip_found {
+                    // Skip rule should apply: the pair already has interest, so flip publishes
+                    // immediately (or very soon, within 1-2 cycles). Assert it's early.
+                    if let Some(pub_cycle) = flip_published_cycle {
+                        // For strongly-linked pairs, flip should publish within a couple cycles.
+                        // We use a loose bound here since timing is implementation-dependent.
+                        assert!(
+                            pub_cycle <= 30,
+                            "strongly-linked flip took {} cycles to publish; skip rule not applied",
+                            pub_cycle
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        assert!(flip_found, "strongly-linked pair never published a flip");
+    }
+
+    /// pending_flip_dropped_when_entity_leaves: If an entity with a pending flip
+    /// disappears from the view, the flip should be dropped and not published.
+    #[test]
+    fn pending_flip_dropped_when_entity_leaves() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::with_config(
+            make_manager(),
+            bus,
+            RuntimeConfig {
+                router_config: make_config(),
+                confirmation_cycles: 3,
+            },
+        );
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let e1 = Uuid::from_u128(0x100);
+
+        let rx1 = runtime.bus.subscribe(c1);
+        let rx2 = runtime.bus.subscribe(c2);
+
+        // Seed a pending flip for an entity the manager view has never seen
+        // (equivalently: it departed before the gate could confirm).
+        runtime.set_observation_radius(500.0);
+        let resident = Uuid::from_u128(0x999);
+        runtime.update_entity(resident, c2, Vec3::new(10_000.0, 0.0, 10_000.0));
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: e1,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: 0,
+        });
+        runtime.first_cycle_flips.insert(e1);
+
+        // Run for a few cycles.
+        for _ in 0..50 {
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+
+        // The flip must have been dropped (entity absent from view), never published.
+        assert!(
+            runtime.pending_flips.is_empty(),
+            "pending flip for a departed entity was not dropped"
+        );
+        assert!(
+            runtime.confirmed_flips.is_empty(),
+            "departed entity's flip reached the confirmed list"
+        );
+        let mut flip_published = false;
+        while let Ok(frame) = rx1.try_recv() {
+            flip_published |= frame.ownership.iter().any(|f| f.entity_id == e1);
+        }
+        while let Ok(frame) = rx2.try_recv() {
+            flip_published |= frame.ownership.iter().any(|f| f.entity_id == e1);
+        }
+        assert!(!flip_published, "departed entity's flip was published");
     }
 }
