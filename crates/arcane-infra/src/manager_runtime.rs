@@ -808,7 +808,7 @@ mod tests {
 
         // Before blocking: flip should promote to confirmed.
         runtime.run_cycle().expect("run_cycle failed");
-        let was_confirmed = !runtime.confirmed_flips.is_empty();
+        let _was_confirmed = !runtime.confirmed_flips.is_empty();
 
         // Reset and redo with blocking.
         runtime.confirmed_flips.clear();
