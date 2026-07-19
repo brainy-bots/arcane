@@ -780,6 +780,19 @@ impl ArcaneManager {
         for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {
                 if desired_cluster != current_cluster {
+                    // Pinned entities never migrate (config.pin_feature, game-declared
+                    // name; nonzero value = pinned). v1 stand-in for client handoff:
+                    // a live client connection anchors its entity to the join cluster.
+                    if let Some(ref pin_name) = self.config.pin_feature {
+                        let pinned = self
+                            .features
+                            .get(&entity_id)
+                            .and_then(|fm| fm.get(pin_name))
+                            .is_some_and(|v| *v != 0.0);
+                        if pinned {
+                            continue;
+                        }
+                    }
                     // Decision is to migrate this entity.
                     if self.migration_state.can_migrate(entity_id) {
                         let flip = OwnershipFlip {
@@ -1114,6 +1127,61 @@ mod view_enrichment_tests {
                 .entity_features(entity_id)
                 .and_then(|f| f.get("party")),
             None
+        );
+    }
+
+    /// Pinned entities never migrate; the identical unpinned setup DOES migrate.
+    /// Two co-moving pairs split across clusters force partition pressure; the
+    /// only difference between runs is the pin feature — so if the pinned run
+    /// also migrates, the guard is genuinely absent (un-fakeable by tuning).
+    #[cfg(feature = "migration")]
+    #[test]
+    fn pinned_entities_never_migrate() {
+        fn run(pin: bool) -> usize {
+            let mut manager = ArcaneManager::with_model("affinity");
+            let mut config = AffinityConfig {
+                pin_feature: pin.then(|| "anchor".to_string()),
+                ..Default::default()
+            };
+            config.edge_rules.push(arcane_affinity::config::EdgeRule {
+                feature: "group".to_string(),
+                weight: 50.0,
+            });
+            manager.set_affinity_config(config);
+
+            let c1 = Uuid::from_u128(100);
+            let c2 = Uuid::from_u128(200);
+            manager.set_known_clusters(vec![c1, c2]);
+            // Pair (1,2) co-located but SPLIT across clusters with a strong
+            // feature edge: the partitioner must want to co-locate them.
+            let e1 = Uuid::from_u128(1);
+            let e2 = Uuid::from_u128(2);
+            manager.update_entity(e1, c1, arcane_core::Vec3::new(0.0, 0.0, 0.0));
+            manager.update_entity(e2, c2, arcane_core::Vec3::new(1.0, 0.0, 1.0));
+            manager.set_entity_feature(e1, "group", 7.0);
+            manager.set_entity_feature(e2, "group", 7.0);
+            if pin {
+                manager.set_entity_feature(e1, "anchor", 1.0);
+                manager.set_entity_feature(e2, "anchor", 1.0);
+            }
+
+            let mut flips = 0;
+            for _ in 0..20 {
+                manager.run_evaluation_cycle().expect("cycle");
+                flips += manager.take_pending_flips().len();
+            }
+            flips
+        }
+
+        let unpinned_flips = run(false);
+        let pinned_flips = run(true);
+        assert!(
+            unpinned_flips > 0,
+            "control run must migrate (else the test proves nothing)"
+        );
+        assert_eq!(
+            pinned_flips, 0,
+            "pinned entities migrated {pinned_flips} times"
         );
     }
 

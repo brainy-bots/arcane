@@ -268,6 +268,15 @@ pub struct NodeCore {
     state_publisher: Option<crate::state_keys::StatePublisher>,
     #[cfg(feature = "migration")]
     state_publish_interval: u64,
+    /// Game-declared pin feature name (NODE_PIN_FEATURE env). When set, entities
+    /// driven by a live client connection publish `{pin_feature: 1.0}` in their
+    /// state-doc FeatureMap so the manager (config.pin_feature) never migrates
+    /// them — v1 stand-in for CLUSTER_REASSIGN client handoff.
+    #[cfg(feature = "migration")]
+    pin_feature: Option<String>,
+    /// entity -> last tick a client update arrived for it (pin liveness window).
+    #[cfg(feature = "migration")]
+    client_driven_last_seen: HashMap<Uuid, u64>,
 }
 
 impl NodeCore {
@@ -383,6 +392,16 @@ impl NodeCore {
             (publisher, interval)
         };
 
+        #[cfg(feature = "migration")]
+        let pin_feature = std::env::var("NODE_PIN_FEATURE").ok().filter(|s| {
+            if s.is_empty() {
+                false
+            } else {
+                eprintln!("pin feature enabled: client-driven entities publish '{s}'=1");
+                true
+            }
+        });
+
         Ok(Self {
             server,
             state_tx,
@@ -408,6 +427,10 @@ impl NodeCore {
             state_publisher,
             #[cfg(feature = "migration")]
             state_publish_interval,
+            #[cfg(feature = "migration")]
+            pin_feature,
+            #[cfg(feature = "migration")]
+            client_driven_last_seen: HashMap::new(),
         })
     }
 
@@ -455,6 +478,11 @@ impl NodeCore {
         out.lost_entities.clear();
 
         while let Ok(entry) = self.client_updates_rx.try_recv() {
+            #[cfg(feature = "migration")]
+            if self.pin_feature.is_some() {
+                self.client_driven_last_seen
+                    .insert(entry.entity_id, self.tick_count);
+            }
             out.client_updates.push(entry);
         }
         while let Ok(action) = self.game_actions_rx.try_recv() {
@@ -462,6 +490,14 @@ impl NodeCore {
         }
         while let Ok(delta) = self.neighbor_rx.try_recv() {
             for entry in delta.updated {
+                // Ownership check (migration): never hold a proxy for an entity WE
+                // own. The legacy neighbor channel lags flips — right after adopting
+                // X, the old owner's last broadcasts still carry X and would ghost a
+                // duplicate next to the adopted actor.
+                #[cfg(feature = "migration")]
+                if self.ownership.owns(entry.entity_id, self.cluster_id) {
+                    continue;
+                }
                 self.neighbor_last_seen
                     .insert(entry.entity_id, self.tick_count);
                 self.neighbor_entities.insert(entry.entity_id, entry);
@@ -600,16 +636,39 @@ impl NodeCore {
         #[cfg(feature = "migration")]
         if self.tick_count.is_multiple_of(self.state_publish_interval) {
             if let Some(ref publisher) = self.state_publisher {
+                // Pin liveness: an entity counts as client-driven while updates arrived
+                // within the last PIN_LIVENESS_TICKS. Prune stale records so entities
+                // whose client disconnected become migratable again.
+                const PIN_LIVENESS_TICKS: u64 = 100;
+                if self.pin_feature.is_some() {
+                    let cutoff = self.tick_count.saturating_sub(PIN_LIVENESS_TICKS);
+                    self.client_driven_last_seen
+                        .retain(|_, last| *last >= cutoff);
+                }
                 let snapshot = self.server.snapshot();
                 let entities: Vec<arcane_affinity::feature_map::EntityRecord> = snapshot
                     .into_iter()
                     .filter(|e| self.ownership.owns(e.entity_id, self.cluster_id))
-                    .map(|entry| arcane_affinity::feature_map::EntityRecord {
-                        entity_id: entry.entity_id,
-                        cluster_id: entry.cluster_id,
-                        position: arcane_core::types::Vec2::new(entry.position.x, entry.position.z),
-                        velocity: arcane_core::types::Vec2::new(entry.velocity.x, entry.velocity.z),
-                        features: arcane_affinity::feature_map::FeatureMap::new(),
+                    .map(|entry| {
+                        let mut features = arcane_affinity::feature_map::FeatureMap::new();
+                        if let Some(ref pin_name) = self.pin_feature {
+                            if self.client_driven_last_seen.contains_key(&entry.entity_id) {
+                                features.insert(pin_name.clone(), 1.0);
+                            }
+                        }
+                        arcane_affinity::feature_map::EntityRecord {
+                            entity_id: entry.entity_id,
+                            cluster_id: entry.cluster_id,
+                            position: arcane_core::types::Vec2::new(
+                                entry.position.x,
+                                entry.position.z,
+                            ),
+                            velocity: arcane_core::types::Vec2::new(
+                                entry.velocity.x,
+                                entry.velocity.z,
+                            ),
+                            features,
+                        }
                     })
                     .collect();
 

@@ -38,6 +38,13 @@ pub struct AffinityConfig {
     // Dynamic edge rules (for features).
     pub edge_rules: Vec<EdgeRule>,
 
+    // Pin feature: entities whose FeatureMap has a nonzero value under this
+    // name are never migrated. The GAME declares the name (e.g. "pinned");
+    // the library never invents one. v1 stand-in for client handoff
+    // (CLUSTER_REASSIGN): entities driven by a live client connection stay
+    // on the cluster that connection terminates at. None = nothing pinned.
+    pub pin_feature: Option<String>,
+
     // Legacy fields (kept for backward compatibility with AffinityEngine).
     pub weight_collision: f64,
     pub weight_game_action: f64,
@@ -83,6 +90,8 @@ impl Default for AffinityConfig {
             promotion_weight_scale: 5.0,
 
             edge_rules: Vec::new(),
+
+            pin_feature: None,
 
             weight_collision: 1.0,
             weight_game_action: 2.0,

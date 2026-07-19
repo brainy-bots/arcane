@@ -264,13 +264,26 @@ async fn control_loop(
 
         let mut manager = ArcaneManager::with_model("affinity");
 
-        // Apply capacity factor if set.
-        if let Some(factor) = capacity_factor {
-            let config = arcane_affinity::config::AffinityConfig {
-                capacity_factor: factor,
+        // Apply operator config: capacity factor and/or pin feature.
+        // MANAGER_PIN_FEATURE names the game-declared feature that anchors an
+        // entity to its current cluster (nonzero value = never migrate). The
+        // v1 stand-in for CLUSTER_REASSIGN: client-driven entities stay on the
+        // cluster their WS connection terminates at.
+        let pin_feature = env::var("MANAGER_PIN_FEATURE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        if capacity_factor.is_some() || pin_feature.is_some() {
+            let mut config = arcane_affinity::config::AffinityConfig {
+                pin_feature: pin_feature.clone(),
                 ..Default::default()
             };
+            if let Some(factor) = capacity_factor {
+                config.capacity_factor = factor;
+            }
             manager.set_affinity_config(config);
+        }
+        if let Some(ref pf) = pin_feature {
+            eprintln!("arcane-manager: pin feature '{pf}' — pinned entities never migrate");
         }
 
         let router_config = RouterConfig::default();
