@@ -443,16 +443,14 @@ impl ArcaneManager {
     }
 
     /// Set the affinity configuration for tuning constants and edge rules.
+    #[cfg(feature = "migration")]
     pub fn set_affinity_config(&mut self, config: AffinityConfig) {
-        #[cfg(feature = "migration")]
-        {
-            self.config = config;
-        }
-        #[cfg(not(feature = "migration"))]
-        {
-            let _ = config;
-        }
+        self.config = config;
     }
+
+    /// No-op without the migration feature (AffinityConfig is `()` there).
+    #[cfg(not(feature = "migration"))]
+    pub fn set_affinity_config(&mut self, _config: AffinityConfig) {}
 
     /// Register the known cluster topology (bootstrap list + warm spares). The
     /// partitioner treats every known cluster as an available partition even when
