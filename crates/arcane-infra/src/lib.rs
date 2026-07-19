@@ -44,6 +44,8 @@ pub mod ws_server;
 pub mod rapier_cluster;
 
 #[cfg(feature = "migration")]
+pub mod forwarded_inputs;
+#[cfg(feature = "migration")]
 pub mod manager_runtime;
 #[cfg(feature = "migration")]
 pub mod node_inbox;

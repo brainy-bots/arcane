@@ -5,14 +5,17 @@
 //! - `--phase static` (default): N static players join round-robin; verdict
 //!   checks attribution, observer consistency, no flips (pinned), position
 //!   continuity, and update cadence.
-//! - `--phase migrate`: run against the PINNED stack (`hl_stack.bat`, default).
-//!   Players 0 and 1 walk to a common point, then DISCONNECT on arrival. While
-//!   connected they are pinned (this harness demonstrated why that is
-//!   mandatory: flipping a connected entity SPLITS it — the old owner keeps a
-//!   live copy fed by the client while the new owner holds a frozen adopted
-//!   copy; the CLUSTER_REASSIGN design gap). After disconnect the pin liveness
-//!   window expires, the entities become plain server-side state, and the
-//!   manager must co-locate the pair cleanly.
+//! - `--phase migrate`: players 0 and 1 walk to a common point and STAY
+//!   CONNECTED (default since D1). Run against the UNPINNED stack
+//!   (`hl_stack.bat nopin`): the manager migrates the connected pair to
+//!   co-locate it, and the D1 forwarding invariant keeps them correct — the
+//!   old owner relays their inputs to the new owner instead of applying them
+//!   (before D1 this scenario reproducibly FAILED: the flip split the entity,
+//!   old owner fed by the client's WS echo vs new owner simulating the
+//!   adopted copy, observers permanently disagreeing).
+//!   `--disconnect-at-target` restores the legacy workaround behavior
+//!   (players disconnect on arrival so the pin liveness window expires and
+//!   entities migrate as plain server-side state — for the PINNED stack).
 //!   Verdict additionally checks: the pair ends on the SAME cluster, at least
 //!   one attribution flip occurred, and every flip was position-continuous.
 //!
@@ -49,6 +52,10 @@ struct Args {
     max_jump: f64,
     max_gap_ms: u64,
     phase: Phase,
+    /// Legacy workaround mode for the PINNED stack: converging players
+    /// disconnect on arrival so their entities migrate as server-side state.
+    /// Default false since D1 (forwarding keeps CONNECTED players correct).
+    disconnect_at_target: bool,
 }
 
 fn parse_args() -> Args {
@@ -59,6 +66,7 @@ fn parse_args() -> Args {
     let mut max_jump = 500.0f64;
     let mut max_gap_ms = 2000u64;
     let mut phase = Phase::Static;
+    let mut disconnect_at_target = false;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -102,6 +110,10 @@ fn parse_args() -> Args {
                 };
                 i += 2;
             }
+            "--disconnect-at-target" => {
+                disconnect_at_target = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -120,6 +132,7 @@ fn parse_args() -> Args {
         max_jump,
         max_gap_ms,
         phase,
+        disconnect_at_target,
     }
 }
 
@@ -239,11 +252,10 @@ struct PlayerSpec {
     /// Walk toward this point at `speed` server-units/sec (None = static).
     target: Option<(f64, f64)>,
     speed: f64,
-    /// Migrate phase: stop sending and close the socket on reaching the
-    /// target. A live client connection re-claims its entity on the join
-    /// cluster every update, fighting ownership flips (the CLUSTER_REASSIGN
-    /// gap this harness demonstrated); a disconnected entity is server-side
-    /// state and migrates cleanly.
+    /// Legacy pinned-stack mode: stop sending and close the socket on
+    /// reaching the target so the entity becomes plain server-side state.
+    /// Default (false) since D1: the player STAYS CONNECTED through the
+    /// flip and the forwarding invariant keeps it single-writer correct.
     disconnect_at_target: bool,
 }
 
@@ -369,20 +381,19 @@ fn main() {
                 spawn: (100.0, 100.0),
                 target: Some(convergence),
                 speed: 60.0,
-                disconnect_at_target: true,
+                disconnect_at_target: args.disconnect_at_target,
             },
             (Phase::Migrate, 1) => PlayerSpec {
                 idx: i,
                 spawn: (3000.0, 3000.0),
                 target: Some(convergence),
                 speed: 60.0,
-                disconnect_at_target: true,
+                disconnect_at_target: args.disconnect_at_target,
             },
             (Phase::Migrate, _) => PlayerSpec {
                 // Static bystanders live in far corners, away from the
                 // convergence point: no proximity edges, no partition
-                // pressure, no reason to migrate (their live connections
-                // would fight any flip — the CLUSTER_REASSIGN gap).
+                // pressure, no reason to migrate.
                 idx: i,
                 spawn: (5000.0 + 800.0 * i as f64, 200.0),
                 target: None,

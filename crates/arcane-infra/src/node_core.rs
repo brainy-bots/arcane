@@ -54,6 +54,10 @@ use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
+#[cfg(feature = "migration")]
+use crate::forwarded_inputs::{
+    spawn_forwarded_inputs_subscriber, ForwardedInputBatch, ForwardedInputsPublisher,
+};
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
 #[cfg(feature = "migration")]
@@ -277,6 +281,23 @@ pub struct NodeCore {
     /// entity -> last tick a client update arrived for it (pin liveness window).
     #[cfg(feature = "migration")]
     client_driven_last_seen: HashMap<Uuid, u64>,
+    /// D1 forwarding invariant (epic #287): inbound channel for input batches
+    /// relayed by non-owner nodes. Drained in `drain_inputs` WITHOUT the
+    /// forwarding check (loop safety: apply-if-owned or drop-and-count).
+    #[cfg(feature = "migration")]
+    forwarded_rx: Option<std::sync::mpsc::Receiver<ForwardedInputBatch>>,
+    /// Publisher relaying inputs for entities another cluster owns.
+    #[cfg(feature = "migration")]
+    forwarded_publisher: Option<ForwardedInputsPublisher>,
+    /// Per-drain scratch: target cluster -> batch under construction. Kept on
+    /// self to reuse allocations; always drained by the end of `drain_inputs`.
+    #[cfg(feature = "migration")]
+    forward_scratch: HashMap<Uuid, ForwardedInputBatch>,
+    /// Kill switch for A/B verification (`ARCANE_INPUT_FORWARDING=off`).
+    /// Forwarding is a correctness invariant and defaults ON; the switch
+    /// exists so the migration harness can demonstrate the failure mode.
+    #[cfg(feature = "migration")]
+    forwarding_enabled: bool,
 }
 
 impl NodeCore {
@@ -402,6 +423,34 @@ impl NodeCore {
             }
         });
 
+        // D1 forwarding invariant (epic #287). Defaults ON: it is a correctness
+        // property, not an optimization. `ARCANE_INPUT_FORWARDING=off` exists
+        // only so the harness can demonstrate the split-brain failure mode.
+        #[cfg(feature = "migration")]
+        let forwarding_enabled = !matches!(
+            std::env::var("ARCANE_INPUT_FORWARDING").as_deref(),
+            Ok("off") | Ok("0") | Ok("false")
+        );
+        #[cfg(feature = "migration")]
+        let (forwarded_rx, forwarded_publisher) = if forwarding_enabled {
+            let (fwd_tx, fwd_rx) = std::sync::mpsc::channel();
+            spawn_forwarded_inputs_subscriber(cfg.redis_url.clone(), cfg.cluster_id, fwd_tx);
+            let publisher = match ForwardedInputsPublisher::new(&cfg.redis_url) {
+                Ok(p) => {
+                    eprintln!("input forwarding enabled (arcane:fwd_inputs:{})", cfg.cluster_id);
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("input forwarding publisher init failed ({e}); non-owned inputs will be dropped");
+                    None
+                }
+            };
+            (Some(fwd_rx), publisher)
+        } else {
+            eprintln!("input forwarding DISABLED (ARCANE_INPUT_FORWARDING=off) — split-brain demo mode");
+            (None, None)
+        };
+
         Ok(Self {
             server,
             state_tx,
@@ -431,6 +480,14 @@ impl NodeCore {
             pin_feature,
             #[cfg(feature = "migration")]
             client_driven_last_seen: HashMap::new(),
+            #[cfg(feature = "migration")]
+            forwarded_rx,
+            #[cfg(feature = "migration")]
+            forwarded_publisher,
+            #[cfg(feature = "migration")]
+            forward_scratch: HashMap::new(),
+            #[cfg(feature = "migration")]
+            forwarding_enabled,
         })
     }
 
@@ -477,16 +534,118 @@ impl NodeCore {
         #[cfg(feature = "migration")]
         out.lost_entities.clear();
 
+        // Client updates: D1 forwarding invariant (epic #287). An input for an
+        // entity ANOTHER cluster owns is relayed to that owner instead of being
+        // applied here — the non-owner never writes it. `owner_of == None` is
+        // the new-spawn path (first-sight claiming in `submit_entities`), which
+        // must stay local. Loop safety: forwarded inputs arrive on a separate
+        // channel drained below WITHOUT this check.
+        #[cfg(feature = "migration")]
         while let Ok(entry) = self.client_updates_rx.try_recv() {
-            #[cfg(feature = "migration")]
+            if let Some(owner) = forward_target(
+                &self.ownership,
+                self.cluster_id,
+                entry.entity_id,
+                self.forwarding_enabled,
+            ) {
+                self.forward_scratch
+                    .entry(owner)
+                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                    .updates
+                    .push(entry);
+                continue;
+            }
             if self.pin_feature.is_some() {
                 self.client_driven_last_seen
                     .insert(entry.entity_id, self.tick_count);
             }
             out.client_updates.push(entry);
         }
+        #[cfg(not(feature = "migration"))]
+        while let Ok(entry) = self.client_updates_rx.try_recv() {
+            out.client_updates.push(entry);
+        }
+        #[cfg(feature = "migration")]
+        while let Ok(action) = self.game_actions_rx.try_recv() {
+            if let Some(owner) = forward_target(
+                &self.ownership,
+                self.cluster_id,
+                action.entity_id,
+                self.forwarding_enabled,
+            ) {
+                self.forward_scratch
+                    .entry(owner)
+                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                    .actions
+                    .push(action);
+                continue;
+            }
+            out.game_actions.push(action);
+        }
+        #[cfg(not(feature = "migration"))]
         while let Ok(action) = self.game_actions_rx.try_recv() {
             out.game_actions.push(action);
+        }
+        // Inbound forwarded batches: apply-if-owned, else drop and count.
+        // NEVER re-forward (structural loop safety: at most one hop per input;
+        // if ownership moved again mid-flight, the client's next input —
+        // arriving at 10-20Hz — forwards to the right place).
+        #[cfg(feature = "migration")]
+        if let Some(ref fwd_rx) = self.forwarded_rx {
+            while let Ok(batch) = fwd_rx.try_recv() {
+                for entry in batch.updates {
+                    if self.ownership.owns(entry.entity_id, self.cluster_id) {
+                        // A forwarded update is a live client session driving this
+                        // entity: pin liveness follows the SESSION, wherever the
+                        // ingress node is.
+                        if self.pin_feature.is_some() {
+                            self.client_driven_last_seen
+                                .insert(entry.entity_id, self.tick_count);
+                        }
+                        self.stats
+                            .fwd_inputs_applied
+                            .fetch_add(1, Ordering::Relaxed);
+                        out.client_updates.push(entry);
+                    } else {
+                        self.stats
+                            .fwd_inputs_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                for action in batch.actions {
+                    if self.ownership.owns(action.entity_id, self.cluster_id) {
+                        self.stats
+                            .fwd_inputs_applied
+                            .fetch_add(1, Ordering::Relaxed);
+                        out.game_actions.push(action);
+                    } else {
+                        self.stats
+                            .fwd_inputs_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        // Flush this drain's forward batches (one publish per target cluster).
+        #[cfg(feature = "migration")]
+        if !self.forward_scratch.is_empty() {
+            if let Some(ref publisher) = self.forwarded_publisher {
+                for (target, batch) in self.forward_scratch.drain() {
+                    let n = (batch.updates.len() + batch.actions.len()) as u64;
+                    if publisher.forward(target, batch).is_ok() {
+                        self.stats.fwd_inputs_relayed.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                // Publisher unavailable: dropping is still more correct than
+                // applying as a second writer.
+                let n: u64 = self
+                    .forward_scratch
+                    .drain()
+                    .map(|(_, b)| (b.updates.len() + b.actions.len()) as u64)
+                    .sum();
+                self.stats.fwd_inputs_dropped.fetch_add(n, Ordering::Relaxed);
+            }
         }
         while let Ok(delta) = self.neighbor_rx.try_recv() {
             for entry in delta.updated {
@@ -748,6 +907,30 @@ impl NodeCore {
     }
 }
 
+/// D1 forwarding invariant (epic #287): decide where an inbound client input
+/// for `entity_id` must go.
+///
+/// - `None` — apply locally. Either we own the entity, or NO owner is recorded
+///   anywhere (the new-spawn path: first-sight claiming in `submit_entities`
+///   must see the entry locally to claim it), or forwarding is disabled.
+/// - `Some(owner)` — another cluster owns the entity; relay the input there and
+///   do NOT apply it locally (the non-owner never writes: single-writer
+///   ownership is what the whole migration executor guarantees).
+#[cfg(feature = "migration")]
+pub fn forward_target(
+    ownership: &OwnershipMap,
+    my_cluster: Uuid,
+    entity_id: Uuid,
+    forwarding_enabled: bool,
+) -> Option<Uuid> {
+    if !forwarding_enabled {
+        return None;
+    }
+    match ownership.owner_of(entity_id) {
+        Some(owner) if owner != my_cluster => Some(owner),
+        _ => None,
+    }
+}
 /// Decide whether this node should write (author) an entity this tick.
 ///
 /// Used by the ownership migration boundary to gate which cluster writes each entity.
@@ -801,6 +984,76 @@ pub fn merge_with_neighbor_latest(
     }
 }
 
+#[cfg(test)]
+#[cfg(feature = "migration")]
+mod forwarding_tests {
+    //! D1 forwarding invariant (epic #287) — pure routing decision tests.
+    //! The un-fakeable end-to-end proof is the migration harness
+    //! (`examples/migration_observer.rs --phase migrate`, unpinned stack):
+    //! without forwarding it reproducibly fails with observer disagreement.
+    use super::forward_target;
+    use crate::ownership_migration::OwnershipMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn owned_entity_applies_locally() {
+        let me = Uuid::from_u128(1);
+        let e = Uuid::from_u128(10);
+        let map = OwnershipMap::new();
+        map.set_owner(e, me);
+        assert_eq!(forward_target(&map, me, e, true), None);
+    }
+
+    #[test]
+    fn unknown_entity_applies_locally_for_first_sight_claiming() {
+        // No recorded owner anywhere = new spawn. It MUST stay local so
+        // `submit_entities` first-sight claiming can run; forwarding it
+        // would orphan new spawns.
+        let me = Uuid::from_u128(1);
+        let e = Uuid::from_u128(10);
+        let map = OwnershipMap::new();
+        assert_eq!(forward_target(&map, me, e, true), None);
+    }
+
+    #[test]
+    fn foreign_owned_entity_forwards_to_owner() {
+        // The invariant itself: the non-owner never applies, it relays.
+        let me = Uuid::from_u128(1);
+        let owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let map = OwnershipMap::new();
+        map.set_owner(e, owner);
+        assert_eq!(forward_target(&map, me, e, true), Some(owner));
+    }
+
+    #[test]
+    fn kill_switch_disables_forwarding() {
+        // ARCANE_INPUT_FORWARDING=off (harness split-brain demo mode):
+        // behave exactly like the pre-D1 node.
+        let me = Uuid::from_u128(1);
+        let owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let map = OwnershipMap::new();
+        map.set_owner(e, owner);
+        assert_eq!(forward_target(&map, me, e, false), None);
+    }
+
+    #[test]
+    fn ownership_flip_reroutes_next_input() {
+        // Before the flip inputs apply locally; after it they forward.
+        // This is the exact sequence a migrating connected player produces.
+        let me = Uuid::from_u128(1);
+        let new_owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let map = OwnershipMap::new();
+        map.set_owner(e, me);
+        assert_eq!(forward_target(&map, me, e, true), None);
+        map.set_owner(e, new_owner); // the flip
+        assert_eq!(forward_target(&map, me, e, true), Some(new_owner));
+        map.set_owner(e, me); // flip back (e.g. re-migration)
+        assert_eq!(forward_target(&map, me, e, true), None);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::merge_with_neighbor_latest;
