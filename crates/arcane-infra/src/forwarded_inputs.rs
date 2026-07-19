@@ -39,6 +39,31 @@ use uuid::Uuid;
 
 const FWD_INPUTS_TOPIC_PREFIX: &str = "arcane:fwd_inputs";
 
+/// One forwarded PLAYER_STATE update. `EntityStateEntry.client_seq` is
+/// `#[serde(skip)]` (out-of-band, never meant for the replication paths),
+/// so the relay carries it EXPLICITLY — otherwise forwarded inputs would
+/// arrive at the owner with seq 0 and break round-trip latency measurement
+/// for exactly the players that migrated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForwardedUpdate {
+    pub entry: EntityStateEntry,
+    pub client_seq: u64,
+}
+
+impl ForwardedUpdate {
+    /// Capture the seq from the entry before serde strips it.
+    pub fn new(entry: EntityStateEntry) -> Self {
+        let client_seq = entry.client_seq;
+        Self { entry, client_seq }
+    }
+
+    /// Restore the seq onto the entry after deserialization.
+    pub fn into_entry(mut self) -> EntityStateEntry {
+        self.entry.client_seq = self.client_seq;
+        self.entry
+    }
+}
+
 /// One batch of client inputs relayed from a non-owner node to the owner.
 /// Batched per drain pass (one publish per target cluster per tick, not per
 /// input) to keep the Redis hot path proportional to clusters, not clients.
@@ -47,7 +72,7 @@ pub struct ForwardedInputBatch {
     /// The node that received the inputs from the client and relayed them.
     pub source_cluster_id: Uuid,
     /// PLAYER_STATE entries for entities the source does not own.
-    pub updates: Vec<EntityStateEntry>,
+    pub updates: Vec<ForwardedUpdate>,
     /// GAME_ACTION entries for entities the source does not own.
     pub actions: Vec<GameAction>,
 }
@@ -196,11 +221,24 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_update_preserves_client_seq_through_json() {
+        // EntityStateEntry.client_seq is #[serde(skip)]; the relay must
+        // carry it out-of-band or latency measurement silently breaks for
+        // migrated players. This is the regression test for that bug.
+        let mut e = entry(Uuid::new_v4());
+        e.client_seq = 4242;
+        let fwd = ForwardedUpdate::new(e);
+        let json = serde_json::to_string(&fwd).unwrap();
+        let back: ForwardedUpdate = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.into_entry().client_seq, 4242);
+    }
+
+    #[test]
     fn batch_roundtrips_through_json() {
         let src = Uuid::new_v4();
         let eid = Uuid::new_v4();
         let mut batch = ForwardedInputBatch::new(src);
-        batch.updates.push(entry(eid));
+        batch.updates.push(ForwardedUpdate::new(entry(eid)));
         batch.actions.push(GameAction {
             entity_id: eid,
             action_type: "cast_spell".into(),
@@ -211,7 +249,7 @@ mod tests {
         let back: ForwardedInputBatch = serde_json::from_str(&json).unwrap();
         assert_eq!(back.source_cluster_id, src);
         assert_eq!(back.updates.len(), 1);
-        assert_eq!(back.updates[0].entity_id, eid);
+        assert_eq!(back.updates[0].entry.entity_id, eid);
         assert_eq!(back.actions.len(), 1);
         assert_eq!(back.actions[0].action_type, "cast_spell");
     }
@@ -232,7 +270,7 @@ mod tests {
             Err(_) => return, // Client::open rejected the URL — acceptable
         };
         let mut batch = ForwardedInputBatch::new(Uuid::new_v4());
-        batch.updates.push(entry(Uuid::new_v4()));
+        batch.updates.push(ForwardedUpdate::new(entry(Uuid::new_v4())));
         let started = std::time::Instant::now();
         publisher.forward(Uuid::new_v4(), batch).unwrap();
         assert!(

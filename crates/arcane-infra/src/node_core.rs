@@ -57,6 +57,7 @@ use uuid::Uuid;
 #[cfg(feature = "migration")]
 use crate::forwarded_inputs::{
     spawn_forwarded_inputs_subscriber, ForwardedInputBatch, ForwardedInputsPublisher,
+    ForwardedUpdate,
 };
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
@@ -301,6 +302,7 @@ pub struct NodeCore {
     /// D2 (epic #287): sender for RECONNECT redirect hints into the WS
     /// server. Always present (the channel is created in `new`); only the
     /// migration path produces directives.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     reconnect_hint_tx: std::sync::mpsc::Sender<crate::ws_server::ReconnectDirective>,
     /// L0 address book: cluster_id -> client-facing ws URL, parsed from
     /// `NODE_CLUSTER_ADDRS` ("uuid:host:port,..."). Empty = no RECONNECT
@@ -603,7 +605,7 @@ impl NodeCore {
                     .entry(owner)
                     .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
                     .updates
-                    .push(entry);
+                    .push(ForwardedUpdate::new(entry));
                 // D2: while we are forwarding this entity, periodically hint
                 // its client to reconnect to the owner directly. Best-effort
                 // and throttled; D1 keeps the client correct either way.
@@ -648,7 +650,8 @@ impl NodeCore {
         #[cfg(feature = "migration")]
         if let Some(ref fwd_rx) = self.forwarded_rx {
             while let Ok(batch) = fwd_rx.try_recv() {
-                for entry in batch.updates {
+                for fwd in batch.updates {
+                    let entry = fwd.into_entry();
                     if self.ownership.owns(entry.entity_id, self.cluster_id) {
                         // A forwarded update is a live client session driving this
                         // entity: pin liveness follows the SESSION, wherever the
@@ -893,6 +896,15 @@ impl NodeCore {
                     let cutoff = self.tick_count.saturating_sub(PIN_LIVENESS_TICKS);
                     self.client_driven_last_seen
                         .retain(|_, last| *last >= cutoff);
+                }
+                // D2 hint throttle records: drop entries idle for 10x the
+                // hint interval (entity stopped being forwarded — client
+                // moved or disconnected). Bounds the map by live forwarded
+                // entities instead of every entity ever forwarded.
+                {
+                    let hint_cutoff = self.tick_count.saturating_sub(600);
+                    self.reconnect_last_hint
+                        .retain(|_, last| *last >= hint_cutoff);
                 }
                 let snapshot = self.server.snapshot();
                 let entities: Vec<arcane_affinity::feature_map::EntityRecord> = snapshot
