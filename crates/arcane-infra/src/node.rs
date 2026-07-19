@@ -104,6 +104,27 @@ impl ArcaneNode {
             .push(entity_id);
     }
 
+    /// Drop an entity from local state WITHOUT emitting a client-facing removal.
+    ///
+    /// Ownership-loss path (§8): when a flip moves an entity to another cluster,
+    /// the entity still EXISTS — the new owner simulates it and this node keeps
+    /// representing it as a replicated proxy. Broadcasting `removed` would tell
+    /// clients to delete a live entity. But leaving the stale authoritative copy
+    /// in the map is worse: every resync tick rebroadcasts it with the OLD
+    /// cluster_id, and local-wins merge lets it shadow the fresh proxy — the
+    /// migration harness observed exactly this as ~1Hz attribution flapping
+    /// (old/new owner alternating at the resync cadence) after every flip.
+    pub fn purge_entity(&self, entity_id: Uuid) {
+        self.entities
+            .lock()
+            .expect("entities lock")
+            .remove(&entity_id);
+        self.last_broadcast_velocity
+            .lock()
+            .expect("last_broadcast_velocity lock")
+            .remove(&entity_id);
+    }
+
     /// Runs custom simulation with exclusive access to the local entity map, then applies any
     /// [`ClusterTickContext::pending_removals`]. Call immediately before [`ArcaneNode::tick`].
     /// `upcoming_tick` must match the tick index the next `tick()` will assign (`current_tick() + 1`

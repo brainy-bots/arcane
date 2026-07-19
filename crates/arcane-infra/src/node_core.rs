@@ -680,6 +680,13 @@ impl NodeCore {
                 // §8 adoption: hand gained entities to the driver so it starts
                 // simulating them from their replicated state.
                 out.adopted_entities.extend(report.adopted);
+                for id in &report.lost {
+                    // Purge the stale authoritative copy WITHOUT a client-facing
+                    // removal (the entity lives on, owned elsewhere). Leaving it
+                    // would rebroadcast the old cluster_id every resync tick and
+                    // flap observer attribution (seen in the migration harness).
+                    self.server.purge_entity(*id);
+                }
                 out.lost_entities.extend(report.lost);
             }
         }
