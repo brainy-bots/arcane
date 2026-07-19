@@ -256,6 +256,21 @@ fn assemble_outbound_frame(tick: &PreEncodedTick, mask: Option<&[bool]>) -> Vec<
     arcane_wire::encode_server_delta_from_chunks(&tick.header, &chunk_refs, &tick.removed)
 }
 
+/// Server-initiated redirect for one entity's driving client (D2, epic #287,
+/// Session Relay L0). Produced by `NodeCore` when it is FORWARDING an
+/// entity's inputs to another owner (the client is connected to the wrong
+/// node); consumed by the WS server, which sends a `ServerFrame::Reconnect`
+/// to the subscriber whose avatar is that entity. Delivery is best-effort:
+/// the producer resends periodically while forwarding persists, and the D1
+/// forwarding invariant keeps the client correct until (and unless) it acts.
+#[derive(Clone, Debug)]
+pub struct ReconnectDirective {
+    pub entity_id: Uuid,
+    /// WebSocket URL of the owning node.
+    pub addr: String,
+    /// Opaque resume token (L0: the entity UUID string).
+    pub token: String,
+}
 /// Route a binary client frame to the cluster-internal message channel.
 enum ClientMessageOutcome {
     Delivered,
@@ -410,6 +425,8 @@ pub fn run_ws_server(
     // every subscriber (L0-off). Some(f) = each subscriber receives only the entities f admits for
     // its observer position, computed in the producer at the throttled recompute cadence.
     visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
+    // D2 (epic #287): RECONNECT redirect directives from the node core.
+    reconnect_rx: Receiver<ReconnectDirective>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -433,6 +450,7 @@ pub fn run_ws_server(
             game_actions_tx,
             stats,
             visibility_filter,
+            reconnect_rx,
         ));
     });
 }
@@ -447,6 +465,7 @@ async fn ws_loop(
     game_actions_tx: Sender<GameAction>,
     stats: Arc<NodeStats>,
     visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
+    reconnect_rx: Receiver<ReconnectDirective>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity FlatBuffer chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
@@ -517,6 +536,27 @@ async fn ws_loop(
         }
     });
 
+    // D2 redirect directives: bridge the std channel into a tokio broadcast
+    // so every subscriber task can filter for its own avatar. Small cap —
+    // directives are rare and periodically resent, so loss is harmless.
+    let (reconnect_btx, _) = tokio::sync::broadcast::channel::<Arc<ReconnectDirective>>(64);
+    let reconnect_btx = Arc::new(reconnect_btx);
+    let rbtx = reconnect_btx.clone();
+    let rrx = Arc::new(std::sync::Mutex::new(reconnect_rx));
+    tokio::spawn(async move {
+        loop {
+            let r = rrx.clone();
+            let d = tokio::task::spawn_blocking(move || r.lock().unwrap().recv())
+                .await
+                .unwrap();
+            match d {
+                Ok(d) => {
+                    let _ = rbtx.send(Arc::new(d));
+                }
+                Err(_) => break, // producer dropped (e.g. non-migration build)
+            }
+        }
+    });
     loop {
         let (stream, peer_addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -546,6 +586,7 @@ async fn ws_loop(
         let subscriber_id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
 
         let mut recv = broadcast_tx.subscribe();
+        let mut reconnect_recv = reconnect_btx.subscribe();
         let updates_tx = client_updates_tx.clone();
         let actions_tx = game_actions_tx.clone();
         let stats = stats.clone();
@@ -597,6 +638,33 @@ async fn ws_loop(
                                     break;
                                 }
                             },
+                        }
+                    }
+                    rc = reconnect_recv.recv() => {
+                        // Redirect hint for OUR avatar only. Lagged/closed are
+                        // ignorable: directives are periodically resent while
+                        // forwarding persists, and D1 keeps the client correct
+                        // regardless of whether this frame arrives.
+                        if let Ok(directive) = rc {
+                            let is_mine = avatars
+                                .get(&subscriber_id)
+                                .map(|v| *v == Some(directive.entity_id))
+                                .unwrap_or(false);
+                            if is_mine {
+                                let frame = arcane_wire::ServerFrame::Reconnect(arcane_wire::ReconnectPayload {
+                                    addr: directive.addr.clone(),
+                                    token: directive.token.clone(),
+                                    entity_id: directive.entity_id,
+                                });
+                                let bytes = arcane_wire::encode_server(&frame);
+                                let len = bytes.len() as u64;
+                                if ws_stream.send(Message::Binary(bytes)).await.is_err() {
+                                    stats.ws_send_errors.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                                stats.bytes_out.fetch_add(len, Ordering::Relaxed);
+                                stats.reconnects_sent.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     msg = ws_stream.next() => {
@@ -705,7 +773,9 @@ mod tests {
         // Decoded frames carry exactly the visible subset.
         let decode = |sub: u64| {
             let bytes = assemble_outbound_frame(&pre_tick, Some(&masks[&sub]));
-            let ServerFrame::Delta(p) = arcane_wire::decode_server(&bytes).expect("decode");
+            let ServerFrame::Delta(p) = arcane_wire::decode_server(&bytes).expect("decode") else {
+            panic!("expected Delta frame");
+        };
             p.updated
                 .into_iter()
                 .map(|e| e.entity_id)
@@ -912,7 +982,9 @@ mod tests {
 
         let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
 
         assert_eq!(payload.source_cluster_id, delta.source_cluster_id);
         assert_eq!(payload.seq, 7);
@@ -944,7 +1016,9 @@ mod tests {
         let pre_tick = pre_encode_tick(&delta);
         let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert!(payload.updated.is_empty());
         assert!(payload.removed.is_empty());
     }
@@ -1079,7 +1153,9 @@ mod tests {
         // serial encode would have produced.
         let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         for (i, e) in payload.updated.iter().enumerate() {
             assert_eq!(e.entity_id, entities[i].entity_id);
         }
@@ -1204,7 +1280,9 @@ mod tests {
         // Decode the filtered frame
         let decoded_filtered =
             arcane_wire::decode_server(&bytes_filtered).expect("decode filtered");
-        let ServerFrame::Delta(payload) = decoded_filtered;
+        let ServerFrame::Delta(payload) = decoded_filtered else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 2);
         assert_eq!(payload.updated[0].entity_id, Uuid::from_u128(1));
         assert_eq!(payload.updated[1].entity_id, Uuid::from_u128(2));
@@ -1252,7 +1330,9 @@ mod tests {
         // Decode the unfiltered frame
         let decoded_unfiltered =
             arcane_wire::decode_server(&bytes_unfiltered).expect("decode unfiltered");
-        let ServerFrame::Delta(payload) = decoded_unfiltered;
+        let ServerFrame::Delta(payload) = decoded_unfiltered else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 3);
         assert_eq!(payload.updated[0].entity_id, Uuid::from_u128(1));
         assert_eq!(payload.updated[1].entity_id, Uuid::from_u128(2));

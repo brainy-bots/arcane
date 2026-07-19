@@ -298,6 +298,19 @@ pub struct NodeCore {
     /// exists so the migration harness can demonstrate the failure mode.
     #[cfg(feature = "migration")]
     forwarding_enabled: bool,
+    /// D2 (epic #287): sender for RECONNECT redirect hints into the WS
+    /// server. Always present (the channel is created in `new`); only the
+    /// migration path produces directives.
+    reconnect_hint_tx: std::sync::mpsc::Sender<crate::ws_server::ReconnectDirective>,
+    /// L0 address book: cluster_id -> client-facing ws URL, parsed from
+    /// `NODE_CLUSTER_ADDRS` ("uuid:host:port,..."). Empty = no RECONNECT
+    /// hints are ever sent (forwarding alone keeps clients correct).
+    #[cfg(feature = "migration")]
+    cluster_addrs: HashMap<Uuid, String>,
+    /// entity -> last tick a RECONNECT hint was sent (throttle; hints are
+    /// resent while forwarding persists so a dropped frame self-heals).
+    #[cfg(feature = "migration")]
+    reconnect_last_hint: HashMap<Uuid, u64>,
 }
 
 impl NodeCore {
@@ -351,6 +364,10 @@ impl NodeCore {
                     as std::sync::Arc<dyn arcane_core::visibility::IVisibilityFilter>
             });
 
+        // D2 (epic #287): RECONNECT hint channel into the WS server. The
+        // rx side lives in the subscriber loop; this core holds the tx and
+        // produces directives from the forwarding path (migration only).
+        let (reconnect_hint_tx, reconnect_hint_rx) = std::sync::mpsc::channel();
         crate::ws_server::run_ws_server(
             cfg.ws_port,
             state_rx,
@@ -358,6 +375,7 @@ impl NodeCore {
             game_actions_tx,
             stats.clone(),
             visibility_filter,
+            reconnect_hint_rx,
         );
 
         let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
@@ -451,6 +469,33 @@ impl NodeCore {
             (None, None)
         };
 
+        // D2 (epic #287): L0 address book for RECONNECT hints. Same entry
+        // format as MANAGER_CLUSTERS ("uuid:host:port,..."). Optional: with
+        // no address book the node simply never hints — D1 forwarding keeps
+        // clients correct on the longer path.
+        #[cfg(feature = "migration")]
+        let cluster_addrs: HashMap<Uuid, String> = std::env::var("NODE_CLUSTER_ADDRS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|entry| {
+                        let mut it = entry.trim().splitn(3, ':');
+                        let id = Uuid::parse_str(it.next()?).ok()?;
+                        let host = it.next()?;
+                        let port = it.next()?;
+                        Some((id, format!("ws://{host}:{port}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "migration")]
+        if !cluster_addrs.is_empty() {
+            eprintln!(
+                "reconnect hints enabled: {} cluster addrs (NODE_CLUSTER_ADDRS)",
+                cluster_addrs.len()
+            );
+        }
+
         Ok(Self {
             server,
             state_tx,
@@ -488,6 +533,11 @@ impl NodeCore {
             forward_scratch: HashMap::new(),
             #[cfg(feature = "migration")]
             forwarding_enabled,
+            reconnect_hint_tx,
+            #[cfg(feature = "migration")]
+            cluster_addrs,
+            #[cfg(feature = "migration")]
+            reconnect_last_hint: HashMap::new(),
         })
     }
 
@@ -548,11 +598,16 @@ impl NodeCore {
                 entry.entity_id,
                 self.forwarding_enabled,
             ) {
+                let entity_id = entry.entity_id;
                 self.forward_scratch
                     .entry(owner)
                     .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
                     .updates
                     .push(entry);
+                // D2: while we are forwarding this entity, periodically hint
+                // its client to reconnect to the owner directly. Best-effort
+                // and throttled; D1 keeps the client correct either way.
+                self.maybe_send_reconnect_hint(entity_id, owner);
                 continue;
             }
             if self.pin_feature.is_some() {
@@ -709,6 +764,34 @@ impl NodeCore {
         out.neighbor_entities.clone_from(&self.neighbor_entities);
     }
 
+    /// D2 (epic #287): send a throttled RECONNECT hint for a forwarded
+    /// entity. No-ops when the owner has no address-book entry. Interval:
+    /// `RECONNECT_HINT_INTERVAL_TICKS` — resending while forwarding
+    /// persists makes delivery self-healing (a lost frame is re-sent; a
+    /// client that already moved stops triggering forwarding, which stops
+    /// the hints).
+    #[cfg(feature = "migration")]
+    fn maybe_send_reconnect_hint(&mut self, entity_id: Uuid, owner: Uuid) {
+        const RECONNECT_HINT_INTERVAL_TICKS: u64 = 60;
+        let Some(addr) = self.cluster_addrs.get(&owner) else {
+            return;
+        };
+        let due = match self.reconnect_last_hint.get(&entity_id) {
+            Some(last) => self.tick_count.saturating_sub(*last) >= RECONNECT_HINT_INTERVAL_TICKS,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.reconnect_last_hint.insert(entity_id, self.tick_count);
+        let _ = self
+            .reconnect_hint_tx
+            .send(crate::ws_server::ReconnectDirective {
+                entity_id,
+                addr: addr.clone(),
+                token: entity_id.to_string(),
+            });
+    }
     /// Driver → core. Writes this tick's authoritative spine into the node map, preserving the
     /// old loop + add_entity semantics (stamp cluster_id, enforce max_entities), and records
     /// EXPLICIT removals (matches today's pending_removed → delta.removed one-shot semantics).

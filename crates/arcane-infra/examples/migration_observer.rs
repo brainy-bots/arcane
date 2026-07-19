@@ -187,6 +187,8 @@ struct EntityTrack {
 struct Shared {
     tracks: Mutex<HashMap<Uuid, EntityTrack>>,
     stop: AtomicBool,
+    /// D2: RECONNECT frames followed by players (make-before-break moves).
+    reconnects_followed: std::sync::atomic::AtomicU64,
 }
 
 fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
@@ -337,9 +339,24 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
                 let _ = socket.close(None);
                 break;
             }
-            // Drain any buffered inbound frames (non-blocking).
+            // Drain any buffered inbound frames (non-blocking). D2: a
+            // RECONNECT frame for OUR entity triggers a make-before-break
+            // move — connect to the new address, switch sends to it, then
+            // drop the old socket. Timing is uncritical (D1 forwarding
+            // keeps us correct while we switch), which is exactly what
+            // this code demonstrates by doing it lazily mid-loop.
+            let mut pending_redirect: Option<String> = None;
             loop {
                 match socket.read() {
+                    Ok(tungstenite::Message::Binary(bytes)) => {
+                        if let Ok(arcane_wire::ServerFrame::Reconnect(rc)) =
+                            arcane_wire::decode_server(&bytes)
+                        {
+                            if rc.entity_id == entity_id {
+                                pending_redirect = Some(rc.addr.clone());
+                            }
+                        }
+                    }
                     Ok(_) => continue,
                     Err(tungstenite::Error::Io(ref e))
                         if e.kind() == std::io::ErrorKind::WouldBlock =>
@@ -347,6 +364,27 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
                         break;
                     }
                     Err(_) => break,
+                }
+            }
+            if let Some(addr) = pending_redirect {
+                match tungstenite::connect(&addr) {
+                    Ok((mut new_socket, _)) => {
+                        if let tungstenite::stream::MaybeTlsStream::Plain(tcp) =
+                            new_socket.get_mut()
+                        {
+                            let _ = tcp.set_nonblocking(true);
+                        }
+                        // Make-before-break: new connection is live; close old.
+                        let old = std::mem::replace(&mut socket, new_socket);
+                        drop(old);
+                        shared
+                            .reconnects_followed
+                            .fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[player {idx}] followed RECONNECT to {addr}");
+                    }
+                    Err(e) => {
+                        eprintln!("[player {idx}] RECONNECT to {addr} failed: {e}; staying (forwarding keeps us correct)");
+                    }
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -360,6 +398,7 @@ fn main() {
     let shared = Arc::new(Shared {
         tracks: Mutex::new(HashMap::new()),
         stop: AtomicBool::new(false),
+        reconnects_followed: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Observers first (so they see players' first frames).
@@ -553,6 +592,19 @@ fn main() {
         } else {
             eprintln!("converging pair flips observed: {pair_flips}");
         }
+    }
+
+    // D2: in migrate phase with CONNECTED players, at least one player must
+    // have followed a RECONNECT to the new owner — proving the full loop:
+    // flip → forwarding → hint → make-before-break → direct path restored.
+    let reconnects = shared
+        .reconnects_followed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("reconnects followed: {reconnects}");
+    if args.phase == Phase::Migrate && !args.disconnect_at_target && reconnects == 0 {
+        failures.push(
+            "no player followed a RECONNECT hint — D2 redirect path not exercised".to_string(),
+        );
     }
 
     if failures.is_empty() {

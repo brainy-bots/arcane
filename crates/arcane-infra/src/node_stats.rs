@@ -64,6 +64,8 @@ pub struct NodeStats {
     /// Forwarded inputs received but dropped (ownership moved again mid-flight,
     /// or the forward publisher was unavailable at the source).
     pub fwd_inputs_dropped: AtomicU64,
+    /// D2 (epic #287): RECONNECT redirect hints actually sent to clients.
+    pub reconnects_sent: AtomicU64,
     /// Set of entity UUIDs ever observed in a parsed PLAYER_STATE message. The
     /// set is write-only at accept time and only its `len()` is exposed via /stats.
     /// This lets the harness distinguish "many messages share a few ids" from
@@ -112,7 +114,7 @@ impl NodeStats {
     /// so the harness's SSM/poll path is cheap.
     pub fn to_json(&self, cluster_id: &str) -> String {
         format!(
-            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"broadcast_lagged_frames":{},"ws_send_errors":{},"accept_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{},"fwd_inputs_relayed":{},"fwd_inputs_applied":{},"fwd_inputs_dropped":{}}}"#,
+            r#"{{"cluster_id":"{}","ws_accepts":{},"msgs_player_state":{},"msgs_game_action":{},"parse_failures":{},"bytes_in":{},"bytes_out":{},"broadcast_lagged_events":{},"broadcast_lagged_frames":{},"ws_send_errors":{},"accept_errors":{},"entities_current":{},"entities_peak":{},"unique_entity_ids_seen":{},"tick":{},"seq":{},"last_tick_us":{},"fwd_inputs_relayed":{},"fwd_inputs_applied":{},"fwd_inputs_dropped":{},"reconnects_sent":{}}}"#,
             cluster_id,
             self.ws_accepts.load(Ordering::Relaxed),
             self.msgs_player_state.load(Ordering::Relaxed),
@@ -133,6 +135,7 @@ impl NodeStats {
             self.fwd_inputs_relayed.load(Ordering::Relaxed),
             self.fwd_inputs_applied.load(Ordering::Relaxed),
             self.fwd_inputs_dropped.load(Ordering::Relaxed),
+            self.reconnects_sent.load(Ordering::Relaxed),
         )
     }
 }
