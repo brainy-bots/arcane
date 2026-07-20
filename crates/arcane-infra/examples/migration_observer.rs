@@ -69,6 +69,19 @@ enum Phase {
     /// the scaling win is quantified. (Run the same phase WITHOUT nolegacy
     /// to see every observer carrying all entities — the A/B baseline.)
     Attention,
+    /// Anticipatory replication probe: group A parked at (500,500), group B
+    /// at (3000,500), a lone far control at (3000,8000). After 30s one B
+    /// member (the TRAVELER, player 4) walks toward A at 50u/s. Run against
+    /// the NOLEGACY stack. Verdict, measured on A's host-cluster broadcast:
+    /// the traveler must appear BEFORE it arrives (first post-settle sighting
+    /// at distance > 60u from A, expect ~120-200u = screen radius minus
+    /// pipeline latency) and attributed to its FOREIGN owner at that moment —
+    /// proving the host was warmed with a proxy ahead of arrival, not shown
+    /// the entity after adoption. The far control must stay invisible on A's
+    /// host throughout: same "not my cluster" status, near-zero interaction
+    /// likelihood, opposite treatment. This is the attention POSITIVE case
+    /// (the `attention` phase proves the negative: no approach, no traffic).
+    Approach,
     /// Distance gradient: three PAIRS parked at increasing separation —
     /// close (~30u, inside proximity radius), mid (~400u), far (~4000u).
     /// Verdict: the close pair co-locates; the far pair NEVER does. Directly
@@ -142,6 +155,7 @@ fn parse_args() -> Args {
                     "defector" => Phase::Defector,
                     "gradient" => Phase::Gradient,
                     "attention" => Phase::Attention,
+                    "approach" => Phase::Approach,
                     other => {
                         eprintln!("unknown phase: {other}");
                         std::process::exit(2);
@@ -219,6 +233,10 @@ struct EntityTrack {
     latest: HashMap<usize, Observation>,
     /// (observer, from, to, position_delta, when) attribution changes.
     flips: Vec<(usize, Uuid, Uuid, f64, Instant)>,
+    /// First sighting per observer AFTER the settle cutoff (25s): when, at
+    /// what position, attributed to which cluster. The anticipation metric:
+    /// distance-at-first-late-sighting on the destination's host observer.
+    first_seen_late: HashMap<usize, (Instant, (f64, f64, f64), Uuid)>,
     max_jump_seen: f64,
     max_gap_ms_seen: u128,
 }
@@ -228,6 +246,8 @@ struct Shared {
     stop: AtomicBool,
     /// D2: RECONNECT frames followed by players (make-before-break moves).
     reconnects_followed: std::sync::atomic::AtomicU64,
+    /// Program start; observers use it for the post-settle window.
+    start: Instant,
 }
 
 fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
@@ -299,6 +319,13 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
                     }
                 }
             }
+                const SETTLE_CUTOFF_SECS: u64 = 25;
+                if now.duration_since(shared.start).as_secs() >= SETTLE_CUTOFF_SECS {
+                    track
+                        .first_seen_late
+                        .entry(idx)
+                        .or_insert((now, obs.position, obs.cluster_id));
+                }
                 track.latest.insert(idx, obs);
             }
         }
@@ -494,13 +521,37 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
     Some(entity_id)
 }
 
+/// Discover which cluster an observer's node hosts by querying its stats
+/// endpoint (ws port + 1). Gives verdicts a ground-truth observer->cluster
+/// map instead of guessing from attribution (under interest scoping, several
+/// observers legitimately broadcast the same entity).
+fn observer_cluster(ws_url: &str) -> Option<Uuid> {
+    let rest = ws_url.strip_prefix("ws://")?;
+    let (host, port) = rest.split_once(':')?;
+    let port: u16 = port.trim_end_matches('/').parse().ok()?;
+    let body = http_get(&format!("http://{}:{}/stats", host, port + 1)).ok()?;
+    let key = "\"cluster_id\":\"";
+    let start = body.find(key)? + key.len();
+    let end = body[start..].find('"')? + start;
+    Uuid::parse_str(&body[start..end]).ok()
+}
+
 fn main() {
     let args = parse_args();
     let shared = Arc::new(Shared {
         tracks: Mutex::new(HashMap::new()),
         stop: AtomicBool::new(false),
         reconnects_followed: std::sync::atomic::AtomicU64::new(0),
+        start: Instant::now(),
     });
+
+    // Ground-truth observer->cluster identity (from each node's /stats).
+    let obs_clusters: Vec<Option<Uuid>> = args
+        .clusters
+        .iter()
+        .map(|ws| observer_cluster(ws))
+        .collect();
+    eprintln!("observer clusters: {obs_clusters:?}");
 
     // Observers first (so they see players' first frames).
     for (idx, ws) in args.clusters.iter().enumerate() {
@@ -625,6 +676,31 @@ fn main() {
                     disconnect_at_target: false,
                 }
             }
+            (Phase::Approach, _) => {
+                // 0,1: group A. 2,3: group B (+ traveler 4 starts IN B so its
+                // initial owner is B's cluster, guaranteed by proximity
+                // edges). 5: lone far control. Traveler departs at 30s and
+                // approaches A at 50u/s (2500u ≈ 50s travel): slow enough
+                // that screen(200u) -> promote -> route -> broadcast happens
+                // well before proximity-radius arrival (50u).
+                let (spawn, waypoints): ((f64, f64), Vec<(f64, f64, f64)>) = match i {
+                    0 => ((500.0, 500.0), vec![]),
+                    1 => ((530.0, 500.0), vec![]),
+                    2 => ((3000.0, 500.0), vec![]),
+                    3 => ((3030.0, 500.0), vec![]),
+                    4 => ((3000.0, 530.0), vec![(30.0, 530.0, 530.0)]),
+                    _ => ((3000.0, 8000.0), vec![]),
+                };
+                PlayerSpec {
+                    idx: i,
+                    rejoin_on_failure: false,
+                    spawn,
+                    target: None,
+                    waypoints,
+                    speed: 50.0,
+                    disconnect_at_target: false,
+                }
+            }
             (Phase::Gradient, _) => {
                 // Three pairs at increasing separation. Pair k = players
                 // (2k, 2k+1). Bases far apart so pairs never interact.
@@ -717,7 +793,12 @@ fn main() {
         // transition owners mid-run while the partition is being discovered.
         let end_state_phase = matches!(
             args.phase,
-            Phase::Restart | Phase::Cluster | Phase::Defector | Phase::Gradient | Phase::Attention
+            Phase::Restart
+                | Phase::Cluster
+                | Phase::Defector
+                | Phase::Gradient
+                | Phase::Attention
+                | Phase::Approach
         );
         if owners.len() > 1 && !transitioning && !end_state_phase {
             failures.push(format!(
@@ -758,6 +839,7 @@ fn main() {
                     | Phase::Defector
                     | Phase::Gradient
                     | Phase::Attention
+                    | Phase::Approach
             )
         {
             // Restart phase: the kill window legitimately gaps; freshness is
@@ -959,6 +1041,117 @@ fn main() {
         );
     }
 
+    // ── Approach phase: ANTICIPATORY replication (attention positive case) ──
+    if args.phase == Phase::Approach {
+        assert!(args.players >= 6, "approach phase needs 6 players");
+        let a_center = (500.0f64, 500.0f64);
+        let final_window = Duration::from_secs(10);
+        let now = Instant::now();
+
+        // Owners from FRESH observations only (stale latest entries from the
+        // settling window would poison a whole-run majority vote).
+        let fresh_owner = |id: &Uuid| -> Option<Uuid> {
+            let t = tracks.get(id)?;
+            let mut counts: HashMap<Uuid, usize> = HashMap::new();
+            for o in t.latest.values() {
+                if now.duration_since(o.at) < final_window {
+                    *counts.entry(o.cluster_id).or_default() += 1;
+                }
+            }
+            counts.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+        };
+
+        let a_owner = fresh_owner(&player_entities[0]);
+        if a_owner.is_none() || a_owner != fresh_owner(&player_entities[1]) {
+            failures.push(format!(
+                "group A not co-located at end: {:?} vs {:?}",
+                a_owner,
+                fresh_owner(&player_entities[1])
+            ));
+        }
+        let traveler = player_entities[4];
+        let trav_owner = fresh_owner(&traveler);
+        if trav_owner.is_none() || trav_owner != a_owner {
+            failures.push(format!(
+                "traveler did not end co-located with A: {trav_owner:?} vs {a_owner:?}"
+            ));
+        }
+
+        // A's HOST observer, by ground truth: the observer whose node IS the
+        // owning cluster (from /stats), not guessed from attribution.
+        let host = a_owner.and_then(|own| {
+            obs_clusters
+                .iter()
+                .position(|c| *c == Some(own))
+        });
+        match host {
+            None => failures.push(format!(
+                "no observer hosts A's cluster {a_owner:?} (observer map {obs_clusters:?})"
+            )),
+            Some(host) => {
+                // Anticipation: A's host must have seen the traveler BEFORE
+                // arrival — first post-settle sighting at distance > 60u from
+                // A — and attributed to a FOREIGN cluster at that moment
+                // (warmed as a proxy ahead of adoption). The traveler parks
+                // 2500u away until t=30s, so any sighting on A's host with
+                // distance in (60, 2400) is genuine mid-approach warm-up.
+                match tracks
+                    .get(&traveler)
+                    .and_then(|t| t.first_seen_late.get(&host))
+                {
+                    Some((when, pos, attributed)) => {
+                        let dx = pos.0 - a_center.0;
+                        let dz = pos.2 - a_center.1;
+                        let dist_at_first = (dx * dx + dz * dz).sqrt();
+                        let since_start = when.duration_since(shared.start).as_secs_f64();
+                        eprintln!(
+                            "ANTICIPATION: host obs{host} first saw traveler at t={since_start:.1}s, \
+                             {dist_at_first:.0}u from A, attributed to {attributed}"
+                        );
+                        if dist_at_first <= 60.0 {
+                            failures.push(format!(
+                                "traveler only became visible {dist_at_first:.0}u from A — \
+                                 no anticipatory replication (expected warm-up at ~150-200u)"
+                            ));
+                        }
+                        if dist_at_first >= 2400.0 {
+                            failures.push(format!(
+                                "traveler visible on A's host at {dist_at_first:.0}u (parked, \
+                                 pre-departure) — attention leaked to a zero-likelihood entity"
+                            ));
+                        }
+                        if Some(*attributed) == a_owner {
+                            failures.push(
+                                "traveler's first sighting was already A-owned — replicated only \
+                                 after adoption, not warmed as a foreign proxy"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    None => failures.push(
+                        "A's host observer NEVER saw the traveler post-settle — \
+                         no anticipatory replication at all"
+                            .to_string(),
+                    ),
+                }
+                // The far control (player 5): same foreign status, ~zero
+                // interaction likelihood -> must stay invisible on A's host.
+                let far = player_entities[5];
+                let far_fresh = tracks
+                    .get(&far)
+                    .and_then(|t| t.latest.get(&host))
+                    .is_some_and(|o| now.duration_since(o.at) < final_window);
+                if far_fresh {
+                    failures.push(
+                        "far control is freshly visible on A's host — attention leaks to \
+                         zero-likelihood entities"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     // ── Restart phase: FINAL-WINDOW convergence (#289 acceptance) ──────────
     // After the disturbance settles, the system must be indistinguishable
     // from a healthy one: every player fresh, observers agree, no flips in
@@ -1085,6 +1278,7 @@ fn main() {
                 Phase::Defector => "defector",
                 Phase::Gradient => "gradient",
                 Phase::Attention => "attention",
+                Phase::Approach => "approach",
             }
         );
     } else {
