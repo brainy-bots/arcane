@@ -988,23 +988,37 @@ fn main() {
         // The far pair must never co-locate... unless capacity packing put
         // them together for free (k=4 clusters, 6 entities — packing can
         // legally pair leftovers). What we assert is the CONTRAST: the far
-        // pair must not be treated BETTER than the close pair. If the close
-        // pair co-located and the far pair is on one cluster too, require
-        // that no flip was needed to achieve it (i.e., they were simply
-        // packed, not attracted): the far pair's tracks must show zero flips.
+        // pair must not be treated BETTER than the close pair. Walk-out takes
+        // ~58s (11.7ku at 200u/s) and the manager may legally reshuffle
+        // players whose PATHS cross during transit — so, like the restart
+        // phase, judge only the FINAL WINDOW: once the far pair is parked
+        // 4000u apart, an attraction flip between them is the bug. If they
+        // end co-resident, require zero far-pair flips in the last 20s
+        // (packed is fine; attracted-while-parked is not).
         if f0.is_some() && f0 == f1 {
-            let far_flips: usize = [4usize, 5usize]
+            let window = Duration::from_secs(20);
+            let now = Instant::now();
+            let far_flips_late: usize = [4usize, 5usize]
                 .iter()
                 .filter_map(|i| tracks.get(&player_entities[*i]))
-                .map(|t| t.flips.len())
+                .map(|t| {
+                    t.flips
+                        .iter()
+                        .filter(|(_, _, _, _, at)| now.duration_since(*at) < window)
+                        .count()
+                })
                 .sum();
-            if far_flips > 0 {
+            if far_flips_late > 0 {
                 failures.push(format!(
-                    "FAR pair (4000u apart) was actively migrated together ({far_flips} flips) — \
-                     distance should have kept interaction probability ~0"
+                    "FAR pair (4000u apart) migrated together while PARKED \
+                     ({far_flips_late} flips in final 20s) — distance should \
+                     have kept interaction probability ~0"
                 ));
             } else {
-                eprintln!("far pair co-resident by initial packing (0 flips) — acceptable");
+                eprintln!(
+                    "far pair co-resident with no final-window flips \
+                     (packing or transit reshuffle, not attraction) — acceptable"
+                );
             }
         }
     }
