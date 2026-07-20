@@ -72,7 +72,7 @@ flowchart TB
     subgraph meta["META CONTROL LAYER (game-agnostic, multi-tenant)"]
         PRED["PREDICTOR pool<br/>stateless, parallel, graph-free<br/>features → p"]
         MGR["MANAGER (single global brain)<br/>holds HOT graph in memory + spatial index<br/>continuous re-partition of ACTIVE PREDICTED graph<br/>decides: predict / migrate / split-merge<br/>OFF the hot path"]
-        ROUTER["ROUTER (per-cluster shards)<br/>read Redis → compute rates → write Redis<br/>holds persistent per-entity rate cache"]
+        ROUTER["ROUTER (stateless worker pool)<br/>read Redis → compute rates → write Redis<br/>work distributed as per-cluster jobs"]
     end
 
     subgraph redis["REDIS (the bus)"]
@@ -129,14 +129,30 @@ flowchart TB
   aggregated cluster graph (§6). Region-shardable later using the same locality
   the game world has.
 
-### 2.3 Router — per-cluster, `read Redis → transform → write Redis`
-The Router is the data plane. It is stateless except a **persistent per-entity
-rate cache**, updated whenever the Manager pushes new graph info. Sharded by
-cluster (a router owns a few clusters). Its entire job, per owned cluster, per
-tick:
+### 2.3 Router — stateless worker pool over per-cluster jobs,
+`read Redis → transform → write Redis`
 
-1. Pick a cluster it owns.
-2. Grab the entities in that cluster.
+The Router is the data plane: an **independently scaled pool of stateless,
+interchangeable workers**. The unit of WORK is a cluster's frame (one
+read-filter-join-publish pass per cluster per tick), but router scaling is
+**absolutely independent of cluster topology** — no worker owns a cluster.
+One worker can serve every cluster (the degenerate v1: a single in-process
+pass); N workers split the cluster jobs however load dictates; adding or
+removing workers never touches clusters, nodes, or the Manager. Any worker
+can compute any cluster's frame because every input is a shared record in
+Redis (ownership, graph, state) — filter by owner id, join, publish. The only
+worker-local data is a **per-entity rate cache**, a performance memo that any
+worker can rebuild from Redis; losing it costs warm-up, not correctness.
+
+(Deliberately NOT per-cluster shards: binding workers to clusters would make
+"which worker owns which cluster" a piece of distributed state to manage —
+recreating the ownership problem one layer up, the same trap as relays
+migrating sessions by in-game position.)
+
+One cluster job, per tick:
+
+1. Take a cluster's job.
+2. Grab the entities in that cluster (ownership record filtered by owner id).
 3. Fetch the non-zero relationships for those entities from the graph (Redis,
    entity-indexed).
 4. Compute what the node actually needs — the entities it cares about and their
@@ -147,7 +163,8 @@ tick:
    owned/proxy bit).
 
 The rate spectrum lives here. This is the actual per-cluster load-management
-mechanism and the site of graceful degradation (§7).
+mechanism and the site of graceful degradation (§7) — "per-cluster" describing
+the JOB and its output channel, never the worker.
 
 ### 2.4 Clusters / nodes — pure sinks
 Clusters **never query anything.** Data flows one way: Router → cluster's
@@ -507,10 +524,11 @@ L1+ game-specific policy, same as every primitive. See [[Sigil Operator]],
 | Component | Data access | Parallelism | Rate |
 |---|---|---|---|
 | **Predictor** | single relationships | shard by pair/region, embarrassingly parallel | hot |
-| **Router** | single relationships (its clusters' edges) | shard by cluster | hot |
+| **Router** | single relationships (the job's cluster's edges) | stateless pool; work distributed as per-cluster jobs | hot |
 | **Manager** | whole (aggregated) graph | single / region-shard later | cold, infrequent |
 
-The two **hot** components (predictor, router) shard freely. The one **global**
+The two **hot** components (predictor, router) scale freely — stateless
+workers over shared Redis records, so worker count is a pure capacity knob. The one **global**
 component (manager) is **cold** (infrequent, incremental, aggregated view). The
 thing that is hard to parallelize is also the thing you run rarely — a healthy
 profile. Redis is the fan-out substrate on the hot path.
