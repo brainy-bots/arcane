@@ -75,6 +75,15 @@ pub struct ArcaneManager {
     /// this an everyone-on-one-cluster world can never spread (k would be 1).
     #[cfg(feature = "migration")]
     known_clusters: Vec<Uuid>,
+    /// The attention spectrum applied to the PREDICTOR itself: per-pair memo
+    /// of (last predicted p, cycle it was predicted at). A pair is
+    /// re-predicted on an interval inversely proportional to its last p —
+    /// pairs likely to interact are re-examined every cycle, cold pairs
+    /// rarely. Unseen pairs predict immediately. Entries for departed
+    /// entities are pruned with the graph.
+    prediction_memo: std::collections::HashMap<(Uuid, Uuid), (f64, u64)>,
+    /// Manager evaluation cycle counter (drives the prediction cadence).
+    eval_cycle: u64,
 }
 
 /// Migration guardrails: cooldown, in-flight cap, and per-node CPU cap config.
@@ -355,6 +364,8 @@ impl ArcaneManager {
             migration_state: MigrationState::new(),
             #[cfg(feature = "migration")]
             known_clusters: Vec::new(),
+            prediction_memo: std::collections::HashMap::new(),
+            eval_cycle: 0,
         }
     }
 
@@ -727,12 +738,69 @@ impl ArcaneManager {
             &edge_rules_array,
         );
 
-        // Predict pass: run predictor on candidates.
-        if !candidates.is_empty() {
+        // Predict pass, cadence-gated by the attention spectrum applied to
+        // prediction itself: a pair's re-prediction interval is inversely
+        // proportional to its last predicted p. Hot pairs (p high) re-predict
+        // every cycle; cold pairs (p near the floor) only every
+        // MAX_PREDICTION_INTERVAL cycles; never-predicted pairs immediately.
+        // Functional property (not calibration): as a pair's p rises, it is
+        // examined more often; as it falls, less often.
+        self.eval_cycle += 1;
+        const MAX_PREDICTION_INTERVAL: u64 = 16;
+        let due_candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|c| {
+                let key = if c.a <= c.b { (c.a, c.b) } else { (c.b, c.a) };
+                match self.prediction_memo.get(&key) {
+                    None => true, // new pair: predict now
+                    Some((last_p, last_cycle)) => {
+                        // interval = 1/p cycles, clamped to [1, MAX].
+                        let interval = if *last_p <= 0.0 {
+                            MAX_PREDICTION_INTERVAL
+                        } else {
+                            ((1.0 / *last_p).ceil() as u64).clamp(1, MAX_PREDICTION_INTERVAL)
+                        };
+                        self.eval_cycle.saturating_sub(*last_cycle) >= interval
+                    }
+                }
+            })
+            .collect();
+
+        if !due_candidates.is_empty() {
             let feature_lookup: HashMap<Uuid, FeatureMap> = features_array.into_iter().collect();
+            // Record predictions for ALL due candidates (sweep only returns
+            // promotions above threshold, so memo low-p pairs from the sweep's
+            // input by predicting through the same predictor).
+            let predictor = HeuristicPredictor::default();
+            let empty_features = arcane_affinity::feature_map::FeatureMap::new();
+            for c in &due_candidates {
+                let key = if c.a <= c.b { (c.a, c.b) } else { (c.b, c.a) };
+                let ctx = arcane_affinity::predictor::PairContext {
+                    distance: {
+                        let dx = c.pos_b.x - c.pos_a.x;
+                        let dy = c.pos_b.y - c.pos_a.y;
+                        (dx * dx + dy * dy).sqrt()
+                    },
+                    closing_speed: arcane_affinity::cold_pair::closing_speed(
+                        c.pos_a, c.pos_b, c.vel_a, c.vel_b,
+                    ),
+                    horizon_secs: self.config.horizon_secs,
+                    history_weight: c.history_weight,
+                    features_a: feature_lookup
+                        .get(&c.a)
+                        .unwrap_or(&empty_features),
+                    features_b: feature_lookup
+                        .get(&c.b)
+                        .unwrap_or(&empty_features),
+                };
+                use arcane_affinity::predictor::InteractionPredictor as _;
+                let p = predictor.predict(&ctx);
+                self.prediction_memo.insert(key, (p, self.eval_cycle));
+            }
+
             let promotions = sweep_cold_pairs(
-                &candidates,
-                &HeuristicPredictor::default(),
+                &due_candidates,
+                &predictor,
                 &feature_lookup,
                 &arcane_affinity::cold_pair::SweepConfig {
                     horizon_secs: self.config.horizon_secs,
@@ -759,6 +827,8 @@ impl ArcaneManager {
                 self.interaction_graph.remove_entity(*entity);
             }
         }
+        self.prediction_memo
+            .retain(|(a, b), _| current_entities.contains(a) && current_entities.contains(b));
         self.last_seen_entities = current_entities;
 
         // Build a map of current cluster assignment from the view for comparison.

@@ -237,6 +237,11 @@ struct EntityTrack {
     /// what position, attributed to which cluster. The anticipation metric:
     /// distance-at-first-late-sighting on the destination's host observer.
     first_seen_late: HashMap<usize, (Instant, (f64, f64, f64), Uuid)>,
+    /// Full sighting timeline per observer (when, position, attributed
+    /// cluster) — the cadence record for the spectrum verdicts. Attribution
+    /// distinguishes PROXY sightings (foreign-owned, spectrum-gated) from
+    /// OWNED sightings (resident, sim-rate broadcast).
+    sightings: HashMap<usize, Vec<(Instant, (f64, f64, f64), Uuid)>>,
     max_jump_seen: f64,
     max_gap_ms_seen: u128,
 }
@@ -248,6 +253,12 @@ struct Shared {
     reconnects_followed: std::sync::atomic::AtomicU64,
     /// Program start; observers use it for the post-settle window.
     start: Instant,
+    /// Router-inbox delivery events: (secs since start, consumer cluster,
+    /// entity, rate_hz). The DIRECT record of the attention spectrum — each
+    /// event is one router delivery of a foreign entity to a cluster, with
+    /// the rate the spectrum assigned. (The WS wire can't measure this:
+    /// nodes rebroadcast stale proxies on their own resync rhythm.)
+    inbox_events: Mutex<Vec<(f64, Uuid, Uuid, f64)>>,
 }
 
 fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
@@ -326,6 +337,11 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
                         .entry(idx)
                         .or_insert((now, obs.position, obs.cluster_id));
                 }
+                track
+                    .sightings
+                    .entry(idx)
+                    .or_default()
+                    .push((now, obs.position, obs.cluster_id));
                 track.latest.insert(idx, obs);
             }
         }
@@ -543,6 +559,7 @@ fn main() {
         stop: AtomicBool::new(false),
         reconnects_followed: std::sync::atomic::AtomicU64::new(0),
         start: Instant::now(),
+        inbox_events: Mutex::new(Vec::new()),
     });
 
     // Ground-truth observer->cluster identity (from each node's /stats).
@@ -552,6 +569,36 @@ fn main() {
         .map(|ws| observer_cluster(ws))
         .collect();
     eprintln!("observer clusters: {obs_clusters:?}");
+
+    // Router-inbox observers (spectrum phases): passively subscribe to each
+    // cluster's inbox — the same frames the node consumes — and record every
+    // foreign-entity delivery with its rate_hz. Redis pub/sub duplicates to
+    // extra subscribers; the node is unaffected.
+    if matches!(args.phase, Phase::SpectrumIdle | Phase::SpectrumWarmup) {
+        use arcane_infra::node_inbox::{InboxBus, RedisInboxBus};
+        for cluster in obs_clusters.iter().flatten().copied() {
+            let shared_c = shared.clone();
+            std::thread::spawn(move || {
+                let Ok(bus) = RedisInboxBus::new("redis://127.0.0.1:6379") else {
+                    return;
+                };
+                let rx = bus.subscribe(cluster);
+                std::mem::forget(bus);
+                while let Ok(frame) = rx.recv() {
+                    if shared_c.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now_s = Instant::now()
+                        .duration_since(shared_c.start)
+                        .as_secs_f64();
+                    let mut ev = shared_c.inbox_events.lock().unwrap();
+                    for re in &frame.entities {
+                        ev.push((now_s, cluster, re.entry.entity_id, re.rate_hz));
+                    }
+                }
+            });
+        }
+    }
 
     // Observers first (so they see players' first frames).
     for (idx, ws) in args.clusters.iter().enumerate() {
@@ -683,12 +730,17 @@ fn main() {
                 // approaches A at 50u/s (2500u ≈ 50s travel): slow enough
                 // that screen(200u) -> promote -> route -> broadcast happens
                 // well before proximity-radius arrival (50u).
+                // B parks 800u from A: beyond the 200u screen radius (p=0,
+                // invisible) but a short walk. The traveler approaches at
+                // 20u/s (~40s to contact) so p rises SLOWLY through the
+                // screen window and the cadence gradient is observable; at
+                // t=90s it retreats.
                 let (spawn, waypoints): ((f64, f64), Vec<(f64, f64, f64)>) = match i {
                     0 => ((500.0, 500.0), vec![]),
                     1 => ((530.0, 500.0), vec![]),
-                    2 => ((3000.0, 500.0), vec![]),
-                    3 => ((3030.0, 500.0), vec![]),
-                    4 => ((3000.0, 530.0), vec![(30.0, 530.0, 530.0)]),
+                    2 => ((1300.0, 500.0), vec![]),
+                    3 => ((1330.0, 500.0), vec![]),
+                    4 => ((1300.0, 530.0), vec![(30.0, 530.0, 530.0), (90.0, 1300.0, 530.0)]),
                     _ => ((3000.0, 8000.0), vec![]),
                 };
                 PlayerSpec {
@@ -697,7 +749,7 @@ fn main() {
                     spawn,
                     target: None,
                     waypoints,
-                    speed: 50.0,
+                    speed: 20.0,
                     disconnect_at_target: false,
                 }
             }
@@ -1041,110 +1093,272 @@ fn main() {
         );
     }
 
-    // ── Approach phase: ANTICIPATORY replication (attention positive case) ──
+    // ── Spectrum-warmup verdict: the p -> rate curve, both directions ──────
+    //
+    // All identification is anchored to the APPROACH WINDOW (not the end
+    // state): late repartitions after the retreat can legally reshuffle
+    // hosts, so end-state identities are confounded. Capacity guarantees
+    // A's settle-time owner differs from the traveler's (A=2 and B=3 cannot
+    // share a cluster at capacity 3), so window-anchored checks are sound.
     if args.phase == Phase::SpectrumWarmup {
         assert!(args.players >= 6, "spectrum-warmup phase needs 6 players");
         let a_center = (500.0f64, 500.0f64);
-        let final_window = Duration::from_secs(10);
-        let now = Instant::now();
+        let depart_secs = 30.0f64;
 
-        // Owners from FRESH observations only (stale latest entries from the
-        // settling window would poison a whole-run majority vote).
-        let fresh_owner = |id: &Uuid| -> Option<Uuid> {
+        // Owner-at-time reconstruction: walk the flips (which
+        // carry timestamps) per entity; owner(t) = last flip.to before t,
+        // else the earliest flip.from, else the (single) attribution in
+        // `latest`. Falls back gracefully when an entity never flipped.
+        let owner_at = |id: &Uuid, at_secs: f64| -> Option<Uuid> {
             let t = tracks.get(id)?;
-            let mut counts: HashMap<Uuid, usize> = HashMap::new();
-            for o in t.latest.values() {
-                if now.duration_since(o.at) < final_window {
-                    *counts.entry(o.cluster_id).or_default() += 1;
+            let mut fl: Vec<(f64, Uuid, Uuid)> = t
+                .flips
+                .iter()
+                .map(|(_, from, to, _, when)| {
+                    (when.duration_since(shared.start).as_secs_f64(), *from, *to)
+                })
+                .collect();
+            fl.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut owner: Option<Uuid> = None;
+            for (s, from, to) in &fl {
+                if *s <= at_secs {
+                    owner = Some(*to);
+                } else if owner.is_none() {
+                    owner = Some(*from);
                 }
             }
-            counts.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+            owner.or_else(|| t.latest.values().next().map(|o| o.cluster_id))
         };
 
-        let a_owner = fresh_owner(&player_entities[0]);
-        if a_owner.is_none() || a_owner != fresh_owner(&player_entities[1]) {
-            failures.push(format!(
-                "group A not co-located at end: {:?} vs {:?}",
-                a_owner,
-                fresh_owner(&player_entities[1])
-            ));
-        }
+        let a_owner = owner_at(&player_entities[0], 28.0);
         let traveler = player_entities[4];
-        let trav_owner = fresh_owner(&traveler);
-        if trav_owner.is_none() || trav_owner != a_owner {
+        let trav_owner_pre = owner_at(&traveler, 28.0);
+        if a_owner.is_none() {
+            failures.push("cannot identify A's settle-time owner".to_string());
+        }
+        if a_owner.is_some() && a_owner == trav_owner_pre {
             failures.push(format!(
-                "traveler did not end co-located with A: {trav_owner:?} vs {a_owner:?}"
+                "scenario collision: A and the traveler share a settle-time owner \
+                 ({a_owner:?}) — capacity should forbid this; partition suspect"
             ));
         }
-
-        // A's HOST observer, by ground truth: the observer whose node IS the
-        // owning cluster (from /stats), not guessed from attribution.
-        let host = a_owner.and_then(|own| {
-            obs_clusters
-                .iter()
-                .position(|c| *c == Some(own))
-        });
+        let host = a_owner.and_then(|own| obs_clusters.iter().position(|c| *c == Some(own)));
         match host {
             None => failures.push(format!(
-                "no observer hosts A's cluster {a_owner:?} (observer map {obs_clusters:?})"
+                "no observer hosts A's settle-time cluster {a_owner:?} \
+                 (observer map {obs_clusters:?})"
             )),
             Some(host) => {
-                // Anticipation: A's host must have seen the traveler BEFORE
-                // arrival — first post-settle sighting at distance > 60u from
-                // A — and attributed to a FOREIGN cluster at that moment
-                // (warmed as a proxy ahead of adoption). The traveler parks
-                // 2500u away until t=30s, so any sighting on A's host with
-                // distance in (60, 2400) is genuine mid-approach warm-up.
-                match tracks
+                let dist_to_a = |p: &(f64, f64, f64)| -> f64 {
+                    let dx = p.0 - a_center.0;
+                    let dz = p.2 - a_center.1;
+                    (dx * dx + dz * dz).sqrt()
+                };
+                let sights = tracks
                     .get(&traveler)
-                    .and_then(|t| t.first_seen_late.get(&host))
-                {
-                    Some((when, pos, attributed)) => {
-                        let dx = pos.0 - a_center.0;
-                        let dz = pos.2 - a_center.1;
-                        let dist_at_first = (dx * dx + dz * dz).sqrt();
-                        let since_start = when.duration_since(shared.start).as_secs_f64();
+                    .and_then(|t| t.sightings.get(&host))
+                    .cloned()
+                    .unwrap_or_default();
+
+                let host_cluster = a_owner.unwrap();
+                // 1) Pre-departure: while the traveler is PARKED 800u away
+                //    its p against A is at/near the spectrum floor, so A's
+                //    host may deliver it at most RARELY. Assert on the rate
+                //    of position-changed proxy deliveries in the parked
+                //    window (< depart): sparse (< 1 per 5s) is the floor
+                //    working; dense means attention leaked. Attribution
+                //    alone can't be the test — A and B sit close enough for
+                //    legitimate weak edges.
+                let parked_window_secs = depart_secs - 2.0;
+                let mut parked_deliveries = 0usize;
+                let mut lastp: Option<(f64, f64, f64)> = None;
+                for (when, pos, attributed) in &sights {
+                    let s = when.duration_since(shared.start).as_secs_f64();
+                    if s >= parked_window_secs {
+                        break;
+                    }
+                    if *attributed == host_cluster {
+                        continue;
+                    }
+                    let changed = lastp.is_none_or(|lp| {
+                        let dx = lp.0 - pos.0;
+                        let dz = lp.2 - pos.2;
+                        (dx * dx + dz * dz).sqrt() > 0.5
+                    });
+                    lastp = Some(*pos);
+                    if changed {
+                        parked_deliveries += 1;
+                    }
+                }
+                let parked_rate_per_5s =
+                    parked_deliveries as f64 * 5.0 / parked_window_secs.max(1.0);
+                eprintln!(
+                    "PARKED: {parked_deliveries} proxy deliveries in {parked_window_secs:.0}s \
+                     ({parked_rate_per_5s:.2} per 5s)"
+                );
+                if parked_rate_per_5s > 1.0 {
+                    failures.push(format!(
+                        "parked traveler delivered at {parked_rate_per_5s:.1}/5s on A's host — \
+                         spectrum floor not suppressing a low-likelihood entity"
+                    ));
+                }
+
+                // 2) Anticipation: first sighting on A's host mid-approach —
+                //    before contact (>60u out) but after departure.
+                let first_appr = sights.iter().find(|(when, _, _)| {
+                    when.duration_since(shared.start).as_secs_f64() >= depart_secs - 1.0
+                });
+                match first_appr {
+                    Some((when, pos, _)) => {
+                        let d = dist_to_a(pos);
+                        let s = when.duration_since(shared.start).as_secs_f64();
                         eprintln!(
-                            "ANTICIPATION: host obs{host} first saw traveler at t={since_start:.1}s, \
-                             {dist_at_first:.0}u from A, attributed to {attributed}"
+                            "ANTICIPATION: A's host obs{host} first saw traveler at \
+                             t={s:.1}s, {d:.0}u from A"
                         );
-                        if dist_at_first <= 60.0 {
+                        if d <= 60.0 {
                             failures.push(format!(
-                                "traveler only became visible {dist_at_first:.0}u from A — \
-                                 no anticipatory replication (expected warm-up at ~150-200u)"
+                                "traveler only became visible {d:.0}u from A — no \
+                                 anticipatory replication (expected warm-up ~150-200u)"
                             ));
-                        }
-                        if dist_at_first >= 2400.0 {
-                            failures.push(format!(
-                                "traveler visible on A's host at {dist_at_first:.0}u (parked, \
-                                 pre-departure) — attention leaked to a zero-likelihood entity"
-                            ));
-                        }
-                        if Some(*attributed) == a_owner {
-                            failures.push(
-                                "traveler's first sighting was already A-owned — replicated only \
-                                 after adoption, not warmed as a foreign proxy"
-                                    .to_string(),
-                            );
                         }
                     }
                     None => failures.push(
-                        "A's host observer NEVER saw the traveler post-settle — \
+                        "A's host never saw the traveler during the approach — \
                          no anticipatory replication at all"
                             .to_string(),
                     ),
                 }
-                // The far control (player 5): same foreign status, ~zero
-                // interaction likelihood -> must stay invisible on A's host.
-                let far = player_entities[5];
-                let far_fresh = tracks
-                    .get(&far)
-                    .and_then(|t| t.latest.get(&host))
-                    .is_some_and(|o| now.duration_since(o.at) < final_window);
-                if far_fresh {
+
+                // 3) The spectrum, measured at the ROUTER INBOX — the direct
+                //    record (each event = one router delivery of the traveler
+                //    to A's host, with the assigned rate_hz). The WS wire
+                //    cannot measure this: nodes rebroadcast stale proxies on
+                //    their own resync rhythm. Distance derives from the walk
+                //    schedule: parked 800u until depart, then closing 20u/s.
+                //    Functional monotonicity only: nearer -> assigned rate not
+                //    lower AND delivery gaps not longer.
+                let dist_at = |s: f64| -> f64 {
+                    if s < depart_secs {
+                        800.0
+                    } else {
+                        (800.0 - 20.0 * (s - depart_secs)).max(30.0)
+                    }
+                };
+                let events = shared.inbox_events.lock().unwrap();
+                let mut far_ts: Vec<f64> = vec![];
+                let mut near_ts: Vec<f64> = vec![];
+                let mut far_rates: Vec<f64> = vec![];
+                let mut near_rates: Vec<f64> = vec![];
+                for (s, cluster, entity, rate) in events.iter() {
+                    if *cluster != host_cluster || *entity != traveler {
+                        continue;
+                    }
+                    let d = dist_at(*s);
+                    if (300.0..700.0).contains(&d) {
+                        far_ts.push(*s);
+                        far_rates.push(*rate);
+                    } else if (60.0..250.0).contains(&d) {
+                        near_ts.push(*s);
+                        near_rates.push(*rate);
+                    }
+                }
+                drop(events);
+                let median = |v: &mut Vec<f64>| -> Option<f64> {
+                    if v.is_empty() {
+                        return None;
+                    }
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    Some(v[v.len() / 2])
+                };
+                let mut far_gaps: Vec<f64> =
+                    far_ts.windows(2).map(|w| w[1] - w[0]).collect();
+                let mut near_gaps: Vec<f64> =
+                    near_ts.windows(2).map(|w| w[1] - w[0]).collect();
+                match (
+                    median(&mut far_gaps),
+                    median(&mut near_gaps),
+                    median(&mut far_rates),
+                    median(&mut near_rates),
+                ) {
+                    (Some(fg), Some(ng), Some(fr), Some(nr)) => {
+                        eprintln!(
+                            "SPECTRUM (router inbox): far band 300-700u — {} deliveries, \
+                             median gap {fg:.2}s, median rate {fr:.2}Hz; near band 60-250u — \
+                             {} deliveries, median gap {ng:.2}s, median rate {nr:.2}Hz",
+                            far_ts.len(),
+                            near_ts.len()
+                        );
+                        if nr < fr {
+                            failures.push(format!(
+                                "assigned rate did NOT rise with proximity: near \
+                                 {nr:.2}Hz < far {fr:.2}Hz"
+                            ));
+                        }
+                        if ng > fg * 1.5 {
+                            failures.push(format!(
+                                "delivery cadence did NOT increase with proximity: \
+                                 near gap {ng:.2}s vs far gap {fg:.2}s"
+                            ));
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "SPECTRUM: far {} / near {} inbox deliveries",
+                            far_ts.len(),
+                            near_ts.len()
+                        );
+                        if near_ts.is_empty() {
+                            failures.push(
+                                "no router deliveries in the near band — spectrum not \
+                                 delivering as p rises"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+
+                // 4) The far control (player 5): p ~ 0 all run — never a
+                //    PROXY on A's host. (It may legitimately be OWNED by the
+                //    same cluster via capacity packing; owned broadcast is
+                //    residency, not attention.)
+                let far_ctl = player_entities[5];
+                // Exemption: the manager may LEGALLY migrate the far control
+                // onto/off A's host (capacity packing of an edge-less
+                // leftover is an ownership decision, not an attention one).
+                // Warm-up/hand-off proxies within +-20s of such a flip are
+                // expected; proxy sightings OUTSIDE those windows are the
+                // actual attention leak.
+                let far_flip_times: Vec<f64> = tracks
+                    .get(&far_ctl)
+                    .map(|t| {
+                        t.flips
+                            .iter()
+                            .filter(|(_, from, to, _, _)| {
+                                *from == host_cluster || *to == host_cluster
+                            })
+                            .map(|(_, _, _, _, when)| {
+                                when.duration_since(shared.start).as_secs_f64()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let far_proxy_leak = tracks
+                    .get(&far_ctl)
+                    .and_then(|t| t.sightings.get(&host))
+                    .is_some_and(|s| {
+                        s.iter().any(|(when, _, attr)| {
+                            if *attr == host_cluster {
+                                return false;
+                            }
+                            let ts = when.duration_since(shared.start).as_secs_f64();
+                            !far_flip_times.iter().any(|ft| (ts - ft).abs() < 20.0)
+                        })
+                    });
+                if far_proxy_leak {
                     failures.push(
-                        "far control is freshly visible on A's host — attention leaks to \
-                         zero-likelihood entities"
+                        "far control was proxied on A's host outside any migration \
+                         window — attention leaked to a zero-likelihood entity"
                             .to_string(),
                     );
                 }

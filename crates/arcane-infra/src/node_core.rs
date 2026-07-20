@@ -2111,6 +2111,7 @@ mod tests {
                 entities: vec![ReplicatedEntity {
                     entry: mk_entry(e, cluster_c2, 5.0),
                     tier: RateTier::Full,
+                    rate_hz: 30.0,
                 }],
                 owned: Some(vec![]),
             };
@@ -2153,6 +2154,7 @@ mod tests {
                 entities: vec![ReplicatedEntity {
                     entry: mk_entry(foreign, cluster_c2, 7.0),
                     tier: RateTier::Full,
+                    rate_hz: 30.0,
                 }],
                 owned: None,
             };

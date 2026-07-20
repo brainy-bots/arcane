@@ -25,6 +25,14 @@ use uuid::Uuid;
 pub struct ReplicatedEntity {
     pub entry: EntityStateEntry,
     pub tier: RateTier,
+    /// Continuous refresh rate (Hz) the rate law assigned this entity for
+    /// this consumer — the attention spectrum's actual value, of which
+    /// `tier` is a coarse projection kept for observability. The router's
+    /// cadence gate has already applied it (an entity due at 2 Hz appears in
+    /// ~2 frames/sec); it travels so nodes can smooth/interpolate later.
+    /// serde-default so pre-rate frames parse (0.0 = unknown/legacy).
+    #[serde(default)]
+    pub rate_hz: f64,
 }
 
 /// One frame written by the Router to a node's inbox (design §2.3/§2.4: the node's ONE input).
@@ -244,7 +252,8 @@ mod tests {
                 },
             ),
             tier: RateTier::Full,
-        };
+            rate_hz: 30.0,
+                };
         let entity_2 = ReplicatedEntity {
             entry: EntityStateEntry::new(
                 Uuid::from_u128(101),
@@ -261,7 +270,8 @@ mod tests {
                 },
             ),
             tier: RateTier::Low,
-        };
+            rate_hz: 30.0,
+                };
 
         let flip = OwnershipFlip {
             entity_id: Uuid::from_u128(200),
@@ -352,7 +362,8 @@ mod tests {
         let entity = ReplicatedEntity {
             entry,
             tier: RateTier::Full,
-        };
+            rate_hz: 30.0,
+                };
 
         let frame = NodeInboxFrame {
             tick: 123,

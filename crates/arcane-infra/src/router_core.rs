@@ -11,7 +11,7 @@
 use crate::node_inbox::{NodeInboxFrame, ReplicatedEntity};
 use crate::ownership_migration::OwnershipFlip;
 use arcane_affinity::interaction_graph::InteractionGraph;
-use arcane_affinity::rate_field::{rate_tier, RateLawConfig, RateTier};
+use arcane_affinity::rate_field::{rate_tier, refresh_rate_hz, RateLawConfig, RateTier};
 use arcane_core::replication_channel::EntityStateEntry;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -47,6 +47,10 @@ pub struct RouterConfig {
     /// v1 dynamism placeholder: a constant per-entity dynamism until real velocity-derived
     /// dynamism is wired (design §4). Default 1.0 (fully dynamic).
     pub default_dynamism: f64,
+    /// Routing passes per second — the clock `cadence_due` measures refresh
+    /// intervals against. Should match the manager cycle rate (cadence_ms).
+    /// Default 2.0 (500ms cycles, the harness stack's configuration).
+    pub router_hz: f64,
 }
 
 impl Default for RouterConfig {
@@ -54,6 +58,7 @@ impl Default for RouterConfig {
         Self {
             rate_law: RateLawConfig::default(),
             default_dynamism: 1.0,
+            router_hz: 2.0,
         }
     }
 }
@@ -100,7 +105,7 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
         // Step 3 & 4: Interest set v1 + binary attention.
         // Collect all entities this cluster should receive, keyed by entity_id.
         // We track (state, tier) and later dedup by keeping the highest tier.
-        let mut entity_interest: HashMap<Uuid, (EntityStateEntry, RateTier)> = HashMap::new();
+        let mut entity_interest: HashMap<Uuid, (EntityStateEntry, RateTier, f64)> = HashMap::new();
 
         // For each entity owned by this cluster, find interesting foreign neighbors.
         for (entity_id, owner) in input.assignments {
@@ -126,23 +131,26 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
                 // Simple saturating map: p = (weight / (weight + 1.0)).clamp(0.0, 1.0)
                 let p = (weight / (weight + 1.0)).clamp(0.0, 1.0);
 
-                // Compute tier from p and dynamism.
-                let tier = rate_tier(p, config.default_dynamism, &config.rate_law);
-
-                // Binary attention: Zero-tier entities are not included.
-                if tier == RateTier::Zero {
+                // The attention spectrum (continuous p -> Hz, zero-truncated)
+                // + the stateless cadence gate. Mirrors route_from_doc.
+                let hz = refresh_rate_hz(p, config.default_dynamism, &config.rate_law);
+                if hz <= 0.0 || !cadence_due(input.tick, neighbor_id, hz, config) {
                     continue;
                 }
+                let tier = rate_tier(p, config.default_dynamism, &config.rate_law);
 
-                // Dedup by entity_id: keep the highest tier (Full > Low > Zero).
+                // Dedup by entity_id: keep the highest tier/rate.
                 entity_interest
                     .entry(neighbor_id)
-                    .and_modify(|(_, existing_tier)| {
+                    .and_modify(|(_, existing_tier, existing_hz)| {
                         if tier_order(tier) > tier_order(*existing_tier) {
                             *existing_tier = tier;
                         }
+                        if hz > *existing_hz {
+                            *existing_hz = hz;
+                        }
                     })
-                    .or_insert_with(|| (neighbor_state.clone(), tier));
+                    .or_insert_with(|| (neighbor_state.clone(), tier, hz));
             }
         }
 
@@ -157,22 +165,27 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
                 continue;
             };
 
-            // Force with tier Full (highest priority), dedup by keeping highest tier.
+            // Force with tier Full / max rate (replication warm-up, §8).
             entity_interest
                 .entry(*entity_id)
-                .and_modify(|(_, existing_tier)| {
-                    if tier_order(RateTier::Full) > tier_order(*existing_tier) {
-                        *existing_tier = RateTier::Full;
-                    }
+                .and_modify(|(_, existing_tier, existing_hz)| {
+                    *existing_tier = RateTier::Full;
+                    *existing_hz = config.rate_law.max_hz;
                 })
-                .or_insert_with(|| (entity_state.clone(), RateTier::Full));
+                .or_insert_with(|| {
+                    (entity_state.clone(), RateTier::Full, config.rate_law.max_hz)
+                });
         }
 
         // Step 5: Frame assembly.
         let entities: Vec<ReplicatedEntity> = {
             let mut ents: Vec<_> = entity_interest
                 .into_iter()
-                .map(|(_, (entry, tier))| ReplicatedEntity { entry, tier })
+                .map(|(_, (entry, tier, rate_hz))| ReplicatedEntity {
+                    entry,
+                    tier,
+                    rate_hz,
+                })
                 .collect();
 
             // Sort by entity_id for determinism.
@@ -320,6 +333,38 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
 /// architecture: the manager ships slow-changing decisions; frame-to-frame
 /// rate variation stays worker-local. Stateless: any worker can run this for
 /// any cluster.
+/// Stateless cadence gate: is an entity with continuous rate `rate_hz` due
+/// for inclusion at router tick `tick`?
+///
+/// interval = router cadence over rate, phase-offset by a hash of the entity
+/// id so entities at the same rate don't all land on the same frames. Pure
+/// function of (tick, entity, rate): any stateless worker computes the same
+/// answer — no per-worker timers, deterministic. Approaching entities (rising
+/// p → rising rate → shrinking interval) are included more often each time;
+/// receding entities less often. Full-rate entities appear every frame.
+pub fn cadence_due(tick: u64, entity_id: Uuid, rate_hz: f64, config: &RouterConfig) -> bool {
+    if rate_hz <= 0.0 {
+        return false;
+    }
+    // Interval from the NORMALIZED spectrum signal s = rate/max: interval =
+    // 1/s router frames. s=1 -> every frame; s=0.5 -> every 2nd; s=0.1 ->
+    // every 10th. Unit-free: the spectrum's full dynamic range maps onto the
+    // router's own cadence (delivered rate = router_hz * s). Computing the
+    // interval from absolute Hz against a 2 Hz router would saturate — any
+    // p above ~0.07 would round to every-frame and the gradient would be
+    // invisible on the wire.
+    let s = (rate_hz / config.rate_law.max_hz).clamp(0.0, 1.0);
+    if s <= 0.0 {
+        return false;
+    }
+    let interval = (1.0 / s).round().max(1.0) as u64;
+    if interval <= 1 {
+        return true;
+    }
+    let phase = entity_id.as_u128() as u64 % interval;
+    tick % interval == phase
+}
+
 pub fn route_from_doc(
     doc: &crate::routing_table::RoutingDoc,
     entity_states: &HashMap<Uuid, EntityStateEntry>,
@@ -330,18 +375,25 @@ pub fn route_from_doc(
         .iter()
         .filter_map(|cand| {
             let state = entity_states.get(&cand.entity_id)?;
-            let tier = if cand.forced {
-                RateTier::Full
+            // The attention spectrum: ONE continuous p -> Hz curve
+            // (zero-truncated). Gate force-includes bypass it (replication
+            // warm-up must be every-frame, §8).
+            let (rate_hz, tier) = if cand.forced {
+                (config.rate_law.max_hz, RateTier::Full)
             } else {
-                let t = rate_tier(cand.p, config.default_dynamism, &config.rate_law);
-                if t == RateTier::Zero {
-                    return None; // binary attention: Zero-tier not delivered
+                let hz = refresh_rate_hz(cand.p, config.default_dynamism, &config.rate_law);
+                if hz <= 0.0 {
+                    return None; // below the zero floor: never delivered
                 }
-                t
+                if !cadence_due(doc.tick, cand.entity_id, hz, config) {
+                    return None; // not due this frame; will be due on its cadence
+                }
+                (hz, rate_tier(cand.p, config.default_dynamism, &config.rate_law))
             };
             Some(ReplicatedEntity {
                 entry: state.clone(),
                 tier,
+                rate_hz,
             })
         })
         .collect();
@@ -670,6 +722,106 @@ mod tests {
                 assert_eq!(e1.tier, e2.tier);
             }
         }
+    }
+
+    /// The attention spectrum's functional property, deterministic: as p
+    /// rises (entity approaching), delivery frequency over a window of router
+    /// ticks rises monotonically; as p falls, it falls. No calibration — the
+    /// direction is the contract.
+    #[test]
+    fn cadence_frequency_monotonic_in_p() {
+        let config = RouterConfig::default();
+        let e = uuid(7);
+        let window = 1000u64;
+        let deliveries_at = |p: f64| -> usize {
+            let hz = refresh_rate_hz(p, config.default_dynamism, &config.rate_law);
+            (0..window)
+                .filter(|tick| cadence_due(*tick, e, hz, &config))
+                .count()
+        };
+        // Rising p (approach): frequency never decreases, strictly increases
+        // across the range.
+        let ps = [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0];
+        let counts: Vec<usize> = ps.iter().map(|p| deliveries_at(*p)).collect();
+        for w in counts.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "delivery frequency must not fall as p rises: {counts:?}"
+            );
+        }
+        assert!(
+            counts[counts.len() - 1] > counts[0],
+            "full-p must deliver strictly more often than near-floor: {counts:?}"
+        );
+        // Below the zero floor: never delivered.
+        assert_eq!(deliveries_at(0.001), 0, "sub-floor p must deliver nothing");
+        // Full p: every frame.
+        assert_eq!(
+            deliveries_at(1.0),
+            window as usize,
+            "p=1 must deliver every frame"
+        );
+    }
+
+    /// route_from_doc applies the spectrum: a high-p candidate appears in
+    /// (nearly) every frame, a low-p candidate in a strict subset, a
+    /// sub-floor candidate never — and the delivered rate_hz is monotonic in
+    /// p. Verified across a window of docs (per-tick output varies by
+    /// design; the WINDOW is the observable).
+    #[test]
+    fn route_from_doc_delivery_follows_p() {
+        use crate::routing_table::{InterestEntry, RoutingDoc};
+        let config = RouterConfig::default();
+        let owner = uuid(9);
+        let high = uuid(1);
+        let low = uuid(2);
+        let floor = uuid(3);
+
+        let mut entity_states = HashMap::new();
+        for id in [high, low, floor] {
+            entity_states.insert(id, make_entity_state(id, owner));
+        }
+        let interest = vec![
+            InterestEntry { entity_id: high, owner, p: 0.9, forced: false },
+            InterestEntry { entity_id: low, owner, p: 0.15, forced: false },
+            InterestEntry { entity_id: floor, owner, p: 0.001, forced: false },
+        ];
+
+        let mut seen_high = 0usize;
+        let mut seen_low = 0usize;
+        let mut seen_floor = 0usize;
+        let mut rate_high = 0.0f64;
+        let mut rate_low = 0.0f64;
+        for tick in 0..200u64 {
+            let doc = RoutingDoc {
+                tick,
+                owned: vec![],
+                interest: interest.clone(),
+                flips: vec![],
+            };
+            let frame = route_from_doc(&doc, &entity_states, &config);
+            for re in &frame.entities {
+                if re.entry.entity_id == high {
+                    seen_high += 1;
+                    rate_high = re.rate_hz;
+                } else if re.entry.entity_id == low {
+                    seen_low += 1;
+                    rate_low = re.rate_hz;
+                } else if re.entry.entity_id == floor {
+                    seen_floor += 1;
+                }
+            }
+        }
+        assert_eq!(seen_floor, 0, "sub-floor candidate must never be delivered");
+        assert!(
+            seen_high > seen_low,
+            "high-p must be delivered more often than low-p ({seen_high} vs {seen_low})"
+        );
+        assert!(seen_low > 0, "low-p must still be delivered sometimes");
+        assert!(
+            rate_high > rate_low,
+            "delivered rate_hz must be monotonic in p ({rate_high} vs {rate_low})"
+        );
     }
 
     /// The table split must not change routing semantics: composing frames
