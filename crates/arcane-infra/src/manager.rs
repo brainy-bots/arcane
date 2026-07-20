@@ -712,15 +712,27 @@ impl ArcaneManager {
                 let a = &players[i];
                 let b = &players[j];
 
-                // Proximity pairs (using config radius and weight)
+                // Proximity pairs (config radius/weight), scaled by relative
+                // speed (arcane#290 improvement #2): a 2s pass-through at
+                // 240 u/s closing speed used to accumulate weight like
+                // standing together, so crossing lanes merged and converge
+                // contact contaminated the graph for hundreds of decay
+                // cycles. Co-moving or parked pairs (rel speed ~0) keep
+                // full weight; pairs passing at >= 4x walking speed accrue
+                // ~20%. Sustained proximity still builds edges — slower.
                 let dx = a.position.x - b.position.x;
                 let dy = a.position.y - b.position.y;
                 let radius_sq = self.config.proximity_radius * self.config.proximity_radius;
                 if dx * dx + dy * dy <= radius_sq {
+                    let rvx = a.velocity.x - b.velocity.x;
+                    let rvy = a.velocity.y - b.velocity.y;
+                    let rel_speed = (rvx * rvx + rvy * rvy).sqrt();
+                    // Half-weight at 60 u/s relative (walking speed).
+                    let speed_scale = 1.0 / (1.0 + rel_speed / 60.0);
                     self.interaction_graph.record_interaction(
                         a.player_id,
                         b.player_id,
-                        self.config.proximity_weight,
+                        self.config.proximity_weight * speed_scale,
                         InteractionKind::Proximity,
                     );
                 }

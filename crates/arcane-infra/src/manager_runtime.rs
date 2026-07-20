@@ -513,6 +513,96 @@ mod tests {
         RouterConfig::default()
     }
 
+    /// Founder-observed in the viz crossing scenario: TWO parked groups
+    /// 1800u apart (no cross-group interaction at all while parked) ended
+    /// with ALL EIGHT entities on one cluster. Two spatially separate
+    /// communities must land on two clusters — total consolidation of
+    /// non-interacting groups is a partitioning failure regardless of any
+    /// cohesion-vs-balance policy. Groups of FOUR matter: the 6-player
+    /// matrix `cluster` phase (groups of 3, capacity 3) passes; groups of
+    /// 4 exceed the derived capacity and hit the repair/refinement paths.
+    #[test]
+    fn two_parked_groups_of_four_do_not_collapse_onto_one_cluster() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        runtime.set_observation_radius(500.0);
+
+        let clusters: Vec<Uuid> = (1..=4).map(Uuid::from_u128).collect();
+        runtime.set_known_clusters(clusters.clone());
+
+        // 8 entities ALL starting on ONE cluster — the state a crossing or
+        // converge leaves behind (transient contact merged everyone; the
+        // sticky seed then preserves consolidation). Parked in two tight
+        // groups far apart, proximity-only edges: the graph is two
+        // components of four, the seed is one over-full cluster of eight
+        // (capacity ceil(2*1.5)=3), and the ONLY way out is capacity
+        // repair moving a whole component. Components of 4 don't fit
+        // capacity 3, so repair must fall back to strict balance
+        // improvement rather than giving up.
+        let east: Vec<Uuid> = (0x100..0x104).map(Uuid::from_u128).collect();
+        let west: Vec<Uuid> = (0x200..0x204).map(Uuid::from_u128).collect();
+
+        // Phase 1 (contact): everyone within proximity — cross-group edges
+        // form, exactly what a lane-crossing leaves behind. 10 cycles.
+        for _cycle in 0..10 {
+            for (i, e) in east.iter().enumerate() {
+                runtime.update_entity(
+                    *e,
+                    clusters[0],
+                    Vec3::new(1000.0 + 15.0 * i as f64, 0.0, 500.0),
+                );
+            }
+            for (i, e) in west.iter().enumerate() {
+                runtime.update_entity(
+                    *e,
+                    clusters[0],
+                    Vec3::new(1000.0 + 15.0 * i as f64, 0.0, 530.0),
+                );
+            }
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+        // Phase 2 (parked apart): cross-group edges DECAY but linger far
+        // above zero for hundreds of cycles. The partitioner must still
+        // recognize two communities — connectivity-to-epsilon kept the
+        // graph "one component" and consolidation permanent.
+        for _cycle in 0..140 {
+            for (i, e) in east.iter().enumerate() {
+                runtime.update_entity(
+                    *e,
+                    clusters[0],
+                    Vec3::new(800.0 + 30.0 * i as f64, 0.0, 500.0),
+                );
+            }
+            for (i, e) in west.iter().enumerate() {
+                runtime.update_entity(
+                    *e,
+                    clusters[0],
+                    Vec3::new(2700.0 + 30.0 * i as f64, 0.0, 500.0),
+                );
+            }
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+
+        let owner = |id: &Uuid| runtime.assignments().get(id).copied();
+        let east_owners: std::collections::HashSet<_> =
+            east.iter().filter_map(&owner).collect();
+        let west_owners: std::collections::HashSet<_> =
+            west.iter().filter_map(&owner).collect();
+        let all_owners: std::collections::HashSet<_> =
+            east.iter().chain(west.iter()).filter_map(&owner).collect();
+
+        eprintln!("east owners: {east_owners:?}");
+        eprintln!("west owners: {west_owners:?}");
+
+        assert_eq!(east_owners.len(), 1, "east group should co-locate");
+        assert_eq!(west_owners.len(), 1, "west group should co-locate");
+        assert!(
+            all_owners.len() >= 2,
+            "two non-interacting groups 1800u apart must NOT share one cluster \
+             (founder-observed total consolidation)"
+        );
+    }
+
     /// Absence pruning: an entity a LIVE cluster stops reporting is removed
     /// from the assignments overlay and the spatial snapshot after the grace
     /// window; a continually-reported entity survives.

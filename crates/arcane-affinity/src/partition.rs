@@ -225,10 +225,30 @@ pub fn seed_from_assignments(
                 .collect();
             members.sort();
 
-            // Connected components over soft edges among members (weight
-            // above epsilon; decayed-to-nothing edges don't bind).
+            // Connected components over soft edges among members. Binding is
+            // RELATIVE: an edge binds only at >= 10% of the strongest edge
+            // in this partition. With epsilon binding, the decayed remnants
+            // of any past contact (0.97/cycle takes ~300 cycles to reach
+            // zero) kept two long-separated groups "one component" — repair
+            // saw one giant unmovable blob and total consolidation became
+            // permanent (founder-observed: 8 entities from two parked
+            // groups 1800u apart wedged on one cluster). Sustained
+            // interaction (refreshed every cycle) stays near the max and
+            // binds; stale contact falls under the fraction within tens of
+            // cycles and stops binding. A fresh clique (all edges similar)
+            // binds fully — cohesion is unaffected.
             let index: HashMap<Uuid, usize> =
                 members.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+            let max_weight = edges
+                .iter()
+                .filter(|e| {
+                    e.colocation == Colocation::Soft
+                        && index.contains_key(&e.a)
+                        && index.contains_key(&e.b)
+                })
+                .map(|e| e.weight)
+                .fold(0.0f64, f64::max);
+            let bind_threshold = (max_weight * 0.1).max(1e-9);
             let mut parent: Vec<usize> = (0..members.len()).collect();
             fn find(parent: &mut Vec<usize>, i: usize) -> usize {
                 if parent[i] != i {
@@ -238,7 +258,7 @@ pub fn seed_from_assignments(
                 parent[i]
             }
             for edge in edges {
-                if edge.colocation != Colocation::Soft || edge.weight <= 1e-9 {
+                if edge.colocation != Colocation::Soft || edge.weight < bind_threshold {
                     continue;
                 }
                 if let (Some(&i), Some(&j)) = (index.get(&edge.a), index.get(&edge.b)) {
@@ -280,10 +300,37 @@ pub fn seed_from_assignments(
                         break;
                     }
                 }
+                // Nothing fits WITHIN capacity (components larger than the
+                // slack everywhere). Without a fallback the world can wedge
+                // on one cluster permanently: crossing lanes consolidate 8
+                // entities onto one node, capacity 3, every component is 4
+                // wide, no move "fits", repair gives up, and refinement
+                // never splits a connected lane (negative gain). Founder-
+                // observed as "clustering stopped working". Move the
+                // smallest component to the least-loaded other partition
+                // anyway when that STRICTLY improves balance — components
+                // stay whole (cliques still never cut), but separate groups
+                // must spread. Strictness terminates the loop: a 4/4 world
+                // won't ping-pong (4+4 < 4 is false).
+                if !moved {
+                    if let Some(comp) = comps.first() {
+                        let target = (0..sizes.len())
+                            .filter(|&i| i != over && sizes[i] + comp.len() < sizes[over])
+                            .min_by_key(|&i| (sizes[i], i));
+                        if let Some(target) = target {
+                            for e in comp {
+                                assignment.insert(*e, target);
+                            }
+                            sizes[over] -= comp.len();
+                            sizes[target] += comp.len();
+                            moved = true;
+                        }
+                    }
+                }
             }
             if !moved {
-                // One giant component, or nothing fits: capacity is
-                // infeasible without cutting a clique — cohesion wins.
+                // One giant component (a genuine merged clique), or no move
+                // improves balance: cohesion wins, over-full stands.
                 break;
             }
         }
