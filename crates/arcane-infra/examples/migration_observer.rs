@@ -65,11 +65,11 @@ enum Phase {
     /// far corner groups, nothing approaching anything, p ~ 0 across groups.
     /// Run against the NOLEGACY stack. Verdict: each cluster broadcasts only
     /// its residents (the scaling payoff of the spectrum's floor). The
-    /// `approach` phase probes the RISING part of the SAME curve — they are
+    /// `spectrum-warmup` phase probes the RISING part of the SAME curve — they are
     /// one mechanism, not two features. A/B: run without nolegacy for the
     /// world-broadcast baseline.
-    Attention,
-    /// Attention-spectrum probe, RISING end — same mechanism as `attention`,
+    SpectrumIdle,
+    /// Attention-spectrum probe, RISING end — same mechanism as `spectrum-idle`,
     /// different region of the same p -> rate curve. Group A parked at
     /// (500,500), group B at (3000,500), a lone far control at (3000,8000).
     /// After 30s one B member (the TRAVELER, player 4) walks toward A at
@@ -81,7 +81,7 @@ enum Phase {
     /// proxy ahead of adoption), while the far control (p ~ 0) stays
     /// invisible throughout. Attention is likelihood-prioritized: the
     /// spectrum decides, distance only through p.
-    Approach,
+    SpectrumWarmup,
     /// Distance gradient: three PAIRS parked at increasing separation —
     /// close (~30u, inside proximity radius), mid (~400u), far (~4000u).
     /// Verdict: the close pair co-locates; the far pair NEVER does. Directly
@@ -154,8 +154,8 @@ fn parse_args() -> Args {
                     "cluster" => Phase::Cluster,
                     "defector" => Phase::Defector,
                     "gradient" => Phase::Gradient,
-                    "attention" => Phase::Attention,
-                    "approach" => Phase::Approach,
+                    "spectrum-idle" => Phase::SpectrumIdle,
+                    "spectrum-warmup" => Phase::SpectrumWarmup,
                     other => {
                         eprintln!("unknown phase: {other}");
                         std::process::exit(2);
@@ -653,7 +653,7 @@ fn main() {
                     disconnect_at_target: false,
                 }
             }
-            (Phase::Attention, _) => {
+            (Phase::SpectrumIdle, _) => {
                 // Four tight groups in four far corners; 2 players per group.
                 // Groups are ~14000u apart — far beyond proximity and screen
                 // radius, so cross-group interest must be ZERO.
@@ -676,7 +676,7 @@ fn main() {
                     disconnect_at_target: false,
                 }
             }
-            (Phase::Approach, _) => {
+            (Phase::SpectrumWarmup, _) => {
                 // 0,1: group A. 2,3: group B (+ traveler 4 starts IN B so its
                 // initial owner is B's cluster, guaranteed by proximity
                 // edges). 5: lone far control. Traveler departs at 30s and
@@ -797,8 +797,8 @@ fn main() {
                 | Phase::Cluster
                 | Phase::Defector
                 | Phase::Gradient
-                | Phase::Attention
-                | Phase::Approach
+                | Phase::SpectrumIdle
+                | Phase::SpectrumWarmup
         );
         if owners.len() > 1 && !transitioning && !end_state_phase {
             failures.push(format!(
@@ -838,8 +838,8 @@ fn main() {
                     | Phase::Cluster
                     | Phase::Defector
                     | Phase::Gradient
-                    | Phase::Attention
-                    | Phase::Approach
+                    | Phase::SpectrumIdle
+                    | Phase::SpectrumWarmup
             )
         {
             // Restart phase: the kill window legitimately gaps; freshness is
@@ -958,8 +958,8 @@ fn main() {
     }
 
     // ── Attention phase: interest-scoped visibility per observer ───────────
-    if args.phase == Phase::Attention {
-        assert!(args.players >= 8, "attention phase needs 8 players");
+    if args.phase == Phase::SpectrumIdle {
+        assert!(args.players >= 8, "spectrum-idle phase needs 8 players");
         let final_window = Duration::from_secs(10);
         let now = Instant::now();
 
@@ -1042,8 +1042,8 @@ fn main() {
     }
 
     // ── Approach phase: ANTICIPATORY replication (attention positive case) ──
-    if args.phase == Phase::Approach {
-        assert!(args.players >= 6, "approach phase needs 6 players");
+    if args.phase == Phase::SpectrumWarmup {
+        assert!(args.players >= 6, "spectrum-warmup phase needs 6 players");
         let a_center = (500.0f64, 500.0f64);
         let final_window = Duration::from_secs(10);
         let now = Instant::now();
@@ -1277,8 +1277,8 @@ fn main() {
                 Phase::Cluster => "cluster",
                 Phase::Defector => "defector",
                 Phase::Gradient => "gradient",
-                Phase::Attention => "attention",
-                Phase::Approach => "approach",
+                Phase::SpectrumIdle => "spectrum-idle",
+                Phase::SpectrumWarmup => "spectrum-warmup",
             }
         );
     } else {
