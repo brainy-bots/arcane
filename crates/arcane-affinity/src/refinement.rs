@@ -185,6 +185,17 @@ fn is_boundary_entity_adj(
 }
 
 /// Refine a partition by KL/FM local search.
+///
+/// Pair swaps are searched only when a constraint (capacity or min_gain)
+/// is active. In the unconstrained case they are provably redundant: at a
+/// single-move optimum every single-move gain is <= 0. For a non-adjacent
+/// cross-partition pair the swap gain is exactly the sum of the two single
+/// gains (<= 0). For an adjacent cross-pair with shared edge weight w > 0,
+/// each single gain counts +w for uncutting the shared edge while the swap
+/// keeps it cut, so swap gain = gain_a + gain_b - 2w < 0. No profitable
+/// swap exists that single moves cannot reach — and the O(boundary^2)
+/// swap search re-run after EVERY applied move was the manager's cycle
+/// wall (measured 13s/cycle at n=512; route was 9ms).
 pub fn refine(
     start: &Partition,
     edges: &[WeightedEdge],
@@ -193,6 +204,23 @@ pub fn refine(
 ) -> Partition {
     let mut current = start.clone();
     let adj = build_adjacency(edges);
+    let use_swaps = config.capacity > 0 || config.min_gain > 0.0;
+
+    // The entity set never changes during refinement: sort and index once.
+    // Partition sizes update incrementally on each applied move.
+    let mut all_entities: Vec<Uuid> = current.assignment().keys().copied().collect();
+    all_entities.sort();
+    let entity_index: HashMap<Uuid, usize> = all_entities
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i))
+        .collect();
+    let mut partition_sizes = vec![0usize; num_partitions];
+    for &p in current.assignment().values() {
+        if p < num_partitions {
+            partition_sizes[p] += 1;
+        }
+    }
 
     for _ in 0..config.max_passes {
         let mut improved = false;
@@ -201,23 +229,6 @@ pub fn refine(
             let mut best_move: Option<(usize, usize, f64)> = None;
             let mut best_swap: Option<(usize, usize, usize, usize, f64)> = None;
 
-            // Collect entities and sort for determinism
-            let mut all_entities: Vec<Uuid> = current.assignment().keys().copied().collect();
-            all_entities.sort();
-
-            // Index map for O(1) position lookups, and current per-partition sizes for capacity.
-            let entity_index: HashMap<Uuid, usize> = all_entities
-                .iter()
-                .enumerate()
-                .map(|(i, &e)| (e, i))
-                .collect();
-            let mut partition_sizes = vec![0usize; num_partitions];
-            for &p in current.assignment().values() {
-                if p < num_partitions {
-                    partition_sizes[p] += 1;
-                }
-            }
-
             // Precompute the boundary set once per inner iteration (O(V * degree)).
             let boundary: Vec<Uuid> = all_entities
                 .iter()
@@ -225,15 +236,54 @@ pub fn refine(
                 .filter(|&e| is_boundary_entity_adj(e, &current, &adj))
                 .collect();
 
-            // Single-vertex moves
+            // Single-vertex moves. One adjacency scan per entity yields the
+            // gain for EVERY target at once (external weight per partition
+            // minus internal weight): O(degree + k) per entity, replacing
+            // the O(k * degree) per-target rescan.
+            let mut external = vec![0.0f64; num_partitions];
             for entity in &boundary {
                 let entity_part = match current.of(*entity) {
                     Some(p) => p,
                     None => continue,
                 };
 
-                // `target_part` is used both as a partition index and as a value passed to the
-                // gain function, so an index loop is the clearest form here.
+                for x in external.iter_mut() {
+                    *x = 0.0;
+                }
+                let mut internal = 0.0f64;
+                let mut hard_locked = false;
+                if let Some(neighbors) = adj.get(entity) {
+                    for a in neighbors {
+                        let other_part = match current.of(a.other) {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        match a.colocation {
+                            Colocation::Hard => {
+                                // A Hard neighbor in our partition blocks
+                                // every move of this entity.
+                                if other_part == entity_part {
+                                    hard_locked = true;
+                                    break;
+                                }
+                            }
+                            Colocation::Soft => {
+                                if other_part == entity_part {
+                                    internal += a.weight;
+                                } else if other_part < num_partitions {
+                                    external[other_part] += a.weight;
+                                }
+                            }
+                            Colocation::CutFree => {}
+                        }
+                    }
+                }
+                if hard_locked {
+                    continue;
+                }
+
+                // `target_part` is used both as an index and a value; an index
+                // loop is the clearest form here.
                 #[allow(clippy::needless_range_loop)]
                 for target_part in 0..num_partitions {
                     if target_part == entity_part {
@@ -245,16 +295,10 @@ pub fn refine(
                         continue;
                     }
 
-                    let gain = match gain_single_move_adj(
-                        *entity,
-                        entity_part,
-                        target_part,
-                        &current,
-                        &adj,
-                    ) {
-                        Some(g) if g > config.min_gain => g,
-                        _ => continue,
-                    };
+                    let gain = external[target_part] - internal;
+                    if gain <= config.min_gain {
+                        continue;
+                    }
 
                     let entity_idx = entity_index[entity];
                     if best_move.is_none()
@@ -268,51 +312,53 @@ pub fn refine(
                 }
             }
 
-            // Pair swaps
-            for entity_a in &boundary {
-                let i = entity_index[entity_a];
-                let part_a = match current.of(*entity_a) {
-                    Some(p) => p,
-                    None => continue,
-                };
-
-                for entity_b in &boundary {
-                    let j = entity_index[entity_b];
-                    // Preserve the original ordering: only consider pairs with i < j.
-                    if j <= i {
-                        continue;
-                    }
-                    let part_b = match current.of(*entity_b) {
+            // Pair swaps (constrained configs only; see fn docs).
+            if use_swaps {
+                for entity_a in &boundary {
+                    let i = entity_index[entity_a];
+                    let part_a = match current.of(*entity_a) {
                         Some(p) => p,
                         None => continue,
                     };
 
-                    if part_a == part_b {
-                        continue;
-                    }
+                    for entity_b in &boundary {
+                        let j = entity_index[entity_b];
+                        // Preserve the original ordering: only consider pairs with i < j.
+                        if j <= i {
+                            continue;
+                        }
+                        let part_b = match current.of(*entity_b) {
+                            Some(p) => p,
+                            None => continue,
+                        };
 
-                    // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
-                    // so it can never violate capacity when the starting partition is valid.
-                    // No capacity check is needed here (unlike single moves).
-                    let gain = match gain_pair_swap_adj(
-                        *entity_a, part_a, *entity_b, part_b, &current, &adj,
-                    ) {
-                        Some(g) if g > config.min_gain => g,
-                        _ => continue,
-                    };
+                        if part_a == part_b {
+                            continue;
+                        }
 
-                    if best_swap.is_none()
-                        || gain > best_swap.unwrap().4
-                        || (gain == best_swap.unwrap().4
-                            && (i, j, part_a, part_b)
-                                < (
-                                    best_swap.unwrap().0,
-                                    best_swap.unwrap().1,
-                                    best_swap.unwrap().2,
-                                    best_swap.unwrap().3,
-                                ))
-                    {
-                        best_swap = Some((i, j, part_a, part_b, gain));
+                        // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
+                        // so it can never violate capacity when the starting partition is valid.
+                        // No capacity check is needed here (unlike single moves).
+                        let gain = match gain_pair_swap_adj(
+                            *entity_a, part_a, *entity_b, part_b, &current, &adj,
+                        ) {
+                            Some(g) if g > config.min_gain => g,
+                            _ => continue,
+                        };
+
+                        if best_swap.is_none()
+                            || gain > best_swap.unwrap().4
+                            || (gain == best_swap.unwrap().4
+                                && (i, j, part_a, part_b)
+                                    < (
+                                        best_swap.unwrap().0,
+                                        best_swap.unwrap().1,
+                                        best_swap.unwrap().2,
+                                        best_swap.unwrap().3,
+                                    ))
+                        {
+                            best_swap = Some((i, j, part_a, part_b, gain));
+                        }
                     }
                 }
             }
@@ -324,48 +370,28 @@ pub fn refine(
                 best_move.is_some()
             };
 
+            // Apply in place (Partition::set); sizes update incrementally.
             if apply_move {
                 if let Some((entity_idx, target_part, _)) = best_move {
                     let entity = all_entities[entity_idx];
-                    if let Some(new_partition) = Partition::from_assignment(
-                        current
-                            .assignment()
-                            .iter()
-                            .map(|(&e, &p)| {
-                                if e == entity {
-                                    (e, target_part)
-                                } else {
-                                    (e, p)
-                                }
-                            })
-                            .collect(),
-                    ) {
-                        current = new_partition;
-                        improved = true;
-                    }
-                }
-            } else if let Some((i, j, part_a, part_b, _)) = best_swap {
-                let entity_a = all_entities[i];
-                let entity_b = all_entities[j];
-
-                let new_assignment: HashMap<Uuid, usize> = current
-                    .assignment()
-                    .iter()
-                    .map(|(&e, &p)| {
-                        if e == entity_a {
-                            (e, part_b)
-                        } else if e == entity_b {
-                            (e, part_a)
-                        } else {
-                            (e, p)
+                    if let Some(from) = current.of(entity) {
+                        if from < num_partitions {
+                            partition_sizes[from] -= 1;
                         }
-                    })
-                    .collect();
-
-                if let Some(new_partition) = Partition::from_assignment(new_assignment) {
-                    current = new_partition;
+                    }
+                    if target_part < num_partitions {
+                        partition_sizes[target_part] += 1;
+                    }
+                    current.set(entity, target_part);
                     improved = true;
                 }
+            } else if let Some((i, j, part_a, part_b, _)) = best_swap {
+                // Size-neutral: no partition_sizes update needed.
+                let entity_a = all_entities[i];
+                let entity_b = all_entities[j];
+                current.set(entity_a, part_b);
+                current.set(entity_b, part_a);
+                improved = true;
             } else {
                 break;
             }

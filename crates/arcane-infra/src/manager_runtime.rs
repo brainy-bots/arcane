@@ -271,9 +271,12 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// Run one control cycle: evaluate, route, publish.
     pub fn run_cycle(&mut self) -> Result<CycleReport, String> {
         self.tick += 1;
+        let timing = std::env::var("ARCANE_DEBUG_TIMING").as_deref() == Ok("1");
+        let t_start = std::time::Instant::now();
 
         // 1. Evaluate the manager.
         self.manager.run_evaluation_cycle()?;
+        let t_eval = t_start.elapsed();
 
         // 2. Drain newly-decided flips and append to pending_flips (with dedup).
         let new_flips = self.manager.take_pending_flips();
@@ -364,6 +367,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
         }
 
         // 5. Route: first with confirmed flips in ownership, then with force_include for pending.
+        let t5 = std::time::Instant::now();
         let router_input = RouterInput {
             tick: self.tick,
             assignments: &self.assignments,
@@ -415,6 +419,16 @@ impl<B: InboxBus> ManagerRuntime<B> {
             self.gate.observe(flip.entity_id, delivered, self.tick);
         }
 
+        let t_route = t5.elapsed();
+        if timing && self.tick % 5 == 0 {
+            eprintln!(
+                "[cycle timing] tick {} eval={:?} route={:?} total_so_far={:?}",
+                self.tick,
+                t_eval,
+                t_route,
+                t_start.elapsed()
+            );
+        }
         // 7. Publish frames to the bus (skipped under the execution split:
         // arcane-router workers publish from the table at data cadence).
         let mut published = 0;

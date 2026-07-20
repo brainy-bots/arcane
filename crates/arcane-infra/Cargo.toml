@@ -54,6 +54,14 @@ name = "arcane-rapier-node"
 path = "src/bin/arcane_rapier_node.rs"
 required-features = ["rapier-cluster"]
 
+[[example]]
+name = "migration_observer"
+required-features = ["migration"]
+
+[[test]]
+name = "manager_scale"
+required-features = ["migration"]
+
 [dev-dependencies]
 redis = "0.27"
 tungstenite = "0.21"

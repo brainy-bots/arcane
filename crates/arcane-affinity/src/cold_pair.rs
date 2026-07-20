@@ -102,71 +102,96 @@ pub fn screen_candidates(
     let feature_map: std::collections::HashMap<Uuid, &FeatureMap> =
         features.iter().map(|(id, fm)| (*id, fm)).collect();
 
-    // (a) Spatial convergence: sweep with simple pairwise check (O(N²))
-    // For scale testing, a SpatialIndex could optimize this; for now, keep it simple and correct.
-    for i in 0..players.len() {
-        for j in (i + 1)..players.len() {
-            let (a, pos_a, vel_a) = players[i];
-            let (b, pos_b, vel_b) = players[j];
+    // Index players for O(1) lookups by id (used by (b) and (c)).
+    let player_index: std::collections::HashMap<Uuid, usize> = players
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _, _))| (*id, i))
+        .collect();
 
-            // Skip if already strongly connected
-            if graph.get_weight(a, b) >= hot_floor {
-                continue;
-            }
-
-            let dx = pos_b.x - pos_a.x;
-            let dy = pos_b.y - pos_a.y;
-            let distance = (dx * dx + dy * dy).sqrt();
-
-            // Check spatial proximity
-            if distance <= screen_radius {
-                let cs = closing_speed(pos_a, pos_b, vel_a, vel_b);
-                if cs >= min_closing_speed {
-                    candidates.push(ScreenCandidate {
-                        a,
-                        b,
-                        pos_a,
-                        pos_b,
-                        vel_a,
-                        vel_b,
-                        history_weight: graph.get_weight(a, b),
-                    });
+    // (a) Spatial convergence via uniform grid: cell = screen_radius, check
+    // the 3x3 neighborhood. O(N·k) with k = local density, replacing the
+    // all-pairs sweep that dominated the scale probe (36ms@128 -> 105s@1024
+    // was mostly THIS loop plus the per-pair graph rescan in (b)).
+    let cell = screen_radius.max(1.0);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, (_, pos, _)) in players.iter().enumerate() {
+        let key = ((pos.x / cell).floor() as i64, (pos.y / cell).floor() as i64);
+        grid.entry(key).or_default().push(i);
+    }
+    for (i, (a, pos_a, vel_a)) in players.iter().enumerate() {
+        let (cx, cy) = ((pos_a.x / cell).floor() as i64, (pos_a.y / cell).floor() as i64);
+        for dx_cell in -1..=1 {
+            for dy_cell in -1..=1 {
+                let Some(bucket) = grid.get(&(cx + dx_cell, cy + dy_cell)) else {
                     continue;
+                };
+                for &j in bucket {
+                    if j <= i {
+                        continue; // each unordered pair once
+                    }
+                    let (b, pos_b, vel_b) = players[j];
+                    if graph.get_weight(*a, b) >= hot_floor {
+                        continue;
+                    }
+                    let dx = pos_b.x - pos_a.x;
+                    let dy = pos_b.y - pos_a.y;
+                    if dx * dx + dy * dy > screen_radius * screen_radius {
+                        continue;
+                    }
+                    let cs = closing_speed(*pos_a, pos_b, *vel_a, vel_b);
+                    if cs >= min_closing_speed {
+                        candidates.push(ScreenCandidate {
+                            a: *a,
+                            b,
+                            pos_a: *pos_a,
+                            pos_b,
+                            vel_a: *vel_a,
+                            vel_b,
+                            history_weight: graph.get_weight(*a, b),
+                        });
+                    }
                 }
             }
+        }
+    }
 
-            // (b) Graph adjacency: neighbors-of-neighbors
-            // Build neighbor sets and check for mutual neighbors
-            let mut neighbors_a = Vec::new();
-            let mut neighbors_b = Vec::new();
-            for (na, nb, weight) in graph.pairs() {
-                if weight > 0.0 {
-                    if na == a {
-                        neighbors_a.push(nb);
-                    } else if nb == a {
-                        neighbors_a.push(na);
-                    }
-                    if nb == b {
-                        neighbors_b.push(na);
-                    } else if na == b {
-                        neighbors_b.push(nb);
-                    }
+    // (b) Graph adjacency (neighbors-of-neighbors) by walking the graph
+    // ONCE: adjacency built in O(E); then for every 2-path a—n—b with no
+    // a—b edge, emit the pair. O(sum(deg²)) — bounded-degree graphs stay
+    // near-linear. The old code rebuilt both neighbor lists from a FULL
+    // edge scan inside the N²/2 pair loop: O(N²·E).
+    let mut adjacency: std::collections::HashMap<Uuid, Vec<Uuid>> =
+        std::collections::HashMap::new();
+    for (na, nb, weight) in graph.pairs() {
+        if weight > 0.0 {
+            adjacency.entry(na).or_default().push(nb);
+            adjacency.entry(nb).or_default().push(na);
+        }
+    }
+    for (n, neighbors) in &adjacency {
+        let _ = n;
+        for (ai, &a) in neighbors.iter().enumerate() {
+            for &b in neighbors.iter().skip(ai + 1) {
+                if graph.get_weight(a, b) >= hot_floor {
+                    continue; // strongly connected already (same rule as (a))
                 }
-            }
-
-            for &neighbor_a in &neighbors_a {
-                if neighbors_b.contains(&neighbor_a) {
-                    candidates.push(ScreenCandidate {
-                        a,
-                        b,
-                        pos_a,
-                        pos_b,
-                        vel_a,
-                        vel_b,
-                        history_weight: graph.get_weight(a, b),
-                    });
-                    break;
-                }
+                let (Some(&ia), Some(&ib)) = (player_index.get(&a), player_index.get(&b))
+                else {
+                    continue; // not in the current view
+                };
+                let (_, pos_a, vel_a) = players[ia];
+                let (_, pos_b, vel_b) = players[ib];
+                candidates.push(ScreenCandidate {
+                    a,
+                    b,
+                    pos_a,
+                    pos_b,
+                    vel_a,
+                    vel_b,
+                    history_weight: graph.get_weight(a, b),
+                });
             }
         }
     }
@@ -196,18 +221,19 @@ pub fn screen_candidates(
                         continue;
                     }
 
-                    // Find positions in players array
-                    if let (Some((_, pos_a, vel_a)), Some((_, pos_b, vel_b))) = (
-                        players.iter().find(|(id, _, _)| *id == a),
-                        players.iter().find(|(id, _, _)| *id == b),
-                    ) {
+                    // O(1) lookups via the player index.
+                    if let (Some(&ia), Some(&ib)) =
+                        (player_index.get(&a), player_index.get(&b))
+                    {
+                        let (_, pos_a, vel_a) = players[ia];
+                        let (_, pos_b, vel_b) = players[ib];
                         candidates.push(ScreenCandidate {
                             a,
                             b,
-                            pos_a: *pos_a,
-                            pos_b: *pos_b,
-                            vel_a: *vel_a,
-                            vel_b: *vel_b,
+                            pos_a,
+                            pos_b,
+                            vel_a,
+                            vel_b,
                             history_weight: graph.get_weight(a, b),
                         });
                     }

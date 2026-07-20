@@ -59,6 +59,12 @@ impl Partition {
         &self.assignment
     }
 
+    /// Reassign one entity in place (refinement's move primitive — avoids
+    /// cloning the whole map per move).
+    pub fn set(&mut self, entity: Uuid, part: usize) {
+        self.assignment.insert(entity, part);
+    }
+
     pub(crate) fn from_assignment(assignment: HashMap<Uuid, usize>) -> Option<Self> {
         if assignment.is_empty() {
             return None;

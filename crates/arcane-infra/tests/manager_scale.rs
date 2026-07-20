@@ -90,3 +90,13 @@ fn manager_cycle_time_vs_entity_count() {
     probe(128, 16, 16, 6); // 2048
     probe(256, 16, 16, 4); // 4096
 }
+
+/// Quick phase-profiling run: one size, ARCANE_DEBUG_TIMING on.
+/// cargo test -p arcane-infra --features migration --release \
+///   --test manager_scale -- profile_512 --nocapture --ignored
+#[test]
+#[ignore]
+fn profile_512() {
+    std::env::set_var("ARCANE_DEBUG_TIMING", "1");
+    probe(32, 16, 8, 10);
+}

@@ -694,7 +694,10 @@ impl ArcaneManager {
         };
 
         // Keep the existing evaluate() call for compatibility.
+        let timing = std::env::var("ARCANE_DEBUG_TIMING").as_deref() == Ok("1");
+        let t0 = std::time::Instant::now();
         let _decisions = self.model.evaluate(&view);
+        let t_model = t0.elapsed();
 
         self.migration_state.advance_tick();
 
@@ -705,36 +708,56 @@ impl ArcaneManager {
             self.config.gc_interval,
         );
 
-        // Record this cycle's signals into the graph.
+        // Record this cycle's signals into the graph. Proximity via a
+        // uniform grid (cell = proximity_radius, 3x3 neighborhood): O(N·k)
+        // with k = local density, replacing the all-pairs O(N²) scan that
+        // dominated cycle time in the scale probe. Weight scaled by
+        // relative speed (arcane#290 improvement #2): pass-throughs accrue
+        // ~20%, parked/co-moving pairs full weight.
         let players = &view.players;
-        for i in 0..players.len() {
-            for j in (i + 1)..players.len() {
-                let a = &players[i];
-                let b = &players[j];
-
-                // Proximity pairs (config radius/weight), scaled by relative
-                // speed (arcane#290 improvement #2): a 2s pass-through at
-                // 240 u/s closing speed used to accumulate weight like
-                // standing together, so crossing lanes merged and converge
-                // contact contaminated the graph for hundreds of decay
-                // cycles. Co-moving or parked pairs (rel speed ~0) keep
-                // full weight; pairs passing at >= 4x walking speed accrue
-                // ~20%. Sustained proximity still builds edges — slower.
-                let dx = a.position.x - b.position.x;
-                let dy = a.position.y - b.position.y;
-                let radius_sq = self.config.proximity_radius * self.config.proximity_radius;
-                if dx * dx + dy * dy <= radius_sq {
-                    let rvx = a.velocity.x - b.velocity.x;
-                    let rvy = a.velocity.y - b.velocity.y;
-                    let rel_speed = (rvx * rvx + rvy * rvy).sqrt();
-                    // Half-weight at 60 u/s relative (walking speed).
-                    let speed_scale = 1.0 / (1.0 + rel_speed / 60.0);
-                    self.interaction_graph.record_interaction(
-                        a.player_id,
-                        b.player_id,
-                        self.config.proximity_weight * speed_scale,
-                        InteractionKind::Proximity,
-                    );
+        let radius = self.config.proximity_radius;
+        let radius_sq = radius * radius;
+        let cell = radius.max(1.0);
+        let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, p) in players.iter().enumerate() {
+            let key = (
+                (p.position.x / cell).floor() as i64,
+                (p.position.y / cell).floor() as i64,
+            );
+            grid.entry(key).or_default().push(i);
+        }
+        for (i, a) in players.iter().enumerate() {
+            let (cx, cy) = (
+                (a.position.x / cell).floor() as i64,
+                (a.position.y / cell).floor() as i64,
+            );
+            for dxc in -1..=1 {
+                for dyc in -1..=1 {
+                    let Some(bucket) = grid.get(&(cx + dxc, cy + dyc)) else {
+                        continue;
+                    };
+                    for &j in bucket {
+                        if j <= i {
+                            continue;
+                        }
+                        let b = &players[j];
+                        let dx = a.position.x - b.position.x;
+                        let dy = a.position.y - b.position.y;
+                        if dx * dx + dy * dy > radius_sq {
+                            continue;
+                        }
+                        let rvx = a.velocity.x - b.velocity.x;
+                        let rvy = a.velocity.y - b.velocity.y;
+                        let rel_speed = (rvx * rvx + rvy * rvy).sqrt();
+                        // Half-weight at 60 u/s relative (walking speed).
+                        let speed_scale = 1.0 / (1.0 + rel_speed / 60.0);
+                        self.interaction_graph.record_interaction(
+                            a.player_id,
+                            b.player_id,
+                            self.config.proximity_weight * speed_scale,
+                            InteractionKind::Proximity,
+                        );
+                    }
                 }
             }
         }
@@ -778,6 +801,7 @@ impl ArcaneManager {
             self.interaction_graph.record_interaction(a, b, 1.0, kind);
         }
 
+        let t_accrue = t0.elapsed();
         // Unified screen+predict pipeline for cold-pair promotion.
         // Screen pass: find candidate pairs from spatial + graph + feature proximity.
         let players_array: Vec<(Uuid, Vec2, Vec2)> = view
@@ -895,6 +919,7 @@ impl ArcaneManager {
             }
         }
 
+        let t_predict = t0.elapsed();
         // Clean up departed entities from the graph.
         let current_entities: std::collections::HashSet<Uuid> =
             view.players.iter().map(|p| p.player_id).collect();
@@ -914,6 +939,7 @@ impl ArcaneManager {
         }
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
+        let t_pre_part = t0.elapsed();
         let resolved = build_partition_decisions(
             &view,
             &current_assignments,
@@ -923,6 +949,17 @@ impl ArcaneManager {
             &self.known_clusters,
         );
 
+        let t_partition = t0.elapsed();
+        if timing && self.eval_cycle % 5 == 0 {
+            eprintln!(
+                "[eval timing] cycle {} model={:?} accrue={:?} screen+predict={:?} partition={:?}",
+                self.eval_cycle,
+                t_model,
+                t_accrue - t_model,
+                t_predict - t_accrue,
+                t_partition - t_pre_part
+            );
+        }
         // Diagnostics (ARCANE_DEBUG_PARTITION=1): the wedge class of failure
         // is silent — a partitioner that never proposes a change produces no
         // flips, no declines, nothing in the logs. Surface the graph state
