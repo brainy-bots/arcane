@@ -55,6 +55,15 @@ pub struct RouterConfig {
     /// binary defaults to 10 Hz; the manager's in-process pass runs at its
     /// decision cadence).
     pub router_hz: f64,
+    /// Per-consumer replication budget in Hz (sum of delivered rates to one
+    /// cluster). The spectrum curve is the ORDERING; the budget sets its
+    /// SCALE by water-filling (`allocate_rates`): with headroom everyone in
+    /// range replicates at full speed, under saturation rates degrade
+    /// continuously ordered by p — never a full-or-zero cliff. Default
+    /// INFINITY = disabled (mechanism exists and is tested; calibrate from
+    /// measured node ingest limits, not guesses). Forced (gate) entities
+    /// bypass the budget: correctness traffic, never attention-priced.
+    pub consumer_budget_hz: f64,
 }
 
 impl Default for RouterConfig {
@@ -63,6 +72,7 @@ impl Default for RouterConfig {
             rate_law: RateLawConfig::default(),
             default_dynamism: 1.0,
             router_hz: 2.0,
+            consumer_budget_hz: f64::INFINITY,
         }
     }
 }
@@ -375,6 +385,30 @@ pub fn route_from_doc(
     config: &RouterConfig,
     router_tick: u64,
 ) -> NodeInboxFrame {
+    // Budget allocation across THIS consumer's unforced candidates: the
+    // spectrum signal orders, the budget scales (water-filling). With the
+    // default infinite budget this reduces exactly to the plain rate law
+    // (allocate_rates saturates everyone with k=inf: rate = max_hz *
+    // min(1, s) = refresh_rate_hz). Forced candidates are excluded — the
+    // gate's warm-up traffic is correctness, not attention, and must not
+    // be starved by a crowded consumer.
+    let signals: HashMap<Uuid, f64> = doc
+        .interest
+        .iter()
+        .filter(|c| !c.forced)
+        .map(|c| {
+            (
+                c.entity_id,
+                (c.p * config.default_dynamism).clamp(0.0, 1.0),
+            )
+        })
+        .collect();
+    let granted = arcane_affinity::rate_field::allocate_rates(
+        &signals,
+        config.consumer_budget_hz,
+        &config.rate_law,
+    );
+
     let mut entities: Vec<ReplicatedEntity> = doc
         .interest
         .iter()
@@ -386,9 +420,9 @@ pub fn route_from_doc(
             let (rate_hz, tier) = if cand.forced {
                 (config.rate_law.max_hz, RateTier::Full)
             } else {
-                let hz = refresh_rate_hz(cand.p, config.default_dynamism, &config.rate_law);
+                let hz = granted.get(&cand.entity_id).copied().unwrap_or(0.0);
                 if hz <= 0.0 {
-                    return None; // below the zero floor: never delivered
+                    return None; // below the (possibly load-contracted) floor
                 }
                 if !cadence_due(router_tick, cand.entity_id, hz, config) {
                     return None; // not due this frame; will be due on its cadence

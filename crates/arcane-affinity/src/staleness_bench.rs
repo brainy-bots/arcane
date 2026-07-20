@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::rate_field::{apply_budget, refresh_rate_hz, RateLawConfig};
+use crate::rate_field::{allocate_rates, RateLawConfig};
 
 /// Scenario input: interest and dynamism for one entity from a consumer's perspective.
 #[derive(Clone, Copy, Debug)]
@@ -64,8 +64,9 @@ pub fn age_from_rate(rate_hz: f64, window_secs: f64) -> f64 {
 
 /// Compute staleness under the rate field strategy.
 ///
-/// 1. Compute each entity's desired rate via `refresh_rate_hz(p, dynamism, law)`.
-/// 2. Apply the per-consumer budget via `apply_budget`.
+/// 1. Compute each entity's spectrum signal `s = clamp(p * dynamism)`.
+/// 2. Allocate rates under the per-consumer budget via `allocate_rates`
+///    (water-filling: the curve is the ordering, the budget sets its scale).
 /// 3. For each entity, compute `age = age_from_rate(granted_hz, window_secs)`.
 /// 4. Return `Sum p*age` (interaction-weighted staleness).
 pub fn rate_field_staleness(
@@ -73,15 +74,16 @@ pub fn rate_field_staleness(
     cfg: &BenchConfig,
     law: &RateLawConfig,
 ) -> f64 {
-    // Step 1: compute desired rates
-    let mut desired = HashMap::new();
+    // Step 1: spectrum signals (the allocator applies the rate law itself:
+    // scaling to Hz, the zero floor on the scaled signal, the max cap).
+    let mut signals = HashMap::new();
     for (idx, entity) in entities.iter().enumerate() {
-        let rate = refresh_rate_hz(entity.p, entity.dynamism, law);
-        desired.insert(Uuid::from_u128(idx as u128), rate);
+        let s = (entity.p * entity.dynamism).clamp(0.0, 1.0);
+        signals.insert(Uuid::from_u128(idx as u128), s);
     }
 
-    // Step 2: apply budget
-    let granted = apply_budget(&desired, cfg.budget_hz);
+    // Step 2: budget-aware allocation
+    let granted = allocate_rates(&signals, cfg.budget_hz, law);
 
     // Step 3 & 4: compute interaction-weighted staleness
     let mut staleness = 0.0;
@@ -257,10 +259,15 @@ mod tests {
 
     #[test]
     fn test_degenerate_equal_scenario() {
-        // All entities identical: same p, dynamism, distance.
-        // With no SKEW, AOI's uniform distribution within the circle is actually efficient,
-        // so improvement_fraction can be near zero or slightly negative. The key is that
-        // the win doesn't come from lack of skew (it comes from skew), so this is expected.
+        // All entities identical: same p, dynamism, distance. Historical
+        // note: under the old GREEDY budget (full-or-zero cut) this scenario
+        // showed ~no advantage — the cliff wasted the tail exactly like AOI
+        // does, so the two strategies tied. Water-filling changed that: with
+        // equal signals everyone shares the budget equally, no entity eats
+        // window-staleness, and the rate field beats binary AOI EVEN WITHOUT
+        // SKEW (AOI's loss here is structural: out-of-AOI entities pay the
+        // full window regardless of skew). The improvement is real, not an
+        // artifact — assert it, plus the equal-share property itself.
         let entities = vec![
             ConsumerEntity {
                 p: 0.5,
@@ -293,11 +300,11 @@ mod tests {
         let law = RateLawConfig::default();
         let result = compare_c2(&entities, &cfg, &law);
 
-        // With identical inputs (no skew), improvement is near zero or slightly negative.
-        // The rate field doesn't have an advantage without SKEW in interest/dynamism.
+        // Water-filling beats binary AOI even here (see comment above):
+        // rf staleness = 4 * 0.5 * age(2.5Hz) = 0.4 vs AOI 1.1.
         assert!(
-            result.improvement_fraction.abs() < 0.5,
-            "degenerate scenario should have modest improvement (near zero), got {}",
+            result.improvement_fraction > 0.0 && result.improvement_fraction < 1.0,
+            "water-filling should structurally beat binary AOI, got {}",
             result.improvement_fraction
         );
     }

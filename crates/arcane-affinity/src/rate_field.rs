@@ -54,42 +54,104 @@ pub fn rate_tier(p: f64, dynamism: f64, config: &RateLawConfig) -> RateTier {
     }
 }
 
-/// Apply per-consumer budget by greedily granting full rate to highest-interest entities.
-/// When sum(desired) exceeds budget, demote least-critical entities to zero.
-/// Returns the granted rate per entity (same keys as input).
-/// Ties are broken by Uuid ascending for determinism.
-pub fn apply_budget(desired: &HashMap<Uuid, f64>, budget_hz: f64) -> HashMap<Uuid, f64> {
-    let sum_desired: f64 = desired.values().sum();
-
-    if sum_desired <= budget_hz {
-        return desired.clone();
-    }
-
-    // Sort by desired rate descending, then by Uuid ascending for tie-break.
-    let mut sorted: Vec<_> = desired.iter().collect();
-    sorted.sort_by(|a, b| {
-        b.1.partial_cmp(a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(b.0))
-    });
-
-    let mut granted = HashMap::new();
-    let mut running_total = 0.0;
-
-    for (entity, rate) in sorted {
-        if running_total + rate <= budget_hz {
-            granted.insert(*entity, *rate);
-            running_total += rate;
-        } else {
-            granted.insert(*entity, 0.0);
+/// Budget-aware rate allocation: the spectrum curve is the ORDERING, the
+/// budget only sets its SCALE (water-filling). `rate_i = max_hz * min(1,
+/// k * s_i)` with k chosen so the total fits `budget_hz`.
+///
+/// - Budget DISABLED (`budget_hz` infinite, the default): k = 1 — the
+///   allocation is exactly the plain spectrum curve (`refresh_rate_hz`).
+///   No boost, no squeeze; today's behavior, bit for bit.
+/// - Headroom (finite budget covering everyone at max_hz): k is unbounded —
+///   every entity in range replicates at FULL speed. "Only two in range ->
+///   both at full rate": configuring a real budget states that unused
+///   capacity SHOULD be spent, so the curve is boosted to saturation.
+/// - Saturation: k shrinks and rates degrade CONTINUOUSLY, ordered by s.
+///   Higher s always gets >= the rate of lower s; adjacent s get adjacent
+///   rates (no full-or-zero cliff at the budget line — a greedy cut would
+///   re-introduce binary attention exactly at the stress boundary).
+/// - `zero_floor` applies to the SCALED signal: under load the tail drops
+///   below the floor and vanishes — the attention horizon contracts when
+///   the system is busy and expands when idle, emergently.
+///
+/// Inputs are raw spectrum signals `s = clamp(p * dynamism)` per entity
+/// (NOT Hz). Pure and deterministic: any stateless router worker computes
+/// the same allocation from the same doc. Forced (gate) entities must be
+/// handled OUTSIDE this function — they are correctness traffic, never
+/// budgeted.
+pub fn allocate_rates(
+    signals: &HashMap<Uuid, f64>,
+    budget_hz: f64,
+    config: &RateLawConfig,
+) -> HashMap<Uuid, f64> {
+    let mut granted: HashMap<Uuid, f64> = HashMap::new();
+    // Positive-signal entities, sorted by s DESC then Uuid ASC (determinism).
+    let mut active: Vec<(Uuid, f64)> = signals
+        .iter()
+        .filter(|(_, s)| **s > 0.0)
+        .map(|(id, s)| (*id, s.clamp(0.0, 1.0)))
+        .collect();
+    for (id, s) in signals {
+        if *s <= 0.0 {
+            granted.insert(*id, 0.0);
         }
     }
-
-    // Ensure all input keys are present.
-    for entity in desired.keys() {
-        granted.entry(*entity).or_insert(0.0);
+    if active.is_empty() {
+        return granted;
     }
+    active.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 
+    let n = active.len();
+    let full_total = config.max_hz * n as f64;
+    // k = the water level. Infinite budget = mechanism DISABLED = plain
+    // curve (k=1). A finite budget covering everyone at max => k unbounded
+    // => all full rate (spend the capacity that was declared available).
+    let k = if !budget_hz.is_finite() {
+        1.0
+    } else if budget_hz >= full_total {
+        f64::INFINITY
+    } else if budget_hz <= 0.0 {
+        0.0
+    } else {
+        // Find m = number of SATURATED entities (top of the sort). For a
+        // candidate m: the unsaturated tail shares the remaining budget in
+        // proportion to s, k = (budget - m*max) / (max * sum_tail_s).
+        // Consistency: the first unsaturated entity must really be under
+        // the cap (k*s < 1) and the last saturated one over it (k*s >= 1).
+        // k is monotone in m, so exactly one m is consistent; n is small
+        // (one doc's candidates), the linear scan is fine.
+        let mut chosen = 0.0;
+        for m in 0..n {
+            let tail_s: f64 = active[m..].iter().map(|(_, s)| s).sum();
+            if tail_s <= 0.0 {
+                break;
+            }
+            let k = (budget_hz - config.max_hz * m as f64) / (config.max_hz * tail_s);
+            if k <= 0.0 {
+                break;
+            }
+            let first_unsat_ok = k * active[m].1 < 1.0;
+            let last_sat_ok = m == 0 || k * active[m - 1].1 >= 1.0;
+            if first_unsat_ok && last_sat_ok {
+                chosen = k;
+                break;
+            }
+        }
+        chosen
+    };
+
+    for (id, s) in active {
+        let s_eff = (k * s).min(1.0);
+        let rate = if s_eff < config.zero_floor {
+            0.0
+        } else {
+            config.max_hz * s_eff
+        };
+        granted.insert(id, rate);
+    }
     granted
 }
 
@@ -147,76 +209,120 @@ mod tests {
         assert_eq!(tier, RateTier::Low);
     }
 
-    #[test]
-    fn test_budget_no_pressure() {
-        let mut desired = HashMap::new();
-        desired.insert(Uuid::nil(), 10.0);
-        desired.insert(Uuid::max(), 5.0);
-
-        let budget = 20.0;
-        let granted = apply_budget(&desired, budget);
-
-        assert_eq!(granted[&Uuid::nil()], 10.0);
-        assert_eq!(granted[&Uuid::max()], 5.0);
+    fn sig(pairs: &[(u8, f64)]) -> HashMap<Uuid, f64> {
+        pairs
+            .iter()
+            .map(|(n, s)| (Uuid::from_bytes([*n; 16]), *s))
+            .collect()
     }
 
     #[test]
-    fn test_budget_demotion() {
-        let e1 = Uuid::nil();
-        let e2 = Uuid::max();
-        let e3 = Uuid::new_v4();
-
-        let mut desired = HashMap::new();
-        desired.insert(e1, 5.0);
-        desired.insert(e2, 3.0);
-        desired.insert(e3, 2.0);
-
-        // Budget only affords the top two (5.0 + 3.0 = 8.0)
-        let budget = 8.0;
-        let granted = apply_budget(&desired, budget);
-
-        assert_eq!(granted[&e1], 5.0);
-        assert_eq!(granted[&e2], 3.0);
-        assert_eq!(granted[&e3], 0.0);
+    fn test_allocate_headroom_everyone_full() {
+        // The founder's case: only two in range and a REAL budget with
+        // headroom -> BOTH at full speed, regardless of their p ordering.
+        let config = RateLawConfig::default();
+        let signals = sig(&[(1, 0.9), (2, 0.3)]);
+        let granted = allocate_rates(&signals, config.max_hz * 2.0, &config);
+        assert_eq!(granted[&Uuid::from_bytes([1; 16])], config.max_hz);
+        assert_eq!(granted[&Uuid::from_bytes([2; 16])], config.max_hz);
     }
 
     #[test]
-    fn test_budget_demotion_determinism() {
-        // Three entities with the same desired rate; ties break by Uuid ascending.
-        let e1 = "00000000-0000-0000-0000-000000000001"
-            .parse::<Uuid>()
-            .unwrap();
-        let e2 = "00000000-0000-0000-0000-000000000002"
-            .parse::<Uuid>()
-            .unwrap();
-        let e3 = "00000000-0000-0000-0000-000000000003"
-            .parse::<Uuid>()
-            .unwrap();
-
-        let mut desired = HashMap::new();
-        desired.insert(e1, 2.0);
-        desired.insert(e2, 2.0);
-        desired.insert(e3, 2.0);
-
-        // Budget affords only two full rates.
-        let budget = 4.0;
-        let granted = apply_budget(&desired, budget);
-
-        // The two with lowest Uuid should be granted; e3 demoted.
-        assert_eq!(granted[&e1], 2.0);
-        assert_eq!(granted[&e2], 2.0);
-        assert_eq!(granted[&e3], 0.0);
+    fn test_allocate_disabled_is_plain_curve() {
+        // budget = INFINITY means the mechanism is OFF: allocation must be
+        // exactly refresh_rate_hz for every entity — including the zero
+        // floor (a p~0 straggler must NOT be boosted to full rate just
+        // because no budget was configured).
+        let config = RateLawConfig::default();
+        let signals = sig(&[(1, 0.9), (2, 0.3), (3, 0.01)]);
+        let granted = allocate_rates(&signals, f64::INFINITY, &config);
+        for (id, s) in &signals {
+            assert_eq!(
+                granted[id],
+                refresh_rate_hz(*s, 1.0, &config),
+                "disabled budget must equal the plain curve at s={s}"
+            );
+        }
+        assert_eq!(granted[&Uuid::from_bytes([3; 16])], 0.0);
     }
 
     #[test]
-    fn test_budget_zero() {
-        let mut desired = HashMap::new();
-        desired.insert(Uuid::nil(), 5.0);
-        desired.insert(Uuid::max(), 3.0);
+    fn test_allocate_saturation_monotone_no_cliff() {
+        let config = RateLawConfig::default();
+        let signals = sig(&[(1, 0.9), (2, 0.6), (3, 0.5), (4, 0.4)]);
+        // Budget = half of everyone-full.
+        let budget = config.max_hz * 2.0;
+        let granted = allocate_rates(&signals, budget, &config);
+        let g = |n: u8| granted[&Uuid::from_bytes([n; 16])];
+        // Total fits.
+        let total: f64 = granted.values().sum();
+        assert!(total <= budget + 1e-9, "total {total} > budget {budget}");
+        // Monotone in s.
+        assert!(g(1) >= g(2) && g(2) >= g(3) && g(3) >= g(4));
+        // No cliff: adjacent s values (0.5 vs 0.4) must get rates in
+        // roughly their signal ratio, NOT full-vs-zero.
+        assert!(g(4) > 0.0, "adjacent-s entity fell off a cliff");
+        assert!(g(3) / g(4) < 2.0, "rate gap {} vs {} disproportionate", g(3), g(4));
+    }
 
-        let granted = apply_budget(&desired, 0.0);
+    #[test]
+    fn test_allocate_water_level_saturates_top() {
+        let config = RateLawConfig::default();
+        // One dominant, two weak; budget affords ~1.5 full rates. The
+        // dominant SATURATES at max_hz (never exceeds it), the tail shares
+        // the remainder proportionally.
+        let signals = sig(&[(1, 1.0), (2, 0.2), (3, 0.1)]);
+        let budget = config.max_hz * 1.5;
+        let granted = allocate_rates(&signals, budget, &config);
+        let g = |n: u8| granted[&Uuid::from_bytes([n; 16])];
+        assert!((g(1) - config.max_hz).abs() < 1e-9, "top should saturate");
+        assert!(g(2) > g(3) && g(3) > 0.0);
+        let tail_ratio = g(2) / g(3);
+        assert!((tail_ratio - 2.0).abs() < 0.2, "tail not proportional: {tail_ratio}");
+    }
 
-        assert_eq!(granted[&Uuid::nil()], 0.0);
-        assert_eq!(granted[&Uuid::max()], 0.0);
+    #[test]
+    fn test_allocate_floor_contracts_horizon_under_load() {
+        let config = RateLawConfig::default();
+        // Weak signal above the floor unloaded, pushed below it when the
+        // budget squeezes k: horizon contracts under load.
+        let signals_unloaded = sig(&[(1, 0.05)]);
+        let g_unloaded = allocate_rates(&signals_unloaded, config.max_hz * 100.0, &config);
+        assert!(g_unloaded[&Uuid::from_bytes([1; 16])] > 0.0);
+
+        let mut signals_loaded = sig(&[(1, 0.05)]);
+        for n in 2..=20u8 {
+            signals_loaded.insert(Uuid::from_bytes([n; 16]), 1.0);
+        }
+        // Budget: enough for ~a quarter of the strong entities. k =
+        // (5*max)/(max*19.05) = 0.26; weak s_eff = 0.013 < floor 0.02.
+        let g_loaded = allocate_rates(&signals_loaded, config.max_hz * 5.0, &config);
+        assert_eq!(
+            g_loaded[&Uuid::from_bytes([1; 16])],
+            0.0,
+            "weak signal should drop below the floor under load"
+        );
+    }
+
+    #[test]
+    fn test_allocate_zero_budget_and_zero_signal() {
+        let config = RateLawConfig::default();
+        let signals = sig(&[(1, 0.9), (2, 0.0)]);
+        let granted = allocate_rates(&signals, 0.0, &config);
+        assert_eq!(granted[&Uuid::from_bytes([1; 16])], 0.0);
+        assert_eq!(granted[&Uuid::from_bytes([2; 16])], 0.0);
+    }
+
+    #[test]
+    fn test_allocate_deterministic() {
+        let config = RateLawConfig::default();
+        let signals = sig(&[(3, 0.5), (1, 0.5), (2, 0.5)]);
+        let a = allocate_rates(&signals, config.max_hz * 1.0, &config);
+        let b = allocate_rates(&signals, config.max_hz * 1.0, &config);
+        assert_eq!(a, b);
+        // Equal signals, equal rates: continuous sharing has no tie-break
+        // winners (unlike a greedy cut).
+        let vals: Vec<f64> = a.values().copied().collect();
+        assert!((vals[0] - vals[1]).abs() < 1e-9 && (vals[1] - vals[2]).abs() < 1e-9);
     }
 }
