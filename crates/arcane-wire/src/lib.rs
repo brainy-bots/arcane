@@ -669,6 +669,36 @@ mod tests {
         assert_eq!(frame, back);
     }
 
+    /// Reference-vector generator for engine-plugin codec tests
+    /// (ArcaneWireReferenceVectors.h in arcane-unreal). Run with:
+    /// cargo test -p arcane-wire print_reconnect_reference -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn print_reconnect_reference_vector() {
+        let entity = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap();
+        let frame = ServerFrame::Reconnect(ReconnectPayload {
+            addr: "ws://127.0.0.1:8082".into(),
+            token: entity.to_string(),
+            entity_id: entity,
+        });
+        let bytes = encode_server(&frame);
+        print!("    static const uint8 ServerFrameReconnect[] = {{");
+        for (i, b) in bytes.iter().enumerate() {
+            if i % 12 == 0 {
+                print!("\n        ");
+            }
+            print!("0x{b:02X}");
+            if i + 1 < bytes.len() {
+                print!(", ");
+            }
+        }
+        println!("\n    }};");
+        println!(
+            "    static constexpr int32 ServerFrameReconnectSize = {};",
+            bytes.len()
+        );
+    }
+
     #[test]
     fn server_frame_reconnect_roundtrip() {
         let frame = ServerFrame::Reconnect(ReconnectPayload {
