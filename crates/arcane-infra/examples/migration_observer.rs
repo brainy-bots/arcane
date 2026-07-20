@@ -88,6 +88,17 @@ enum Phase {
     /// confirms distance <-> interaction probability. (The mid pair is
     /// reported but not asserted — it sits in the predictor's gray zone.)
     Gradient,
+    /// Speed sweep probe: MAX SUPPORTED CLOSING SPEED as a first-class
+    /// metric. Group A (players 0,1) parks; the traveler (player 2) starts
+    /// 2000u out and closes on A at `--travel-speed` u/s. Measurement: the
+    /// distance-from-A at which A's host FIRST sights the traveler (the
+    /// anticipation margin). PASS if that first sighting is > 60u out
+    /// (contact threshold): the warm-up pipeline outran the approach.
+    /// Run per speed with a fresh stack (scripts/hl_speed_sweep.bat drives
+    /// the sweep); the max speed that still PASSes IS the supported closing
+    /// speed — measured, not guessed. Screen radius becomes derived config:
+    /// margin(v) = screen_radius - v * pipeline_latency.
+    Speed,
 }
 
 #[derive(Clone)]
@@ -103,6 +114,8 @@ struct Args {
     /// disconnect on arrival so their entities migrate as server-side state.
     /// Default false since D1 (forwarding keeps CONNECTED players correct).
     disconnect_at_target: bool,
+    /// Speed phase: the traveler's closing speed in u/s (the swept variable).
+    travel_speed: f64,
 }
 
 fn parse_args() -> Args {
@@ -114,6 +127,7 @@ fn parse_args() -> Args {
     let mut max_gap_ms = 2000u64;
     let mut phase = Phase::Static;
     let mut disconnect_at_target = false;
+    let mut travel_speed = 100.0f64;
 
     let argv: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -156,6 +170,7 @@ fn parse_args() -> Args {
                     "gradient" => Phase::Gradient,
                     "spectrum-idle" => Phase::SpectrumIdle,
                     "spectrum-warmup" => Phase::SpectrumWarmup,
+                    "speed" => Phase::Speed,
                     other => {
                         eprintln!("unknown phase: {other}");
                         std::process::exit(2);
@@ -166,6 +181,10 @@ fn parse_args() -> Args {
             "--disconnect-at-target" => {
                 disconnect_at_target = true;
                 i += 1;
+            }
+            "--travel-speed" => {
+                travel_speed = argv[i + 1].parse().expect("--travel-speed");
+                i += 2;
             }
             other => {
                 eprintln!("unknown arg: {other}");
@@ -186,6 +205,7 @@ fn parse_args() -> Args {
         max_gap_ms,
         phase,
         disconnect_at_target,
+        travel_speed,
     }
 }
 
@@ -773,6 +793,40 @@ fn main() {
                     disconnect_at_target: false,
                 }
             }
+            (Phase::Speed, _) => {
+                // A parks; traveler starts 2000u east and closes at the
+                // swept speed after a 20s settle (A must be partitioned and
+                // warm before the run starts, or we'd measure stack spin-up).
+                match i {
+                    0 => PlayerSpec {
+                        idx: i,
+                        rejoin_on_failure: false,
+                        spawn: (500.0, 500.0),
+                        target: None,
+                        waypoints: vec![],
+                        speed: 0.0,
+                        disconnect_at_target: false,
+                    },
+                    1 => PlayerSpec {
+                        idx: i,
+                        rejoin_on_failure: false,
+                        spawn: (530.0, 500.0),
+                        target: None,
+                        waypoints: vec![],
+                        speed: 0.0,
+                        disconnect_at_target: false,
+                    },
+                    _ => PlayerSpec {
+                        idx: i,
+                        rejoin_on_failure: false,
+                        spawn: (2500.0, 500.0),
+                        target: None,
+                        waypoints: vec![(20.0, 500.0, 500.0)],
+                        speed: args.travel_speed,
+                        disconnect_at_target: false,
+                    },
+                }
+            }
             _ => PlayerSpec {
                 idx: i,
                 rejoin_on_failure: false,
@@ -851,6 +905,7 @@ fn main() {
                 | Phase::Gradient
                 | Phase::SpectrumIdle
                 | Phase::SpectrumWarmup
+                | Phase::Speed
         );
         if owners.len() > 1 && !transitioning && !end_state_phase {
             failures.push(format!(
@@ -1493,6 +1548,93 @@ fn main() {
         );
     }
 
+    // ── Speed verdict: anticipation margin at the swept closing speed ─────
+    //
+    // Same anchoring as spectrum-warmup (window, not end state): A's owner
+    // at settle time defines the host observer; the traveler's first
+    // sighting there after departure measures how far out the warm-up
+    // pipeline (screen -> p rise -> doc -> route -> broadcast) beat the
+    // approach. margin(v) = screen_radius - v * pipeline_latency: the
+    // verdict is the measured point on that line for this run's speed.
+    if args.phase == Phase::Speed {
+        assert!(args.players >= 3, "speed phase needs 3 players");
+        let a_center = (500.0f64, 500.0f64);
+        let depart_secs = 20.0f64;
+        let contact_u = 60.0f64;
+
+        let owner_at = |id: &Uuid, at_secs: f64| -> Option<Uuid> {
+            let t = tracks.get(id)?;
+            let mut fl: Vec<(f64, Uuid, Uuid)> = t
+                .flips
+                .iter()
+                .map(|(_, from, to, _, when)| {
+                    (when.duration_since(shared.start).as_secs_f64(), *from, *to)
+                })
+                .collect();
+            fl.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut owner: Option<Uuid> = None;
+            for (s, from, to) in &fl {
+                if *s <= at_secs {
+                    owner = Some(*to);
+                } else if owner.is_none() {
+                    owner = Some(*from);
+                }
+            }
+            owner.or_else(|| t.latest.values().next().map(|o| o.cluster_id))
+        };
+
+        let a_owner = owner_at(&player_entities[0], depart_secs - 2.0);
+        let traveler = player_entities[2];
+        let trav_owner_pre = owner_at(&traveler, depart_secs - 2.0);
+        if a_owner.is_none() {
+            failures.push("speed: cannot identify A's settle-time owner".to_string());
+        }
+        if a_owner.is_some() && a_owner == trav_owner_pre {
+            failures.push(format!(
+                "speed: scenario collision — A and traveler share settle-time owner                  {a_owner:?}; margin unmeasurable (traveler is A-resident from t0)"
+            ));
+        }
+        let host = a_owner.and_then(|own| obs_clusters.iter().position(|c| *c == Some(own)));
+        match host {
+            None => failures.push(format!(
+                "speed: no observer hosts A's cluster {a_owner:?} ({obs_clusters:?})"
+            )),
+            Some(host) => {
+                let sights = tracks
+                    .get(&traveler)
+                    .and_then(|t| t.sightings.get(&host))
+                    .cloned()
+                    .unwrap_or_default();
+                let first = sights.iter().find(|(when, _, _)| {
+                    when.duration_since(shared.start).as_secs_f64() >= depart_secs - 1.0
+                });
+                match first {
+                    None => failures.push(format!(
+                        "speed: traveler NEVER appeared on A's host at {} u/s —                          warm-up pipeline fully outrun",
+                        args.travel_speed
+                    )),
+                    Some((when, pos, _)) => {
+                        let dx = pos.0 - a_center.0;
+                        let dz = pos.2 - a_center.1;
+                        let d = (dx * dx + dz * dz).sqrt();
+                        let s = when.duration_since(shared.start).as_secs_f64();
+                        // The metric line for the sweep runner to scrape.
+                        eprintln!(
+                            "SPEED: v={} u/s first_sighting t={s:.1}s margin={d:.0}u",
+                            args.travel_speed
+                        );
+                        if d <= contact_u {
+                            failures.push(format!(
+                                "speed: first sighting only {d:.0}u out at {} u/s                                  (contact={contact_u}u) — closing speed NOT supported",
+                                args.travel_speed
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if failures.is_empty() {
         eprintln!(
             "VERDICT: PASS — {} players, {} clusters, phase={}",
@@ -1507,6 +1649,7 @@ fn main() {
                 Phase::Gradient => "gradient",
                 Phase::SpectrumIdle => "spectrum-idle",
                 Phase::SpectrumWarmup => "spectrum-warmup",
+                Phase::Speed => "speed",
             }
         );
     } else {
