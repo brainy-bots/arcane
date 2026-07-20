@@ -65,6 +65,17 @@ pub struct AffinityConfig {
 
     // Decision translation
     pub merge_entity_threshold: usize,
+
+    /// Partition stickiness (arcane#290): seed refinement from CURRENT
+    /// assignments instead of a fresh greedy layout each cycle. The greedy
+    /// partitioner re-derives the cut from scratch every cycle, so
+    /// near-equal cuts resolve arbitrarily and flap (ring/converge/bridge
+    /// churn). Seeded refinement only moves entities on strictly positive
+    /// gain: the standing partition wins ties. Greedy still runs when no
+    /// assignments exist (bootstrap) — and capacity violations in the seed
+    /// are repaired minimally before refinement. false = the old
+    /// from-scratch behavior (A/B).
+    pub seed_from_current: bool,
 }
 
 impl Default for AffinityConfig {
@@ -108,6 +119,8 @@ impl Default for AffinityConfig {
             capacity_soft_limit_fraction: 0.8,
 
             merge_entity_threshold: 5,
+
+            seed_from_current: true,
         }
     }
 }

@@ -261,9 +261,19 @@ fn build_partition_decisions(
         std::cmp::max(1, clusters.len())
     };
 
-    // Capacity = ceil(n/k) * capacity_factor
+    // Capacity = ceil(ceil(n/k) * capacity_factor). The multiply must CEIL:
+    // truncation made a 2-entity/2-cluster world compute capacity 1
+    // (1 * 1.5 -> 1), under which co-locating any pair is illegal. That was
+    // masked for years by refinement running capacity-UNCHECKED (RefineConfig
+    // capacity 0) — the partitioner obeyed a limit refinement then violated.
+    // Now refinement enforces capacity (seeded stickiness requires it, else
+    // eviction repair and refine undo each other), so the formula must
+    // genuinely allow the headroom the factor promises.
     let base_capacity = entities.len().div_ceil(num_partitions);
-    let capacity = std::cmp::max(1, (base_capacity as f64 * config.capacity_factor) as usize);
+    let capacity = std::cmp::max(
+        1,
+        (base_capacity as f64 * config.capacity_factor).ceil() as usize,
+    );
 
     // Build partition input
     let input = PartitionInput {
@@ -273,11 +283,41 @@ fn build_partition_decisions(
         capacity,
     };
 
-    // Run partitioner
-    let partitioner = GreedyGrowthPartitioner::new();
-    let partition = partitioner.partition(&input);
+    // Partition stickiness (arcane#290): seed refinement from the STANDING
+    // assignments so near-equal cuts resolve toward "stay put" instead of
+    // flapping. The cluster-uuid -> partition-index mapping uses the same
+    // sorted cluster list as the index -> cluster mapping below, so a seeded
+    // partition's plurality cluster is exactly the cluster it was seeded
+    // from (identity round-trip for unmoved entities). Greedy still runs on
+    // bootstrap (no assignments) or when stickiness is disabled.
+    let cluster_index: HashMap<Uuid, usize> = {
+        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
+        cs.extend_from_slice(known_clusters);
+        cs.sort();
+        cs.dedup();
+        cs.into_iter().enumerate().map(|(i, c)| (c, i)).collect()
+    };
+    let partition = if config.seed_from_current && !current_assignments.is_empty() {
+        let current_idx: HashMap<Uuid, usize> = current_assignments
+            .iter()
+            .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
+            .collect();
+        arcane_affinity::partition::seed_from_assignments(
+            &input.entities,
+            &current_idx,
+            num_partitions,
+            capacity,
+            &input.edges,
+        )
+    } else {
+        GreedyGrowthPartitioner::new().partition(&input)
+    };
 
-    // Run refinement
+    // Run refinement, capacity-UNCHECKED (as always): cohesion beats the
+    // balance preference — a clique larger than ceil(n/k)*factor may still
+    // co-locate. Balance acts at component granularity in the seed repair
+    // (whole groups relocate; cliques are never cut), and at bootstrap via
+    // the greedy layout.
     let refined_partition = refine(
         &partition,
         &input.edges,
