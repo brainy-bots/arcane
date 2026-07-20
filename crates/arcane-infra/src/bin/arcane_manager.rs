@@ -302,6 +302,15 @@ async fn control_loop(
                 e
             ),
         }
+        // Execution split: MANAGER_ROUTE=off hands frame publication to
+        // external arcane-router workers (decisions + table writes continue).
+        if matches!(
+            env::var("MANAGER_ROUTE").as_deref(),
+            Ok("off") | Ok("0") | Ok("false")
+        ) {
+            runtime.set_publish_frames(false);
+            eprintln!("arcane-manager: in-process routing pass DISABLED (MANAGER_ROUTE=off) — arcane-router workers publish frames");
+        }
         // Warm spares count as partitions: without this, an everyone-on-one-cluster
         // world has k=1 and can never spread.
         runtime.set_known_clusters(cluster_ids.clone());

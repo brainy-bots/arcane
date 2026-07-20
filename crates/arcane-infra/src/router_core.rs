@@ -47,9 +47,13 @@ pub struct RouterConfig {
     /// v1 dynamism placeholder: a constant per-entity dynamism until real velocity-derived
     /// dynamism is wired (design §4). Default 1.0 (fully dynamic).
     pub default_dynamism: f64,
-    /// Routing passes per second — the clock `cadence_due` measures refresh
-    /// intervals against. Should match the manager cycle rate (cadence_ms).
-    /// Default 2.0 (500ms cycles, the harness stack's configuration).
+    /// Routing passes per second — the data-plane clock. Informational
+    /// since the normalized cadence gate: delivered rate for a candidate is
+    /// `router_rate × (rate_hz / max_hz)`, so the router's own pass rate is
+    /// the ceiling and the spectrum shapes everything below it. Set it to
+    /// whatever the hosting loop actually runs at (the `arcane-router`
+    /// binary defaults to 10 Hz; the manager's in-process pass runs at its
+    /// decision cadence).
     pub router_hz: f64,
 }
 
@@ -369,6 +373,7 @@ pub fn route_from_doc(
     doc: &crate::routing_table::RoutingDoc,
     entity_states: &HashMap<Uuid, EntityStateEntry>,
     config: &RouterConfig,
+    router_tick: u64,
 ) -> NodeInboxFrame {
     let mut entities: Vec<ReplicatedEntity> = doc
         .interest
@@ -385,7 +390,7 @@ pub fn route_from_doc(
                 if hz <= 0.0 {
                     return None; // below the zero floor: never delivered
                 }
-                if !cadence_due(doc.tick, cand.entity_id, hz, config) {
+                if !cadence_due(router_tick, cand.entity_id, hz, config) {
                     return None; // not due this frame; will be due on its cadence
                 }
                 (hz, rate_tier(cand.p, config.default_dynamism, &config.rate_law))
@@ -400,7 +405,11 @@ pub fn route_from_doc(
     entities.sort_by_key(|e| e.entry.entity_id);
 
     NodeInboxFrame {
-        tick: doc.tick,
+        // The ROUTER's tick, not the doc's: the router runs at data cadence
+        // (many passes per doc), and the cadence gate + frame ordering key
+        // off the fast clock. The doc's decision age is invisible to nodes
+        // by design (decisions age well; state is joined fresh every pass).
+        tick: router_tick,
         ownership: doc.flips.clone(),
         entities,
         owned: Some(doc.owned.clone()),
@@ -799,7 +808,7 @@ mod tests {
                 interest: interest.clone(),
                 flips: vec![],
             };
-            let frame = route_from_doc(&doc, &entity_states, &config);
+            let frame = route_from_doc(&doc, &entity_states, &config, tick);
             for re in &frame.entities {
                 if re.entry.entity_id == high {
                     seen_high += 1;
@@ -873,7 +882,7 @@ mod tests {
         let docs = build_routing_docs(&input);
         let via_table: Vec<(Uuid, NodeInboxFrame)> = docs
             .iter()
-            .map(|(c, d)| (*c, route_from_doc(d, &entity_states, &config)))
+            .map(|(c, d)| (*c, route_from_doc(d, &entity_states, &config, d.tick)))
             .collect();
 
         assert_eq!(direct.len(), via_table.len(), "same cluster set");

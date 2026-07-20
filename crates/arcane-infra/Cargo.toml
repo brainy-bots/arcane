@@ -45,6 +45,11 @@ path = "src/bin/arcane_manager.rs"
 required-features = ["manager", "migration"]
 
 [[bin]]
+name = "arcane-router"
+path = "src/bin/arcane_router.rs"
+required-features = ["migration"]
+
+[[bin]]
 name = "arcane-rapier-node"
 path = "src/bin/arcane_rapier_node.rs"
 required-features = ["rapier-cluster"]

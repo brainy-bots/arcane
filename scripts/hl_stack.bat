@@ -1,8 +1,11 @@
 @echo off
-REM Headless control-plane stack: 4 Rust arcane-node + real arcane-manager + docker Redis.
-REM Usage: hl_stack.bat [nopin] [nofwd]
-REM   nopin - disable the pin feature (players may migrate while connected)
-REM   nofwd - disable D1 input forwarding (split-brain demo mode)
+REM Headless control-plane stack: 4 arcane-node (60 Hz) + arcane-manager
+REM (decisions, 250ms) + arcane-router (data plane, 100ms) + docker Redis.
+REM Usage: hl_stack.bat [nopin] [nofwd] [norouter]
+REM   nopin    - disable the pin feature (players may migrate while connected)
+REM   nofwd    - disable D1 input forwarding (split-brain demo mode)
+REM   norouter - no arcane-router worker; manager publishes frames in-process
+REM              (the pre-split degenerate mode, for A/B comparison)
 REM Companion runner: hl_run.bat <phase> <players> <duration>
 REM
 REM Ports: nodes ws 8080/8082/8084/8086 (+1 each for stats), manager http 7777.
@@ -22,10 +25,12 @@ set PIN_NODE=client_anchor
 set PIN_MGR=client_anchor
 set FWD=on
 set LEGACY=on
+set ROUTER=on
 :parse
 if "%1"=="nopin" ( set PIN_NODE=& set PIN_MGR=& shift & goto parse )
 if "%1"=="nofwd" ( set FWD=off& shift & goto parse )
 if "%1"=="nolegacy" ( set LEGACY=off& shift & goto parse )
+if "%1"=="norouter" ( set ROUTER=off& shift & goto parse )
 
 echo [stack] pin=%PIN_NODE% forwarding=%FWD%
 
@@ -48,12 +53,18 @@ REM router's interest-based inbox frames (binary attention). This is the
 REM attention-scaling configuration.
 if "%LEGACY%"=="off" set NEIGH=
 set ADDRS=%C1%:127.0.0.1:8080,%C2%:127.0.0.1:8082,%C3%:127.0.0.1:8084,%C4%:127.0.0.1:8086
-start "node%1" /min cmd /c "set NODE_ID=%NID%&& set REDIS_URL=%REDIS_URL%&& set NEIGHBOR_IDS=%NEIGH%&& set NODE_WS_PORT=%WSPORT%&& set NODE_STATS_PORT=%STATSPORT%&& set NODE_STATE_PUBLISH_TICKS=10&& set NODE_PIN_FEATURE=%PIN_NODE%&& set ARCANE_INPUT_FORWARDING=%FWD%&& set NODE_CLUSTER_ADDRS=%ADDRS%&& set ARCANE_RESYNC_EVERY_N_TICKS=20&& %BIN%\arcane-node.exe 2> %ROOT%\..\temp\hl_node%1.log"
+start "node%1" /min cmd /c "set NODE_ID=%NID%&& set REDIS_URL=%REDIS_URL%&& set NEIGHBOR_IDS=%NEIGH%&& set NODE_WS_PORT=%WSPORT%&& set NODE_STATS_PORT=%STATSPORT%&& set NODE_STATE_PUBLISH_TICKS=10&& set NODE_PIN_FEATURE=%PIN_NODE%&& set ARCANE_INPUT_FORWARDING=%FWD%&& set NODE_CLUSTER_ADDRS=%ADDRS%&& set ARCANE_RESYNC_EVERY_N_TICKS=20&& set ARCANE_TICK_RATE_HZ=60&& %BIN%\arcane-node.exe 2> %ROOT%\..\temp\hl_node%1.log"
 exit /b
 
 :manager
 timeout /t 3 /nobreak >nul
-start "manager" /min cmd /c "set MANAGER_CLUSTERS=%C1%:127.0.0.1:8080,%C2%:127.0.0.1:8082,%C3%:127.0.0.1:8084,%C4%:127.0.0.1:8086&& set MANAGER_HTTP_PORT=7777&& set REDIS_URL=%REDIS_URL%&& set MANAGER_CADENCE_MS=500&& set MANAGER_JOIN_POLICY=round-robin&& set MANAGER_PIN_FEATURE=%PIN_MGR%&& %BIN%\arcane-manager.exe 2> %ROOT%\..\temp\hl_manager.log"
-echo [stack] 4 nodes + manager starting. Logs: temp\hl_node*.log, temp\hl_manager.log
-echo [stack] stop with: taskkill /f /im arcane-node.exe ^& taskkill /f /im arcane-manager.exe
+set MROUTE=on
+if "%ROUTER%"=="on" set MROUTE=off
+start "manager" /min cmd /c "set MANAGER_CLUSTERS=%C1%:127.0.0.1:8080,%C2%:127.0.0.1:8082,%C3%:127.0.0.1:8084,%C4%:127.0.0.1:8086&& set MANAGER_HTTP_PORT=7777&& set REDIS_URL=%REDIS_URL%&& set MANAGER_CADENCE_MS=250&& set MANAGER_JOIN_POLICY=round-robin&& set MANAGER_PIN_FEATURE=%PIN_MGR%&& set MANAGER_ROUTE=%MROUTE%&& %BIN%\arcane-manager.exe 2> %ROOT%\..\temp\hl_manager.log"
+if "%ROUTER%"=="on" (
+  timeout /t 2 /nobreak >nul
+  start "router" /min cmd /c "set ROUTER_CLUSTERS=%C1%,%C2%,%C3%,%C4%&& set REDIS_URL=%REDIS_URL%&& set ROUTER_TICK_MS=100&& %BIN%\arcane-router.exe 2> %ROOT%\..\temp\hl_router.log"
+)
+echo [stack] 4 nodes (60Hz) + manager (250ms) + router=%ROUTER% (100ms). Logs: temp\hl_*.log
+echo [stack] stop with: taskkill /f /im arcane-node.exe ^& taskkill /f /im arcane-manager.exe ^& taskkill /f /im arcane-router.exe
 endlocal

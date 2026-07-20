@@ -62,6 +62,12 @@ pub struct ManagerRuntime<B: InboxBus> {
     blocked_destinations: HashSet<Uuid>,
     /// #289: full known topology; every routing pass addresses all of these.
     known_clusters: Vec<Uuid>,
+    /// Execution split: when false, run_cycle writes DOCS to the table but
+    /// skips the in-process route+publish (external arcane-router workers own
+    /// frame publication). Decisions/gate/assignments still run — the gate's
+    /// replication check consumes the routed frames it needs from its own
+    /// route() pass, which stays internal either way.
+    publish_frames: bool,
     /// The routing table this runtime writes/reads each cycle. In-memory by
     /// default (tests); the manager binary injects the Redis-backed table so
     /// the decision output is a READABLE RECORD and the in-process router
@@ -102,6 +108,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             skip_confirmed: HashSet::new(),
             first_cycle_flips: HashSet::new(),
             blocked_destinations: HashSet::new(),
+            publish_frames: true,
             routing_table: Box::new(InMemoryRoutingTable::new()),
             known_clusters: Vec::new(),
             seen_clusters: std::collections::HashSet::new(),
@@ -172,6 +179,12 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// implementation; tests keep the in-memory default).
     pub fn set_routing_table(&mut self, table: Box<dyn RoutingTable>) {
         self.routing_table = table;
+    }
+
+    /// Execution split: disable the in-process frame publication (docs are
+    /// still written every cycle; arcane-router workers publish frames).
+    pub fn set_publish_frames(&mut self, publish: bool) {
+        self.publish_frames = publish;
     }
 
     /// Register the known cluster topology (passthrough; see
@@ -303,7 +316,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             .map(|(cluster, doc)| {
                 (
                     *cluster,
-                    route_from_doc(doc, &entity_states, &self.config.router_config),
+                    route_from_doc(doc, &entity_states, &self.config.router_config, self.tick),
                 )
             })
             .collect();
@@ -330,11 +343,14 @@ impl<B: InboxBus> ManagerRuntime<B> {
             self.gate.observe(flip.entity_id, delivered, self.tick);
         }
 
-        // 7. Publish frames to the bus.
+        // 7. Publish frames to the bus (skipped under the execution split:
+        // arcane-router workers publish from the table at data cadence).
         let mut published = 0;
-        for (cluster_id, frame) in frames {
-            self.bus.publish(cluster_id, frame)?;
-            published += 1;
+        if self.publish_frames {
+            for (cluster_id, frame) in frames {
+                self.bus.publish(cluster_id, frame)?;
+                published += 1;
+            }
         }
 
         // 8. The confirmed flips routed THIS cycle (step 5's `flips` input) have now
