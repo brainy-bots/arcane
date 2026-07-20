@@ -288,6 +288,20 @@ async fn control_loop(
 
         let router_config = RouterConfig::default();
         let mut runtime = ManagerRuntime::new(manager, bus, router_config);
+        // Routing table: the manager's decision output as a readable Redis
+        // record (arcane:routing:<cluster> + arcane:ownership). The in-process
+        // router pass reads THROUGH it, so splitting router workers out later
+        // is pure process topology.
+        match arcane_infra::routing_table::RedisRoutingTable::new(&redis_url) {
+            Ok(table) => {
+                runtime.set_routing_table(Box::new(table));
+                eprintln!("arcane-manager: routing table on Redis (arcane:routing:*)");
+            }
+            Err(e) => eprintln!(
+                "arcane-manager: routing table init failed ({}); using in-memory (frames still flow)",
+                e
+            ),
+        }
         // Warm spares count as partitions: without this, an everyone-on-one-cluster
         // world has k=1 and can never spread.
         runtime.set_known_clusters(cluster_ids.clone());

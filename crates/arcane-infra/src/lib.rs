@@ -56,6 +56,8 @@ pub mod replication_gate;
 #[cfg(feature = "migration")]
 pub mod router_core;
 #[cfg(feature = "migration")]
+pub mod routing_table;
+#[cfg(feature = "migration")]
 pub mod state_keys;
 
 #[cfg(feature = "cluster-ws")]

@@ -211,6 +211,150 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
     frames
 }
 
+/// Manager side of the routing-table split: turn this cycle's decisions into
+/// per-cluster [`RoutingDoc`]s — the WRITE half of the table contract. Pure
+/// decision output: owned sets, interest candidates with the predictor's `p`,
+/// and force-include marks. NO rate-law evaluation and NO state joining —
+/// those are the router worker's job (`route_from_doc`).
+pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_table::RoutingDoc)> {
+    use crate::routing_table::{InterestEntry, RoutingDoc};
+
+    // Same cluster universe as route(): assignments ∪ flip endpoints ∪
+    // force-include targets ∪ known clusters.
+    let mut clusters = HashSet::new();
+    clusters.extend(input.assignments.values().copied());
+    for flip in input.flips {
+        clusters.insert(flip.from_cluster);
+        clusters.insert(flip.to_cluster);
+    }
+    for (_, to_cluster) in input.force_include {
+        clusters.insert(*to_cluster);
+    }
+    clusters.extend(input.known_clusters.iter().copied());
+
+    let mut sorted_clusters: Vec<_> = clusters.into_iter().collect();
+    sorted_clusters.sort();
+
+    let mut docs = Vec::new();
+    for cluster_id in sorted_clusters {
+        let flips: Vec<OwnershipFlip> = input
+            .flips
+            .iter()
+            .copied()
+            .filter(|f| f.from_cluster == cluster_id || f.to_cluster == cluster_id)
+            .collect();
+
+        // Interest candidates: foreign neighbors of owned entities, dedup by
+        // max p. p only — tier assignment is the worker's rate-law job.
+        let mut interest: HashMap<Uuid, InterestEntry> = HashMap::new();
+        for (entity_id, owner) in input.assignments {
+            if *owner != cluster_id {
+                continue;
+            }
+            for (neighbor_id, weight) in input.interaction_graph.neighbors(*entity_id) {
+                let neighbor_owner = input.assignments.get(&neighbor_id).copied();
+                if neighbor_owner == Some(cluster_id) {
+                    continue;
+                }
+                let Some(owner) = neighbor_owner else {
+                    continue; // unknown owner: no state doc to reference
+                };
+                let p = (weight / (weight + 1.0)).clamp(0.0, 1.0);
+                interest
+                    .entry(neighbor_id)
+                    .and_modify(|e| {
+                        if p > e.p {
+                            e.p = p;
+                        }
+                    })
+                    .or_insert(InterestEntry {
+                        entity_id: neighbor_id,
+                        owner,
+                        p,
+                        forced: false,
+                    });
+            }
+        }
+        for (entity_id, to_cluster) in input.force_include {
+            if *to_cluster != cluster_id {
+                continue;
+            }
+            let owner = input.assignments.get(entity_id).copied().unwrap_or(cluster_id);
+            interest
+                .entry(*entity_id)
+                .and_modify(|e| e.forced = true)
+                .or_insert(InterestEntry {
+                    entity_id: *entity_id,
+                    owner,
+                    p: 1.0,
+                    forced: true,
+                });
+        }
+        let mut interest: Vec<InterestEntry> = interest.into_values().collect();
+        interest.sort_by_key(|e| e.entity_id);
+
+        let mut owned: Vec<Uuid> = input
+            .assignments
+            .iter()
+            .filter(|(_, owner)| **owner == cluster_id)
+            .map(|(id, _)| *id)
+            .collect();
+        owned.sort();
+
+        docs.push((
+            cluster_id,
+            RoutingDoc {
+                tick: input.tick,
+                owned,
+                interest,
+                flips,
+            },
+        ));
+    }
+    docs
+}
+
+/// Router-worker side of the split: compose one cluster's inbox frame from
+/// its routing doc plus the state the doc references — the READ half of the
+/// table contract. This is where the RATE LAW runs (tier from `p`), per the
+/// architecture: the manager ships slow-changing decisions; frame-to-frame
+/// rate variation stays worker-local. Stateless: any worker can run this for
+/// any cluster.
+pub fn route_from_doc(
+    doc: &crate::routing_table::RoutingDoc,
+    entity_states: &HashMap<Uuid, EntityStateEntry>,
+    config: &RouterConfig,
+) -> NodeInboxFrame {
+    let mut entities: Vec<ReplicatedEntity> = doc
+        .interest
+        .iter()
+        .filter_map(|cand| {
+            let state = entity_states.get(&cand.entity_id)?;
+            let tier = if cand.forced {
+                RateTier::Full
+            } else {
+                let t = rate_tier(cand.p, config.default_dynamism, &config.rate_law);
+                if t == RateTier::Zero {
+                    return None; // binary attention: Zero-tier not delivered
+                }
+                t
+            };
+            Some(ReplicatedEntity {
+                entry: state.clone(),
+                tier,
+            })
+        })
+        .collect();
+    entities.sort_by_key(|e| e.entry.entity_id);
+
+    NodeInboxFrame {
+        tick: doc.tick,
+        ownership: doc.flips.clone(),
+        entities,
+        owned: Some(doc.owned.clone()),
+    }
+}
+
 /// Helper: total order on RateTier for dedup (Full > Low > Zero).
 fn tier_order(tier: RateTier) -> u8 {
     match tier {
@@ -524,6 +668,76 @@ mod tests {
             for (e1, e2) in f1.1.entities.iter().zip(f2.1.entities.iter()) {
                 assert_eq!(e1.entry.entity_id, e2.entry.entity_id);
                 assert_eq!(e1.tier, e2.tier);
+            }
+        }
+    }
+
+    /// The table split must not change routing semantics: composing frames
+    /// from RoutingDocs (write half + read half) yields byte-identical frames
+    /// to the direct single-pass `route()`. Guards the manager-side/worker-side
+    /// split against divergence.
+    #[test]
+    fn route_from_docs_matches_direct_route() {
+        let c1 = uuid(1);
+        let c2 = uuid(2);
+        let e1 = uuid(10);
+        let e2 = uuid(20);
+        let e3 = uuid(30);
+
+        let mut assignments = HashMap::new();
+        assignments.insert(e1, c1);
+        assignments.insert(e2, c2);
+        assignments.insert(e3, c2);
+
+        let mut entity_states = HashMap::new();
+        entity_states.insert(e1, make_entity_state(e1, c1));
+        entity_states.insert(e2, make_entity_state(e2, c2));
+        entity_states.insert(e3, make_entity_state(e3, c2));
+
+        let mut graph = InteractionGraph::new();
+        graph.record_interaction(e1, e2, 5.0, InteractionKind::Proximity); // strong edge
+        graph.record_interaction(e1, e3, 0.001, InteractionKind::Proximity); // negligible
+
+        let flips = [OwnershipFlip {
+            entity_id: e2,
+            from_cluster: c2,
+            to_cluster: c1,
+            effective_tick: 9,
+        }];
+        let force_include = [(e2, c1)];
+        let known = [c1, c2];
+        let input = RouterInput {
+            tick: 9,
+            assignments: &assignments,
+            flips: &flips,
+            entity_states: &entity_states,
+            interaction_graph: &graph,
+            force_include: &force_include,
+            known_clusters: &known,
+        };
+        let config = RouterConfig::default();
+
+        let direct = route(&input, &config);
+        let docs = build_routing_docs(&input);
+        let via_table: Vec<(Uuid, NodeInboxFrame)> = docs
+            .iter()
+            .map(|(c, d)| (*c, route_from_doc(d, &entity_states, &config)))
+            .collect();
+
+        assert_eq!(direct.len(), via_table.len(), "same cluster set");
+        for ((c_a, f_a), (c_b, f_b)) in direct.iter().zip(via_table.iter()) {
+            assert_eq!(c_a, c_b, "same cluster order");
+            assert_eq!(f_a.tick, f_b.tick);
+            assert_eq!(f_a.owned, f_b.owned, "cluster {c_a}: owned statements differ");
+            assert_eq!(f_a.ownership, f_b.ownership, "cluster {c_a}: flips differ");
+            assert_eq!(
+                f_a.entities.len(),
+                f_b.entities.len(),
+                "cluster {c_a}: interest set sizes differ"
+            );
+            for (ea, eb) in f_a.entities.iter().zip(f_b.entities.iter()) {
+                assert_eq!(ea.entry.entity_id, eb.entry.entity_id);
+                assert_eq!(ea.tier, eb.tier, "tier mismatch for {}", ea.entry.entity_id);
             }
         }
     }

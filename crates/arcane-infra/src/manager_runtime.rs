@@ -8,7 +8,8 @@ use crate::manager::ArcaneManager;
 use crate::node_inbox::InboxBus;
 use crate::ownership_migration::OwnershipFlip;
 use crate::replication_gate::ReplicationGate;
-use crate::router_core::{route, RouterConfig, RouterInput};
+use crate::router_core::{build_routing_docs, route, route_from_doc, RouterConfig, RouterInput};
+use crate::routing_table::{InMemoryRoutingTable, RoutingTable};
 use arcane_core::replication_channel::EntityStateEntry;
 use arcane_core::Vec3;
 use std::collections::{HashMap, HashSet};
@@ -61,6 +62,11 @@ pub struct ManagerRuntime<B: InboxBus> {
     blocked_destinations: HashSet<Uuid>,
     /// #289: full known topology; every routing pass addresses all of these.
     known_clusters: Vec<Uuid>,
+    /// The routing table this runtime writes/reads each cycle. In-memory by
+    /// default (tests); the manager binary injects the Redis-backed table so
+    /// the decision output is a READABLE RECORD and the in-process router
+    /// pass reads through it (worker split = pure process topology later).
+    routing_table: Box<dyn RoutingTable>,
     /// #289: clusters ever seen in entity sightings. Union-ed with
     /// `known_clusters` for routing so a cluster that lost ALL entities keeps
     /// receiving its (empty) owned statement — without this, a fully-drained
@@ -96,6 +102,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             skip_confirmed: HashSet::new(),
             first_cycle_flips: HashSet::new(),
             blocked_destinations: HashSet::new(),
+            routing_table: Box::new(InMemoryRoutingTable::new()),
             known_clusters: Vec::new(),
             seen_clusters: std::collections::HashSet::new(),
             tick: 0,
@@ -159,6 +166,12 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// Once unblocked, they can be promoted to confirmed on the next cycle.
     pub fn set_blocked_destinations(&mut self, blocked: HashSet<Uuid>) {
         self.blocked_destinations = blocked;
+    }
+
+    /// Inject a routing-table backend (the manager binary passes the Redis
+    /// implementation; tests keep the in-memory default).
+    pub fn set_routing_table(&mut self, table: Box<dyn RoutingTable>) {
+        self.routing_table = table;
     }
 
     /// Register the known cluster topology (passthrough; see
@@ -276,7 +289,24 @@ impl<B: InboxBus> ManagerRuntime<B> {
             known_clusters: &route_clusters,
         };
 
-        let frames = route(&router_input, &self.config.router_config);
+        // Route THROUGH the routing table: write this cycle's decision docs
+        // (one batched round trip on Redis), read them back exactly as a
+        // stateless router worker would, and compose frames from the docs +
+        // state. `route()` remains as the reference single-pass; equivalence
+        // is asserted by test (route_from_docs_matches_direct_route).
+        let docs = build_routing_docs(&router_input);
+        self.routing_table.write(&docs)?;
+        let doc_clusters: Vec<Uuid> = docs.iter().map(|(c, _)| *c).collect();
+        let read_docs = self.routing_table.read(&doc_clusters)?;
+        let frames: Vec<(Uuid, crate::node_inbox::NodeInboxFrame)> = read_docs
+            .iter()
+            .map(|(cluster, doc)| {
+                (
+                    *cluster,
+                    route_from_doc(doc, &entity_states, &self.config.router_config),
+                )
+            })
+            .collect();
 
         // 6. Track replication for pending flips.
         for flip in &self.pending_flips {
