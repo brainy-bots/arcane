@@ -59,6 +59,14 @@ pub struct ManagerRuntime<B: InboxBus> {
     first_cycle_flips: HashSet<Uuid>,
     /// Clusters where flips are blocked (gate keeps counting, promotion deferred).
     blocked_destinations: HashSet<Uuid>,
+    /// #289: full known topology; every routing pass addresses all of these.
+    known_clusters: Vec<Uuid>,
+    /// #289: clusters ever seen in entity sightings. Union-ed with
+    /// `known_clusters` for routing so a cluster that lost ALL entities keeps
+    /// receiving its (empty) owned statement — without this, a fully-drained
+    /// node would never hear "you own nothing" and could keep simulating
+    /// migrated entities forever.
+    seen_clusters: std::collections::HashSet<Uuid>,
     tick: u64,
 }
 
@@ -88,6 +96,8 @@ impl<B: InboxBus> ManagerRuntime<B> {
             skip_confirmed: HashSet::new(),
             first_cycle_flips: HashSet::new(),
             blocked_destinations: HashSet::new(),
+            known_clusters: Vec::new(),
+            seen_clusters: std::collections::HashSet::new(),
             tick: 0,
         }
     }
@@ -96,6 +106,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// On re-sighting, keeps the runner's assignments in sync with the driver's
     /// cluster (after a flip, the manager must see the entity on its new cluster).
     pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
+        self.seen_clusters.insert(cluster_id);
         // Establish ownership on first sighting, or use current assignment on re-sighting.
         let current_cluster = *self.assignments.entry(entity_id).or_insert(cluster_id);
         self.manager
@@ -152,7 +163,10 @@ impl<B: InboxBus> ManagerRuntime<B> {
 
     /// Register the known cluster topology (passthrough; see
     /// `ArcaneManager::set_known_clusters`). Warm spares count as partitions.
+    /// #289: also retained locally so every routing pass addresses every
+    /// known cluster with a complete-statement frame.
     pub fn set_known_clusters(&mut self, clusters: Vec<Uuid>) {
+        self.known_clusters = clusters.clone();
         self.manager.set_known_clusters(clusters);
     }
 
@@ -178,6 +192,17 @@ impl<B: InboxBus> ManagerRuntime<B> {
 
         // 3. Build entity_states from the manager's spatial snapshot.
         let snapshot_positions = self.manager.snapshot_positions();
+
+        // #289: address every cluster we know about — configured topology plus
+        // every cluster ever seen — so each gets a complete owned statement.
+        let route_clusters: Vec<Uuid> = {
+            let mut set: std::collections::HashSet<Uuid> =
+                self.known_clusters.iter().copied().collect();
+            set.extend(self.seen_clusters.iter().copied());
+            let mut v: Vec<Uuid> = set.into_iter().collect();
+            v.sort();
+            v
+        };
 
         let mut entity_states: HashMap<Uuid, EntityStateEntry> = HashMap::new();
         for (entity_id, cluster_id, position, velocity) in &snapshot_positions {
@@ -209,6 +234,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
                     entity_states: &entity_states,
                     interaction_graph: self.manager.interaction_graph(),
                     force_include: &[],
+                    known_clusters: &route_clusters,
                 };
                 let test_frames = route(&empty_router_input, &self.config.router_config);
 
@@ -247,6 +273,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             entity_states: &entity_states,
             interaction_graph: self.manager.interaction_graph(),
             force_include: &force_include,
+            known_clusters: &route_clusters,
         };
 
         let frames = route(&router_input, &self.config.router_config);

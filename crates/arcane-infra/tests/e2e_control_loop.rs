@@ -1,17 +1,19 @@
 //! E2E acceptance for Epic #257: the full control loop, end to end.
 //!
 //! Manager decides → ManagerRuntime drains flips → RouterCore routes →
-//! InMemoryInboxBus delivers → each node applies its own inbox frames to its OWN
-//! OwnershipMap and neighbor proxies via `apply_inbox_frame`.
+//! InMemoryInboxBus delivers → each node reconciles its world against the
+//! frames' OWNED STATEMENTS via `apply_inbox_frame` (#289: record-based — no
+//! node OwnershipMap, no event folding).
 //!
-//! Un-fakeable: the test never calls `take_pending_flips` and never touches the
-//! nodes' OwnershipMaps directly. The only way node-side ownership can change is
-//! the full circuit actually working. Exactly-once (XOR) authority is asserted at
-//! every tick around each flip.
+//! Un-fakeable: the test never calls `take_pending_flips` and never sets any
+//! ownership on the nodes directly. The only way node-side ownership can change
+//! is the full circuit actually working: the frame's `owned` list replaces the
+//! node's view wholesale each cycle.
 //!
-//! No Redis, no WebSocket, no threads: nodes are simulated as (OwnershipMap +
-//! neighbor maps + inbox receiver), which is exactly the node-side state
-//! `NodeCore::attach_inbox` + `drain_inputs` maintain in production.
+//! No Redis, no WebSocket, no threads: nodes are simulated as (owned view +
+//! spawn grace + neighbor maps + inbox receiver), which is exactly the
+//! node-side state `NodeCore::attach_inbox` + `drain_inputs` maintain in
+//! production.
 
 #![cfg(feature = "migration")]
 
@@ -20,11 +22,11 @@ use arcane_core::replication_channel::EntityStateEntry;
 use arcane_core::Vec3;
 use arcane_infra::manager::ArcaneManager;
 use arcane_infra::manager_runtime::ManagerRuntime;
-use arcane_infra::node_core::{apply_inbox_frame, resolve_authoritative};
+use arcane_infra::node_core::apply_inbox_frame;
 use arcane_infra::node_inbox::InboxBus as _;
 use arcane_infra::node_inbox::{InMemoryInboxBus, NodeInboxFrame};
-use arcane_infra::ownership_migration::{OwnershipFlip, OwnershipMap};
-use std::collections::HashMap;
+use arcane_infra::ownership_migration::OwnershipFlip;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use uuid::Uuid;
 
@@ -61,40 +63,65 @@ fn set_party_rt<B: arcane_infra::node_inbox::InboxBus>(
     runtime.set_entity_feature(entity, "party", party.as_u128() as f64);
 }
 
-/// Node-side state, exactly what NodeCore maintains for the inbox path.
+/// Node-side state, exactly what NodeCore maintains for the inbox path (#289).
 struct SimNode {
     cluster_id: Uuid,
-    ownership: OwnershipMap,
+    /// Record view: replaced wholesale by each frame's owned statement.
+    owned_view: HashSet<Uuid>,
+    spawn_grace: HashMap<Uuid, u64>,
     neighbor_entities: HashMap<Uuid, EntityStateEntry>,
     neighbor_last_seen: HashMap<Uuid, u64>,
     inbox: Receiver<NodeInboxFrame>,
     flips_seen: Vec<OwnershipFlip>,
+    adopted: Vec<Uuid>,
+    released: Vec<Uuid>,
 }
 
 impl SimNode {
-    fn new(cluster_id: Uuid, bus: &InMemoryInboxBus) -> Self {
+    /// `initial`: entities this node starts out simulating (pre-control-plane
+    /// world), held under spawn grace exactly like fresh local spawns.
+    fn new(cluster_id: Uuid, bus: &InMemoryInboxBus, initial: &[Uuid]) -> Self {
         Self {
             cluster_id,
-            ownership: OwnershipMap::new(),
+            owned_view: HashSet::new(),
+            spawn_grace: initial.iter().map(|e| (*e, 0u64)).collect(),
             neighbor_entities: HashMap::new(),
             neighbor_last_seen: HashMap::new(),
             inbox: bus.subscribe(cluster_id),
             flips_seen: Vec::new(),
+            adopted: Vec::new(),
+            released: Vec::new(),
         }
     }
 
-    /// Mirror of NodeCore::drain_inputs' inbox branch.
+    fn owns(&self, e: Uuid) -> bool {
+        self.owned_view.contains(&e) || self.spawn_grace.contains_key(&e)
+    }
+
+    /// Mirror of NodeCore::drain_inputs' inbox branch (#289 record path).
     fn drain_inbox(&mut self, tick: u64) {
         while let Ok(frame) = self.inbox.try_recv() {
             self.flips_seen.extend(frame.ownership.iter().copied());
-            apply_inbox_frame(
+            let effective: HashSet<Uuid> = self
+                .owned_view
+                .iter()
+                .chain(self.spawn_grace.keys())
+                .copied()
+                .collect();
+            let report = apply_inbox_frame(
                 self.cluster_id,
                 &frame,
-                &self.ownership,
+                &effective,
+                &mut self.spawn_grace,
                 &mut self.neighbor_entities,
                 &mut self.neighbor_last_seen,
                 tick,
             );
+            if let Some(statement) = report.statement {
+                self.owned_view = statement;
+            }
+            self.adopted.extend(report.adopted.iter().map(|e| e.entity_id));
+            self.released.extend(report.lost.iter().copied());
         }
     }
 }
@@ -111,12 +138,10 @@ fn full_loop_two_nodes_converge_with_exactly_once() {
     let party = uuid(30);
 
     let bus = InMemoryInboxBus::new();
-    let mut node1 = SimNode::new(c1, &bus);
-    let mut node2 = SimNode::new(c2, &bus);
-    node1.ownership.set_owner(e1, c1);
-    node1.ownership.set_owner(e2, c2);
-    node2.ownership.set_owner(e1, c1);
-    node2.ownership.set_owner(e2, c2);
+    // Each node starts simulating its own entity (spawn-grace, like real
+    // spawns); the control plane's statements take over from there.
+    let mut node1 = SimNode::new(c1, &bus, &[e1]);
+    let mut node2 = SimNode::new(c2, &bus, &[e2]);
 
     let mut runtime = ManagerRuntime::new(affinity_manager(), bus, Default::default());
     runtime.set_observation_radius(500.0);
@@ -131,19 +156,19 @@ fn full_loop_two_nodes_converge_with_exactly_once() {
         node2.drain_inbox(tick);
     }
 
-    // 1. The NODES' own ownership maps converged (never touched by the test).
-    let owner_e1 = node1.ownership.owner_of(e1);
-    let owner_e2 = node1.ownership.owner_of(e2);
-    assert_eq!(
-        owner_e1, owner_e2,
-        "node1's map: pair must co-locate; e1={owner_e1:?} e2={owner_e2:?}"
+    // 1. The nodes' RECORD views converged: exactly one node owns both
+    // entities, the other owns neither (never touched by the test — the only
+    // writer is the frames' owned statements).
+    let n1_both = node1.owns(e1) && node1.owns(e2);
+    let n2_both = node2.owns(e1) && node2.owns(e2);
+    assert!(
+        n1_both ^ n2_both,
+        "exactly one node must own the co-located pair (n1: {}/{}, n2: {}/{})",
+        node1.owns(e1),
+        node1.owns(e2),
+        node2.owns(e1),
+        node2.owns(e2)
     );
-    assert_eq!(
-        node2.ownership.owner_of(e1),
-        node2.ownership.owner_of(e2),
-        "node2's map must agree"
-    );
-    assert_eq!(owner_e1, node2.ownership.owner_of(e1), "maps consistent");
 
     // 2. At least one flip actually travelled the bus.
     assert!(
@@ -151,32 +176,41 @@ fn full_loop_two_nodes_converge_with_exactly_once() {
         "no flip ever arrived on any node inbox"
     );
 
-    // 3. Node maps equal the runtime's authoritative assignments.
+    // 3. Node record views equal the runtime's authoritative assignments.
     for e in [e1, e2] {
+        let mgr_owner = runtime.assignments().get(&e).copied().unwrap();
         assert_eq!(
-            node1.ownership.owner_of(e),
-            runtime.assignments().get(&e).copied(),
-            "node map must match manager assignments for {e}"
+            node1.owns(e),
+            mgr_owner == c1,
+            "node1's record view must match manager assignments for {e}"
+        );
+        assert_eq!(
+            node2.owns(e),
+            mgr_owner == c2,
+            "node2's record view must match manager assignments for {e}"
         );
     }
 
-    // 4. Exactly-once authority (XOR) around every flip both nodes saw.
-    for flip in node1.flips_seen.iter().chain(node2.flips_seen.iter()) {
-        let t0 = flip.effective_tick.saturating_sub(2);
-        for tick in t0..=flip.effective_tick + 2 {
-            let n1 = resolve_authoritative(flip.entity_id, c1, &node1.ownership, tick, Some(*flip));
-            let n2 = resolve_authoritative(flip.entity_id, c2, &node2.ownership, tick, Some(*flip));
-            assert!(
-                n1 != n2,
-                "tick {tick}: exactly one node must own {} (n1={n1} n2={n2})",
-                flip.entity_id
-            );
-        }
+    // 4. Exactly-once authority at the END state, from the record views alone.
+    for e in [e1, e2] {
+        assert!(
+            node1.owns(e) ^ node2.owns(e),
+            "exactly one node must own {e} per the record views"
+        );
     }
 
-    // 5. The gaining node holds no proxy for an entity it now owns.
-    let winner = owner_e1.unwrap();
-    let gaining = if winner == c1 { &node1 } else { &node2 };
+    // 5. Adoption happened through the statement path (with the proxy seed),
+    // and the gaining node holds no proxy for an entity it now owns.
+    let gaining = if n1_both { &node1 } else { &node2 };
+    let losing = if n1_both { &node2 } else { &node1 };
+    assert!(
+        !gaining.adopted.is_empty(),
+        "gaining node never adopted through a statement"
+    );
+    assert!(
+        !losing.released.is_empty(),
+        "losing node never released through a statement"
+    );
     for e in [e1, e2] {
         assert!(
             !gaining.neighbor_entities.contains_key(&e),
@@ -201,16 +235,8 @@ fn full_loop_boundary_proxies_flow_to_nodes() {
     let b3 = uuid(22);
 
     let bus = InMemoryInboxBus::new();
-    let mut node1 = SimNode::new(c1, &bus);
-    let mut node2 = SimNode::new(c2, &bus);
-    for n in [&node1, &node2] {
-        for e in [a, a2, a3] {
-            n.ownership.set_owner(e, c1);
-        }
-        for e in [b, b2, b3] {
-            n.ownership.set_owner(e, c2);
-        }
-    }
+    let mut node1 = SimNode::new(c1, &bus, &[a, a2, a3]);
+    let mut node2 = SimNode::new(c2, &bus, &[b, b2, b3]);
 
     let mut runtime = ManagerRuntime::new(affinity_manager(), bus, Default::default());
     runtime.set_observation_radius(500.0);
@@ -233,9 +259,8 @@ fn full_loop_boundary_proxies_flow_to_nodes() {
     }
 
     // The cliques stayed split...
-    assert_ne!(
-        node1.ownership.owner_of(a),
-        node1.ownership.owner_of(b),
+    assert!(
+        node1.owns(a) && !node1.owns(b) && node2.owns(b) && !node2.owns(a),
         "boundary pair unexpectedly co-located; proxy assertions vacuous"
     );
     // ...and each node's inbox delivered the other side's boundary entity.

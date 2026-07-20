@@ -35,10 +35,26 @@ pub struct ReplicatedEntity {
 pub struct NodeInboxFrame {
     /// Router tick this frame was produced at (monotonic per router).
     pub tick: u64,
-    /// Ownership changes relevant to this node (it is from_cluster or to_cluster).
+    /// Ownership change EVENTS relevant to this node (it is from_cluster or
+    /// to_cluster). Informational since #289: nodes derive ownership from
+    /// `owned` (the record), not from these deltas. Kept for observability
+    /// (the multiprocess E2E asserts gate ordering on them).
     pub ownership: Vec<OwnershipFlip>,
     /// Foreign entities this node should replicate/represent, with attention tier.
     pub entities: Vec<ReplicatedEntity>,
+    /// #289: the COMPLETE owned set for this cluster — every frame is an
+    /// idempotent statement, not a delta. "You own exactly these entities."
+    /// A node reconciles its world against it: adopt what appeared, release
+    /// what disappeared. Missing a frame is harmless (the next corrects);
+    /// restart is harmless (the first frame tells everything).
+    ///
+    /// `Option` distinguishes "no statement" (None — pre-#289 frame, node
+    /// skips reconciliation) from "you own NOTHING" (Some(empty) — a real
+    /// statement that must release everything outside spawn grace). A plain
+    /// Vec with serde(default) would conflate the two and an old frame
+    /// would wrongly drain the node.
+    #[serde(default)]
+    pub owned: Option<Vec<Uuid>>,
 }
 
 const NODE_INBOX_TOPIC_PREFIX: &str = "arcane:inbox";
@@ -258,6 +274,7 @@ mod tests {
             tick: 100,
             ownership: vec![flip],
             entities: vec![entity_1.clone(), entity_2.clone()],
+            owned: None,
         };
 
         bus.publish(cluster_a, frame.clone()).unwrap();
@@ -294,6 +311,7 @@ mod tests {
             tick: 50,
             ownership: vec![],
             entities: vec![],
+            owned: None,
         };
 
         bus.publish(cluster_id, frame.clone()).unwrap();
@@ -340,6 +358,7 @@ mod tests {
             tick: 123,
             ownership: vec![],
             entities: vec![entity],
+            owned: None,
         };
 
         let json = serde_json::to_string(&frame).unwrap();
@@ -392,6 +411,7 @@ mod tests {
             tick: 77,
             ownership: vec![],
             entities: vec![],
+            owned: None,
         };
 
         // Publishing should not error even though one receiver is gone.

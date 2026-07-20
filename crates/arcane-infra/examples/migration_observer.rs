@@ -41,6 +41,12 @@ use uuid::Uuid;
 enum Phase {
     Static,
     Migrate,
+    /// #289 restart-convergence probe: static players; the RUNNER kills and
+    /// restarts a node mid-run (scripts/hl_restart_node2.bat). Verdict checks
+    /// only the FINAL WINDOW: after the disturbance settles, observers agree,
+    /// nothing flips, every player still updates. Transient flips/disagreement
+    /// during the disturbance are expected and allowed.
+    Restart,
 }
 
 #[derive(Clone)]
@@ -103,6 +109,7 @@ fn parse_args() -> Args {
                 phase = match argv[i + 1].as_str() {
                     "static" => Phase::Static,
                     "migrate" => Phase::Migrate,
+                    "restart" => Phase::Restart,
                     other => {
                         eprintln!("unknown phase: {other}");
                         std::process::exit(2);
@@ -178,8 +185,8 @@ struct Observation {
 struct EntityTrack {
     /// Latest observation per observer index.
     latest: HashMap<usize, Observation>,
-    /// (observer, from, to, position_delta) attribution changes.
-    flips: Vec<(usize, Uuid, Uuid, f64)>,
+    /// (observer, from, to, position_delta, when) attribution changes.
+    flips: Vec<(usize, Uuid, Uuid, f64, Instant)>,
     max_jump_seen: f64,
     max_gap_ms_seen: u128,
 }
@@ -199,19 +206,27 @@ fn dist(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
 }
 
 fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
-    let (mut socket, _) = match tungstenite::connect(&ws_url) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[obs {idx}] connect {ws_url} failed: {e}");
-            return;
-        }
-    };
-    eprintln!("[obs {idx}] connected to {ws_url}");
-    while !shared.stop.load(Ordering::Relaxed) {
-        let msg = match socket.read() {
-            Ok(m) => m,
-            Err(_) => break,
+    // Reconnect loop: a killed/restarted node (restart phase) must not
+    // permanently blind its observer — a frozen observer would hold a stale
+    // last-observation and fake a disagreement forever.
+    'outer: while !shared.stop.load(Ordering::Relaxed) {
+        let (mut socket, _) = match tungstenite::connect(&ws_url) {
+            Ok(s) => s,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(1000));
+                continue 'outer;
+            }
         };
+        eprintln!("[obs {idx}] connected to {ws_url}");
+        while !shared.stop.load(Ordering::Relaxed) {
+            let msg = match socket.read() {
+                Ok(m) => m,
+                Err(_) => {
+                    eprintln!("[obs {idx}] connection lost; reconnecting");
+                    std::thread::sleep(Duration::from_millis(1000));
+                    continue 'outer;
+                }
+            };
         let tungstenite::Message::Binary(bytes) = msg else {
             continue;
         };
@@ -233,7 +248,7 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
                 if prev.cluster_id != obs.cluster_id {
                     track
                         .flips
-                        .push((idx, prev.cluster_id, obs.cluster_id, jump));
+                        .push((idx, prev.cluster_id, obs.cluster_id, jump, now));
                 } else if jump > track.max_jump_seen {
                     track.max_jump_seen = jump;
                 }
@@ -242,7 +257,8 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
                     track.max_gap_ms_seen = gap;
                 }
             }
-            track.latest.insert(idx, obs);
+                track.latest.insert(idx, obs);
+            }
         }
     }
     eprintln!("[obs {idx}] done");
@@ -250,6 +266,9 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
 
 struct PlayerSpec {
     idx: u32,
+    /// Restart phase: if the socket dies (its node was killed), re-join via
+    /// the manager and keep driving the SAME entity — real clients reconnect.
+    rejoin_on_failure: bool,
     spawn: (f64, f64),
     /// Walk toward this point at `speed` server-units/sec (None = static).
     target: Option<(f64, f64)>,
@@ -263,6 +282,7 @@ struct PlayerSpec {
 
 fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<Uuid> {
     let idx = spec.idx;
+    let manager_url = manager.trim_end_matches('/').to_string();
     let body = match http_get(&format!("{}/join", manager.trim_end_matches('/'))) {
         Ok(b) => b,
         Err(e) => {
@@ -331,6 +351,30 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
             });
             let bytes = arcane_wire::encode_client(&frame);
             if socket.send(tungstenite::Message::Binary(bytes)).is_err() {
+                if spec.rejoin_on_failure {
+                    // Our node died (restart phase). Re-join via the manager
+                    // and keep driving the same entity id.
+                    eprintln!("[player {idx}] send failed; re-joining via manager");
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let Ok(body) = http_get(&format!("{manager_url}/join")) else {
+                        continue;
+                    };
+                    let Ok(join) = serde_json::from_str::<JoinResponse>(&body) else {
+                        continue;
+                    };
+                    let url = format!("ws://{}:{}", join.server_host, join.server_port);
+                    match tungstenite::connect(&url) {
+                        Ok((mut s, _)) => {
+                            if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = s.get_mut() {
+                                let _ = tcp.set_nonblocking(true);
+                            }
+                            socket = s;
+                            eprintln!("[player {idx}] re-joined via {url}");
+                        }
+                        Err(_) => continue,
+                    }
+                    continue;
+                }
                 eprintln!("[player {idx}] send failed, stopping");
                 break;
             }
@@ -417,6 +461,7 @@ fn main() {
         let spec = match (args.phase, i) {
             (Phase::Migrate, 0) => PlayerSpec {
                 idx: i,
+                rejoin_on_failure: false,
                 spawn: (100.0, 100.0),
                 target: Some(convergence),
                 speed: 60.0,
@@ -424,6 +469,7 @@ fn main() {
             },
             (Phase::Migrate, 1) => PlayerSpec {
                 idx: i,
+                rejoin_on_failure: false,
                 spawn: (3000.0, 3000.0),
                 target: Some(convergence),
                 speed: 60.0,
@@ -434,13 +480,25 @@ fn main() {
                 // convergence point: no proximity edges, no partition
                 // pressure, no reason to migrate.
                 idx: i,
+                rejoin_on_failure: false,
                 spawn: (5000.0 + 800.0 * i as f64, 200.0),
+                target: None,
+                speed: 0.0,
+                disconnect_at_target: false,
+            },
+            (Phase::Restart, _) => PlayerSpec {
+                // Far-apart static players that SURVIVE their node dying:
+                // re-join through the manager and keep driving the entity.
+                idx: i,
+                rejoin_on_failure: true,
+                spawn: (100.0 + 1500.0 * i as f64, 100.0 + 1500.0 * i as f64),
                 target: None,
                 speed: 0.0,
                 disconnect_at_target: false,
             },
             _ => PlayerSpec {
                 idx: i,
+                rejoin_on_failure: false,
                 spawn: (100.0 + 700.0 * i as f64, 100.0 + 700.0 * i as f64),
                 target: None,
                 speed: 0.0,
@@ -504,14 +562,19 @@ fn main() {
         let owners: std::collections::HashSet<Uuid> =
             t.latest.values().map(|o| o.cluster_id).collect();
         let transitioning = args.phase == Phase::Migrate && i < 2;
-        if owners.len() > 1 && !transitioning {
+        // Restart phase: agreement is only required at the END (final window);
+        // the per-track latest map spans the whole run including the
+        // disturbance, so the generic disagree check is evaluated below in
+        // the final-window pass instead.
+        if owners.len() > 1 && !transitioning && args.phase != Phase::Restart {
             failures.push(format!(
                 "player {i} ({id}): observers DISAGREE on owner: {owners:?}"
             ));
         }
-        // Flips: forbidden in static phase (pinned); expected only for the
-        // converging pair in migrate phase.
-        let flips_allowed = args.phase == Phase::Migrate;
+        // Flips: forbidden in static phase (pinned); expected in migrate
+        // (the converging pair) and legitimate in restart (rebalancing after
+        // the node died — the final-window check below catches non-settling).
+        let flips_allowed = args.phase != Phase::Static;
         if !flips_allowed && !t.flips.is_empty() {
             failures.push(format!(
                 "player {i} ({id}): {} attribution flip(s) despite pinning",
@@ -520,7 +583,7 @@ fn main() {
         }
         // Every flip must be position-continuous (the same entity may not
         // teleport when its owner changes — the §8 adoption seed guarantees it).
-        for (obs, from, to, jump) in &t.flips {
+        for (obs, from, to, jump, _) in &t.flips {
             if *jump > args.max_jump {
                 failures.push(format!(
                     "player {i} ({id}): flip {from}->{to} on obs{obs} jumped {jump:.1} > {:.1}",
@@ -534,11 +597,61 @@ fn main() {
                 t.max_jump_seen, args.max_jump
             ));
         }
-        if t.max_gap_ms_seen > args.max_gap_ms as u128 {
+        if t.max_gap_ms_seen > args.max_gap_ms as u128 && args.phase != Phase::Restart {
+            // Restart phase: the kill window legitimately gaps; freshness is
+            // asserted in the final-window pass instead.
             failures.push(format!(
                 "player {i} ({id}): update gap {}ms > {}ms (stale/slow class)",
                 t.max_gap_ms_seen, args.max_gap_ms
             ));
+        }
+    }
+
+    // ── Restart phase: FINAL-WINDOW convergence (#289 acceptance) ──────────
+    // After the disturbance settles, the system must be indistinguishable
+    // from a healthy one: every player fresh, observers agree, no flips in
+    // the final window. Un-fakeable: a node that failed to converge keeps
+    // flipping attribution or freezes its entity, tripping these checks.
+    if args.phase == Phase::Restart {
+        let final_window = Duration::from_secs(15);
+        let now = Instant::now();
+        for (i, id) in player_entities.iter().enumerate() {
+            let Some(t) = tracks.get(id) else { continue };
+            // Freshness: latest observation within 3s across surviving observers.
+            let freshest = t.latest.values().map(|o| o.at).max();
+            match freshest {
+                Some(at) if now.duration_since(at) < Duration::from_secs(3) => {}
+                _ => failures.push(format!(
+                    "player {i} ({id}): NOT FRESH at end (last obs {:?} ago) — frozen after restart",
+                    freshest.map(|a| now.duration_since(a))
+                )),
+            }
+            // End-state agreement across observers with a FRESH view (an
+            // observer whose latest is older than the final window is mid-
+            // reconnect backlog, not a divergent authority).
+            let fresh_owners: std::collections::HashSet<Uuid> = t
+                .latest
+                .values()
+                .filter(|o| now.duration_since(o.at) < final_window)
+                .map(|o| o.cluster_id)
+                .collect();
+            if fresh_owners.len() > 1 {
+                failures.push(format!(
+                    "player {i} ({id}): observers DISAGREE at end: {fresh_owners:?}"
+                ));
+            }
+            // Settled: no flips in the final window.
+            let late_flips = t
+                .flips
+                .iter()
+                .filter(|(_, _, _, _, at)| now.duration_since(*at) < final_window)
+                .count();
+            if late_flips > 0 {
+                failures.push(format!(
+                    "player {i} ({id}): {late_flips} flip(s) in the final {}s — not settled",
+                    final_window.as_secs()
+                ));
+            }
         }
     }
 
@@ -615,6 +728,7 @@ fn main() {
             match args.phase {
                 Phase::Static => "static",
                 Phase::Migrate => "migrate",
+                Phase::Restart => "restart",
             }
         );
     } else {

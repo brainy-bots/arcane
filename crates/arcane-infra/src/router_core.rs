@@ -33,6 +33,11 @@ pub struct RouterInput<'a> {
     /// Entities to force-include in specific clusters regardless of interest.
     /// (entity_id, to_cluster) pairs for pending-flip entities awaiting replication confirmation.
     pub force_include: &'a [(Uuid, Uuid)],
+    /// #289: the full known cluster topology. Every cluster listed here gets
+    /// a frame every cycle (a complete statement, possibly "you own nothing"),
+    /// so restarted/drained nodes are always corrected. Clusters appearing in
+    /// assignments/flips but not listed here still get frames (union).
+    pub known_clusters: &'a [Uuid],
 }
 
 /// Router configuration: rate law and per-entity dynamism placeholder.
@@ -54,9 +59,11 @@ impl Default for RouterConfig {
 }
 
 /// One routing pass: compute each cluster's inbox frame (design §2.3 steps 1-5).
-/// Returns one frame per cluster that has anything to receive (owned entities exist,
-/// a flip affects it, or foreign entities are interesting to it). Deterministic:
-/// entities within a frame sorted by entity_id; clusters iterated in sorted order.
+/// #289: returns one frame per KNOWN cluster per cycle — each frame is a
+/// complete, idempotent statement (owned set + interest set + state), so a
+/// node that missed any number of frames is fully corrected by the next one.
+/// Deterministic: entities within a frame sorted by entity_id; clusters
+/// iterated in sorted order.
 pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInboxFrame)> {
     // Step 1: Collect distinct cluster ids from assignments and flip endpoints.
     let mut clusters = HashSet::new();
@@ -72,6 +79,8 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
     for (_, to_cluster) in input.force_include {
         clusters.insert(*to_cluster);
     }
+    // #289: every known cluster is addressed every cycle.
+    clusters.extend(input.known_clusters.iter().copied());
 
     let mut frames = Vec::new();
 
@@ -171,20 +180,31 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
             ents
         };
 
-        // Only emit a frame if:
-        // - there are ownership flips affecting this cluster, OR
-        // - there are foreign entities to receive, OR
-        // - this cluster owns at least one entity.
-        let owns_entities = input.assignments.values().any(|&o| o == cluster_id);
+        // #289: the cluster's COMPLETE owned set — the frame is an idempotent
+        // statement of the record ("you own exactly these"), not a delta.
+        // Sorted for determinism.
+        let owned: Vec<Uuid> = {
+            let mut o: Vec<Uuid> = input
+                .assignments
+                .iter()
+                .filter(|(_, owner)| **owner == cluster_id)
+                .map(|(id, _)| *id)
+                .collect();
+            o.sort();
+            o
+        };
 
-        if !ownership.is_empty() || !entities.is_empty() || owns_entities {
-            let frame = NodeInboxFrame {
-                tick: input.tick,
-                ownership,
-                entities,
-            };
-            frames.push((cluster_id, frame));
-        }
+        // #289: EVERY known cluster gets a frame EVERY cycle. An empty owned
+        // set is itself a statement ("you own nothing") — exactly what a
+        // restarted or drained node needs to hear. The old any-content gate
+        // would starve such a node of the correcting statement.
+        let frame = NodeInboxFrame {
+            tick: input.tick,
+            ownership,
+            entities,
+            owned: Some(owned),
+        };
+        frames.push((cluster_id, frame));
     }
 
     // Return sorted by cluster id (already done since we processed sorted_clusters).
@@ -256,6 +276,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -310,6 +331,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -363,6 +385,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -400,6 +423,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -443,6 +467,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -482,6 +507,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
@@ -516,6 +542,7 @@ mod tests {
             entity_states: &entity_states,
             interaction_graph: &interaction_graph,
             force_include: &[],
+            known_clusters: &[],
         };
 
         let config = RouterConfig::default();
