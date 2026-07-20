@@ -58,29 +58,29 @@ enum Phase {
     /// on G2's cluster (it followed its new neighbors) while both groups
     /// remain internally co-located.
     Defector,
-    /// Binary-attention scaling probe: 8 players form FOUR tight groups in
-    /// four far-apart corners (2 per group). Run against the NOLEGACY stack
-    /// (`hl_stack.bat nopin nolegacy`): proxies flow ONLY through the
-    /// router's interest-based inbox. Verdict, per observer (cluster), from
-    /// the FRESH final window: the cluster's broadcast contains its OWN
-    /// group's entities and NOT the far groups' — each node pays attention
-    /// to what it owns plus its interest set, not the world. The report
-    /// prints per-observer visible-entity counts and per-node bytes_out so
-    /// the scaling win is quantified. (Run the same phase WITHOUT nolegacy
-    /// to see every observer carrying all entities — the A/B baseline.)
+    /// Attention-spectrum probe, ZERO end. Attention is ONE spectrum: how
+    /// often a cluster hears about an entity, as a function of interaction
+    /// probability p (the rate law; today quantized Zero/Low/Full, Zero =
+    /// absent). This phase probes the zero-truncated end: 8 players in FOUR
+    /// far corner groups, nothing approaching anything, p ~ 0 across groups.
+    /// Run against the NOLEGACY stack. Verdict: each cluster broadcasts only
+    /// its residents (the scaling payoff of the spectrum's floor). The
+    /// `approach` phase probes the RISING part of the SAME curve — they are
+    /// one mechanism, not two features. A/B: run without nolegacy for the
+    /// world-broadcast baseline.
     Attention,
-    /// Anticipatory replication probe: group A parked at (500,500), group B
-    /// at (3000,500), a lone far control at (3000,8000). After 30s one B
-    /// member (the TRAVELER, player 4) walks toward A at 50u/s. Run against
-    /// the NOLEGACY stack. Verdict, measured on A's host-cluster broadcast:
-    /// the traveler must appear BEFORE it arrives (first post-settle sighting
-    /// at distance > 60u from A, expect ~120-200u = screen radius minus
-    /// pipeline latency) and attributed to its FOREIGN owner at that moment —
-    /// proving the host was warmed with a proxy ahead of arrival, not shown
-    /// the entity after adoption. The far control must stay invisible on A's
-    /// host throughout: same "not my cluster" status, near-zero interaction
-    /// likelihood, opposite treatment. This is the attention POSITIVE case
-    /// (the `attention` phase proves the negative: no approach, no traffic).
+    /// Attention-spectrum probe, RISING end — same mechanism as `attention`,
+    /// different region of the same p -> rate curve. Group A parked at
+    /// (500,500), group B at (3000,500), a lone far control at (3000,8000).
+    /// After 30s one B member (the TRAVELER, player 4) walks toward A at
+    /// 50u/s: its p against A rises with approach, crossing from Zero
+    /// (absent) into the included tiers BEFORE contact. Verdict, on A's
+    /// host-cluster broadcast: the traveler appears before arrival (first
+    /// post-settle sighting > 60u out, expect ~150-200u = screen radius
+    /// minus pipeline latency) attributed to its FOREIGN owner (warmed as a
+    /// proxy ahead of adoption), while the far control (p ~ 0) stays
+    /// invisible throughout. Attention is likelihood-prioritized: the
+    /// spectrum decides, distance only through p.
     Approach,
     /// Distance gradient: three PAIRS parked at increasing separation —
     /// close (~30u, inside proximity radius), mid (~400u), far (~4000u).
