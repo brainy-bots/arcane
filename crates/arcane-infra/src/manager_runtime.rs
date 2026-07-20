@@ -543,8 +543,12 @@ mod tests {
         let west: Vec<Uuid> = (0x200..0x204).map(Uuid::from_u128).collect();
 
         // Phase 1 (contact): everyone within proximity — cross-group edges
-        // form, exactly what a lane-crossing leaves behind. 10 cycles.
-        for _cycle in 0..10 {
+        // form, exactly what a lane-crossing leaves behind. 240 cycles
+        // (the converge scenario's 60s dwell at 250ms cadence): cross-group
+        // edges SATURATE to the same weight as within-group edges. The
+        // short-contact variant (10 cycles) passed while the live converge
+        // still wedged — saturated contact is the hard case.
+        for _cycle in 0..240 {
             for (i, e) in east.iter().enumerate() {
                 runtime.update_entity(
                     *e,
@@ -564,8 +568,9 @@ mod tests {
         // Phase 2 (parked apart): cross-group edges DECAY but linger far
         // above zero for hundreds of cycles. The partitioner must still
         // recognize two communities — connectivity-to-epsilon kept the
-        // graph "one component" and consolidation permanent.
-        for _cycle in 0..140 {
+        // graph "one component" and consolidation permanent. 264 cycles =
+        // the converge scenario's post-homecoming window (66s).
+        for _cycle in 0..264 {
             for (i, e) in east.iter().enumerate() {
                 runtime.update_entity(
                     *e,

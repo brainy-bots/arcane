@@ -923,6 +923,40 @@ impl ArcaneManager {
             &self.known_clusters,
         );
 
+        // Diagnostics (ARCANE_DEBUG_PARTITION=1): the wedge class of failure
+        // is silent — a partitioner that never proposes a change produces no
+        // flips, no declines, nothing in the logs. Surface the graph state
+        // and the desired-vs-current diff every 20 cycles so "why is it not
+        // splitting" is answerable from a live log.
+        if std::env::var("ARCANE_DEBUG_PARTITION").as_deref() == Ok("1")
+            && self.eval_cycle % 20 == 0
+        {
+            let mut weights: Vec<f64> = Vec::new();
+            for (_, _, w) in self.interaction_graph.pairs() {
+                weights.push(w);
+            }
+            weights.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let max_w = weights.first().copied().unwrap_or(0.0);
+            let above_10pct = weights.iter().filter(|w| **w >= max_w * 0.1).count();
+            let diffs = resolved
+                .iter()
+                .filter(|(e, d)| current_assignments.get(e) != Some(d))
+                .count();
+            let mut owner_counts: HashMap<Uuid, usize> = HashMap::new();
+            for c in current_assignments.values() {
+                *owner_counts.entry(*c).or_insert(0) += 1;
+            }
+            eprintln!(
+                "[partition dbg] cycle {} edges {} max_w {:.2} >=10% {} desired_diffs {} owners {:?}",
+                self.eval_cycle,
+                weights.len(),
+                max_w,
+                above_10pct,
+                diffs,
+                owner_counts.values().collect::<Vec<_>>()
+            );
+        }
+
         for (entity_id, desired_cluster) in resolved {
             if let Some(&current_cluster) = current_assignments.get(&entity_id) {
                 if desired_cluster != current_cluster {
