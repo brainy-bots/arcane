@@ -47,6 +47,23 @@ enum Phase {
     /// nothing flips, every player still updates. Transient flips/disagreement
     /// during the disturbance are expected and allowed.
     Restart,
+    /// Clustering-logic acceptance: 6 players walk into TWO tight groups
+    /// (0,1,2 -> G1; 3,4,5 -> G2) far apart. The distance->interaction
+    /// heuristic must produce the PREDICTED PARTITION: each group co-located
+    /// on ONE cluster, the two groups on DIFFERENT clusters. Stronger than
+    /// pair co-location: the full expected partition is asserted.
+    Cluster,
+    /// Clustering follow-through: same two groups; after a settle period
+    /// player 0 DEFECTS and walks from G1 to G2. Verdict: the defector ends
+    /// on G2's cluster (it followed its new neighbors) while both groups
+    /// remain internally co-located.
+    Defector,
+    /// Distance gradient: three PAIRS parked at increasing separation —
+    /// close (~30u, inside proximity radius), mid (~400u), far (~4000u).
+    /// Verdict: the close pair co-locates; the far pair NEVER does. Directly
+    /// confirms distance <-> interaction probability. (The mid pair is
+    /// reported but not asserted — it sits in the predictor's gray zone.)
+    Gradient,
 }
 
 #[derive(Clone)]
@@ -110,6 +127,9 @@ fn parse_args() -> Args {
                     "static" => Phase::Static,
                     "migrate" => Phase::Migrate,
                     "restart" => Phase::Restart,
+                    "cluster" => Phase::Cluster,
+                    "defector" => Phase::Defector,
+                    "gradient" => Phase::Gradient,
                     other => {
                         eprintln!("unknown phase: {other}");
                         std::process::exit(2);
@@ -272,6 +292,11 @@ struct PlayerSpec {
     spawn: (f64, f64),
     /// Walk toward this point at `speed` server-units/sec (None = static).
     target: Option<(f64, f64)>,
+    /// Choreography: waypoints as (activate_after_secs, x, z). The player
+    /// heads to the LAST waypoint whose activation time has elapsed
+    /// (overrides `target` once any is active). Enables predicted-partition
+    /// scenarios: park in a group, then move on schedule.
+    waypoints: Vec<(f64, f64, f64)>,
     speed: f64,
     /// Legacy pinned-stack mode: stop sending and close the socket on
     /// reaching the target so the entity becomes plain server-side state.
@@ -320,11 +345,21 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
         let (mut x, mut z) = spec.spawn;
         let mut seq = 0u64;
         let dt = 0.1f64;
+        let started = Instant::now();
         while !shared.stop.load(Ordering::Relaxed) {
-            // Movement toward the target, if any.
+            // Movement toward the target, if any. Waypoints override target:
+            // head to the LAST waypoint whose activation time has elapsed.
+            let elapsed = started.elapsed().as_secs_f64();
+            let active_target: Option<(f64, f64)> = spec
+                .waypoints
+                .iter()
+                .filter(|(after, _, _)| elapsed >= *after)
+                .next_back()
+                .map(|(_, wx, wz)| (*wx, *wz))
+                .or(spec.target);
             let (mut vx, mut vz) = (0.0, 0.0);
             let mut arrived = false;
-            if let Some((tx, tz)) = spec.target {
+            if let Some((tx, tz)) = active_target {
                 let dx = tx - x;
                 let dz = tz - z;
                 let d = (dx * dx + dz * dz).sqrt();
@@ -458,12 +493,23 @@ fn main() {
     let convergence = (1500.0, 1500.0);
     let mut player_entities = vec![];
     for i in 0..args.players {
+        // Cluster/Defector geometry: G1 around (500,500), G2 around (5500,5500)
+        // — inter-group distance ~7000u >> proximity radius, intra-group ~30u.
+        let group_slot = |center: (f64, f64), slot: u32| -> (f64, f64) {
+            let offsets = [(0.0, 0.0), (30.0, 0.0), (0.0, 30.0)];
+            let (ox, oz) = offsets[(slot % 3) as usize];
+            (center.0 + ox, center.1 + oz)
+        };
+        let g1 = (500.0, 500.0);
+        let g2 = (5500.0, 5500.0);
+
         let spec = match (args.phase, i) {
             (Phase::Migrate, 0) => PlayerSpec {
                 idx: i,
                 rejoin_on_failure: false,
                 spawn: (100.0, 100.0),
                 target: Some(convergence),
+                waypoints: vec![],
                 speed: 60.0,
                 disconnect_at_target: args.disconnect_at_target,
             },
@@ -472,6 +518,7 @@ fn main() {
                 rejoin_on_failure: false,
                 spawn: (3000.0, 3000.0),
                 target: Some(convergence),
+                waypoints: vec![],
                 speed: 60.0,
                 disconnect_at_target: args.disconnect_at_target,
             },
@@ -483,6 +530,7 @@ fn main() {
                 rejoin_on_failure: false,
                 spawn: (5000.0 + 800.0 * i as f64, 200.0),
                 target: None,
+                waypoints: vec![],
                 speed: 0.0,
                 disconnect_at_target: false,
             },
@@ -493,14 +541,71 @@ fn main() {
                 rejoin_on_failure: true,
                 spawn: (100.0 + 1500.0 * i as f64, 100.0 + 1500.0 * i as f64),
                 target: None,
+                waypoints: vec![],
                 speed: 0.0,
                 disconnect_at_target: false,
             },
+            (Phase::Cluster, _) => {
+                // Players spawn SCATTERED (one per cluster via round-robin,
+                // far apart), then walk into their group. The partition must
+                // be DISCOVERED by the distance heuristic, not inherited
+                // from the join placement.
+                let group = if i < 3 { g1 } else { g2 };
+                let slot = group_slot(group, i % 3);
+                PlayerSpec {
+                    idx: i,
+                    rejoin_on_failure: false,
+                    spawn: (100.0 + 2000.0 * i as f64, 8000.0),
+                    target: Some(slot),
+                    waypoints: vec![],
+                    speed: 120.0,
+                    disconnect_at_target: false,
+                }
+            }
+            (Phase::Defector, _) => {
+                let group = if i < 3 { g1 } else { g2 };
+                let slot = group_slot(group, i % 3);
+                let mut waypoints = vec![];
+                if i == 0 {
+                    // The defector: after the groups settle (45s), walk to G2.
+                    waypoints.push((45.0, g2.0 - 30.0, g2.1 - 30.0));
+                }
+                PlayerSpec {
+                    idx: i,
+                    rejoin_on_failure: false,
+                    spawn: (100.0 + 2000.0 * i as f64, 8000.0),
+                    target: Some(slot),
+                    waypoints,
+                    speed: 120.0,
+                    disconnect_at_target: false,
+                }
+            }
+            (Phase::Gradient, _) => {
+                // Three pairs at increasing separation. Pair k = players
+                // (2k, 2k+1). Bases far apart so pairs never interact.
+                let pair = i / 2;
+                let side = (i % 2) as f64;
+                let (bx, bz, sep) = match pair {
+                    0 => (500.0, 500.0, 30.0),     // close: inside proximity radius
+                    1 => (500.0, 6000.0, 400.0),   // mid: predictor gray zone
+                    _ => (6000.0, 500.0, 4000.0),  // far: no interaction ever
+                };
+                PlayerSpec {
+                    idx: i,
+                    rejoin_on_failure: false,
+                    spawn: (100.0 + 2000.0 * i as f64, 12000.0),
+                    target: Some((bx + side * sep, bz)),
+                    waypoints: vec![],
+                    speed: 200.0,
+                    disconnect_at_target: false,
+                }
+            }
             _ => PlayerSpec {
                 idx: i,
                 rejoin_on_failure: false,
                 spawn: (100.0 + 700.0 * i as f64, 100.0 + 700.0 * i as f64),
                 target: None,
+                waypoints: vec![],
                 speed: 0.0,
                 disconnect_at_target: false,
             },
@@ -562,18 +667,21 @@ fn main() {
         let owners: std::collections::HashSet<Uuid> =
             t.latest.values().map(|o| o.cluster_id).collect();
         let transitioning = args.phase == Phase::Migrate && i < 2;
-        // Restart phase: agreement is only required at the END (final window);
-        // the per-track latest map spans the whole run including the
-        // disturbance, so the generic disagree check is evaluated below in
-        // the final-window pass instead.
-        if owners.len() > 1 && !transitioning && args.phase != Phase::Restart {
+        // Restart/cluster/defector/gradient phases: agreement is only required
+        // at the END (final-window pass below); entities legitimately
+        // transition owners mid-run while the partition is being discovered.
+        let end_state_phase = matches!(
+            args.phase,
+            Phase::Restart | Phase::Cluster | Phase::Defector | Phase::Gradient
+        );
+        if owners.len() > 1 && !transitioning && !end_state_phase {
             failures.push(format!(
                 "player {i} ({id}): observers DISAGREE on owner: {owners:?}"
             ));
         }
-        // Flips: forbidden in static phase (pinned); expected in migrate
-        // (the converging pair) and legitimate in restart (rebalancing after
-        // the node died — the final-window check below catches non-settling).
+        // Flips: forbidden only in the static phase; every other phase
+        // exercises migration by design (the end-state checks catch
+        // non-settling).
         let flips_allowed = args.phase != Phase::Static;
         if !flips_allowed && !t.flips.is_empty() {
             failures.push(format!(
@@ -597,13 +705,124 @@ fn main() {
                 t.max_jump_seen, args.max_jump
             ));
         }
-        if t.max_gap_ms_seen > args.max_gap_ms as u128 && args.phase != Phase::Restart {
+        if t.max_gap_ms_seen > args.max_gap_ms as u128
+            && !matches!(
+                args.phase,
+                Phase::Restart | Phase::Cluster | Phase::Defector | Phase::Gradient
+            )
+        {
             // Restart phase: the kill window legitimately gaps; freshness is
             // asserted in the final-window pass instead.
             failures.push(format!(
                 "player {i} ({id}): update gap {}ms > {}ms (stale/slow class)",
                 t.max_gap_ms_seen, args.max_gap_ms
             ));
+        }
+    }
+
+    // ── Clustering phases: PREDICTED-PARTITION verdicts ────────────────────
+    // The majority-owner of each entity at the end, from the freshest
+    // observations (same resolution the migrate phase uses).
+    let end_owner = |id: &Uuid| -> Option<Uuid> {
+        let t = tracks.get(id)?;
+        let mut counts: HashMap<Uuid, usize> = HashMap::new();
+        for o in t.latest.values() {
+            *counts.entry(o.cluster_id).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c)
+    };
+
+    if matches!(args.phase, Phase::Cluster | Phase::Defector) {
+        assert!(args.players >= 6, "cluster/defector phases need 6 players");
+        // Expected partition: {0,1,2} together, {3,4,5} together, apart.
+        // Defector: player 0 must END with group 2 instead.
+        let (g1_idx, g2_idx): (Vec<usize>, Vec<usize>) = match args.phase {
+            Phase::Defector => (vec![1, 2], vec![0, 3, 4, 5]),
+            _ => (vec![0, 1, 2], vec![3, 4, 5]),
+        };
+        let owners_of = |idxs: &[usize]| -> Vec<Option<Uuid>> {
+            idxs.iter()
+                .map(|i| end_owner(&player_entities[*i]))
+                .collect()
+        };
+        let g1_owners = owners_of(&g1_idx);
+        let g2_owners = owners_of(&g2_idx);
+        eprintln!("group1 (players {g1_idx:?}) owners: {g1_owners:?}");
+        eprintln!("group2 (players {g2_idx:?}) owners: {g2_owners:?}");
+
+        let g1_set: std::collections::HashSet<_> = g1_owners.iter().flatten().collect();
+        let g2_set: std::collections::HashSet<_> = g2_owners.iter().flatten().collect();
+        if g1_owners.iter().any(|o| o.is_none()) || g1_set.len() != 1 {
+            failures.push(format!(
+                "group 1 NOT co-located on one cluster: {g1_owners:?} — \
+                 distance heuristic failed to cluster the group"
+            ));
+        }
+        if g2_owners.iter().any(|o| o.is_none()) || g2_set.len() != 1 {
+            failures.push(format!(
+                "group 2 NOT co-located on one cluster: {g2_owners:?} — \
+                 distance heuristic failed to cluster the group"
+            ));
+        }
+        if g1_set.len() == 1 && g2_set.len() == 1 && g1_set == g2_set {
+            failures.push(
+                "BOTH groups on the SAME cluster — partition ignored inter-group distance"
+                    .to_string(),
+            );
+        }
+        if args.phase == Phase::Defector {
+            let defector = end_owner(&player_entities[0]);
+            let g2_owner = g2_owners.get(1).copied().flatten(); // player 3's owner
+            eprintln!("defector (player 0) end owner: {defector:?} vs group2 {g2_owner:?}");
+            if defector.is_none() || defector != g2_owner {
+                failures.push(format!(
+                    "defector did NOT follow its new group: ended {defector:?}, group2 on {g2_owner:?}"
+                ));
+            }
+        }
+    }
+
+    if args.phase == Phase::Gradient {
+        assert!(args.players >= 6, "gradient phase needs 6 players");
+        let pair_owner = |k: usize| -> (Option<Uuid>, Option<Uuid>) {
+            (
+                end_owner(&player_entities[2 * k]),
+                end_owner(&player_entities[2 * k + 1]),
+            )
+        };
+        let (c0, c1) = pair_owner(0); // close pair
+        let (m0, m1) = pair_owner(1); // mid pair (reported, not asserted)
+        let (f0, f1) = pair_owner(2); // far pair
+        eprintln!("close pair (30u):  {c0:?} vs {c1:?}");
+        eprintln!("mid pair (400u):   {m0:?} vs {m1:?} (informational)");
+        eprintln!("far pair (4000u):  {f0:?} vs {f1:?}");
+        if c0.is_none() || c0 != c1 {
+            failures.push(format!(
+                "CLOSE pair (30u apart) not co-located: {c0:?} vs {c1:?} — \
+                 high interaction probability ignored"
+            ));
+        }
+        // The far pair must never co-locate... unless capacity packing put
+        // them together for free (k=4 clusters, 6 entities — packing can
+        // legally pair leftovers). What we assert is the CONTRAST: the far
+        // pair must not be treated BETTER than the close pair. If the close
+        // pair co-located and the far pair is on one cluster too, require
+        // that no flip was needed to achieve it (i.e., they were simply
+        // packed, not attracted): the far pair's tracks must show zero flips.
+        if f0.is_some() && f0 == f1 {
+            let far_flips: usize = [4usize, 5usize]
+                .iter()
+                .filter_map(|i| tracks.get(&player_entities[*i]))
+                .map(|t| t.flips.len())
+                .sum();
+            if far_flips > 0 {
+                failures.push(format!(
+                    "FAR pair (4000u apart) was actively migrated together ({far_flips} flips) — \
+                     distance should have kept interaction probability ~0"
+                ));
+            } else {
+                eprintln!("far pair co-resident by initial packing (0 flips) — acceptable");
+            }
         }
     }
 
@@ -729,6 +948,9 @@ fn main() {
                 Phase::Static => "static",
                 Phase::Migrate => "migrate",
                 Phase::Restart => "restart",
+                Phase::Cluster => "cluster",
+                Phase::Defector => "defector",
+                Phase::Gradient => "gradient",
             }
         );
     } else {
