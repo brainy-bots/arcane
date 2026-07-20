@@ -400,6 +400,30 @@ impl ArcaneManager {
             .update_entity(entity_id, cluster_id, position);
     }
 
+    /// Remove an entity from ALL manager state: spatial index, features,
+    /// physics edges, interaction graph, prediction memo, migration
+    /// bookkeeping. The manager's inputs are complete per-cycle statements
+    /// (state keys); an entity absent from them has despawned or its cluster
+    /// lost it — either way keeping it would freeze a phantom in the
+    /// partition forever. Caller (ManagerRuntime) decides WHEN absence means
+    /// gone (grace + stale-cluster protection); this method is the
+    /// unconditional removal.
+    pub fn remove_entity(&mut self, entity_id: Uuid) {
+        // Cluster id argument is unused by the index's removal path.
+        self.spatial_index.remove_entity(entity_id, Uuid::nil());
+        self.prediction_memo
+            .retain(|(a, b), _| *a != entity_id && *b != entity_id);
+        #[cfg(feature = "migration")]
+        {
+            self.features.remove(&entity_id);
+            self.physics_edges
+                .retain(|(a, b), _| *a != entity_id && *b != entity_id);
+            self.interaction_graph.remove_entity(entity_id);
+            self.last_seen_entities.remove(&entity_id);
+            self.migration_state.last_migrated.remove(&entity_id);
+        }
+    }
+
     /// Set observation radius used for neighbor discovery (delegates to SpatialIndex). Call before get_neighbors_for_cluster.
     pub fn set_observation_radius(&mut self, radius: f64) {
         self.spatial_index.set_observation_radius(radius);

@@ -21,6 +21,13 @@ pub struct RuntimeConfig {
     pub router_config: RouterConfig,
     /// Number of cycles an entity must be replicated to the destination before flipping.
     pub confirmation_cycles: u64,
+    /// Cycles an entity may be ABSENT from the state feed before the runtime
+    /// prunes it from all decision state (assignments overlay, spatial index,
+    /// graph, gate). State keys are complete per-cluster statements, so a
+    /// LIVE cluster omitting an entity means despawn; the grace absorbs feed
+    /// jitter. Entities on a blocked (stale) cluster are never pruned — a
+    /// silent cluster says nothing about its entities. 0 disables pruning.
+    pub absence_grace_cycles: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -28,6 +35,7 @@ impl Default for RuntimeConfig {
         Self {
             router_config: RouterConfig::default(),
             confirmation_cycles: 3,
+            absence_grace_cycles: 8,
         }
     }
 }
@@ -73,6 +81,10 @@ pub struct ManagerRuntime<B: InboxBus> {
     /// the decision output is a READABLE RECORD and the in-process router
     /// pass reads through it (worker split = pure process topology later).
     routing_table: Box<dyn RoutingTable>,
+    /// Last cycle each entity appeared in the state feed (`update_entity`).
+    /// Drives absence pruning: assignments/graph/index entries for entities
+    /// a LIVE cluster stopped reporting are dropped after the grace window.
+    last_seen: HashMap<Uuid, u64>,
     /// #289: clusters ever seen in entity sightings. Union-ed with
     /// `known_clusters` for routing so a cluster that lost ALL entities keeps
     /// receiving its (empty) owned statement — without this, a fully-drained
@@ -91,6 +103,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             RuntimeConfig {
                 router_config,
                 confirmation_cycles: 3,
+                absence_grace_cycles: 8,
             },
         )
     }
@@ -109,6 +122,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             first_cycle_flips: HashSet::new(),
             blocked_destinations: HashSet::new(),
             publish_frames: true,
+            last_seen: HashMap::new(),
             routing_table: Box::new(InMemoryRoutingTable::new()),
             known_clusters: Vec::new(),
             seen_clusters: std::collections::HashSet::new(),
@@ -121,6 +135,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
     /// cluster (after a flip, the manager must see the entity on its new cluster).
     pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
         self.seen_clusters.insert(cluster_id);
+        self.last_seen.insert(entity_id, self.tick);
         // Establish ownership on first sighting, or use current assignment on re-sighting.
         let current_cluster = *self.assignments.entry(entity_id).or_insert(cluster_id);
         self.manager
@@ -194,6 +209,63 @@ impl<B: InboxBus> ManagerRuntime<B> {
     pub fn set_known_clusters(&mut self, clusters: Vec<Uuid>) {
         self.known_clusters = clusters.clone();
         self.manager.set_known_clusters(clusters);
+    }
+
+    /// Absence pruning: drop entities the state feed stopped reporting.
+    /// State keys are complete per-cluster statements, so absence from a
+    /// complete feed means despawn (the grace window absorbs jitter).
+    /// Without this, the assignments overlay and spatial index grow forever
+    /// and despawned entities keep participating in partition decisions as
+    /// frozen phantoms.
+    ///
+    /// EXPLICIT by design: only the caller knows whether its feed is
+    /// complete. The manager binary calls this every control loop right
+    /// after feeding all state records; an embedding that feeds entities
+    /// once and cycles many times (unit tests, replays) simply never calls
+    /// it. Guards:
+    ///  - entities assigned to a BLOCKED (stale) cluster are exempt — a
+    ///    silent cluster says nothing about its entities;
+    ///  - entities with an in-flight pending/confirmed flip are exempt —
+    ///    mid-migration feed gaps are expected (the source may drop the
+    ///    entity a beat before the destination reports it).
+    ///
+    /// Returns the number of entities pruned.
+    pub fn prune_absent(&mut self) -> usize {
+        if self.config.absence_grace_cycles == 0 {
+            return 0;
+        }
+        let grace = self.config.absence_grace_cycles;
+        let tick = self.tick;
+        let mut departed: Vec<Uuid> = Vec::new();
+        for (entity_id, last) in &self.last_seen {
+            if tick.saturating_sub(*last) <= grace {
+                continue;
+            }
+            if let Some(owner) = self.assignments.get(entity_id) {
+                if self.blocked_destinations.contains(owner) {
+                    continue;
+                }
+            }
+            let migrating = self
+                .pending_flips
+                .iter()
+                .chain(self.confirmed_flips.iter())
+                .any(|f| f.entity_id == *entity_id);
+            if migrating {
+                continue;
+            }
+            departed.push(*entity_id);
+        }
+        let pruned = departed.len();
+        for entity_id in departed {
+            self.last_seen.remove(&entity_id);
+            self.assignments.remove(&entity_id);
+            self.manager.remove_entity(entity_id);
+            self.gate.forget(entity_id);
+            self.skip_confirmed.remove(&entity_id);
+            self.first_cycle_flips.remove(&entity_id);
+        }
+        pruned
     }
 
     /// Run one control cycle: evaluate, route, publish.
@@ -441,6 +513,85 @@ mod tests {
         RouterConfig::default()
     }
 
+    /// Absence pruning: an entity a LIVE cluster stops reporting is removed
+    /// from the assignments overlay and the spatial snapshot after the grace
+    /// window; a continually-reported entity survives.
+    #[test]
+    fn absent_entities_are_pruned_after_grace() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        let grace = runtime.config.absence_grace_cycles;
+
+        let c1 = Uuid::from_u128(0x1);
+        let stays = Uuid::from_u128(0x100);
+        let departs = Uuid::from_u128(0x200);
+
+        for cycle in 0..(grace + 3) {
+            runtime.update_entity(stays, c1, Vec3::new(0.0, 0.0, 0.0));
+            if cycle < 1 {
+                runtime.update_entity(departs, c1, Vec3::new(100.0, 0.0, 0.0));
+            }
+            runtime.prune_absent();
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+
+        assert!(
+            runtime.assignments().contains_key(&stays),
+            "continually-reported entity must survive"
+        );
+        assert!(
+            !runtime.assignments().contains_key(&departs),
+            "absent entity must be pruned from assignments after grace"
+        );
+        let snapshot = runtime.manager().snapshot_positions();
+        assert!(
+            !snapshot.iter().any(|(id, _, _, _)| *id == departs),
+            "absent entity must leave the spatial snapshot"
+        );
+        assert!(
+            snapshot.iter().any(|(id, _, _, _)| *id == stays),
+            "reported entity must stay in the spatial snapshot"
+        );
+    }
+
+    /// Absence pruning guard: entities owned by a BLOCKED (stale) cluster are
+    /// never pruned — a silent cluster says nothing about its entities.
+    #[test]
+    fn stale_cluster_entities_survive_absence() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        let grace = runtime.config.absence_grace_cycles;
+
+        let c1 = Uuid::from_u128(0x1);
+        let e1 = Uuid::from_u128(0x100);
+
+        runtime.update_entity(e1, c1, Vec3::new(0.0, 0.0, 0.0));
+        let mut blocked = HashSet::new();
+        blocked.insert(c1);
+        runtime.set_blocked_destinations(blocked);
+
+        for _ in 0..(grace + 5) {
+            runtime.prune_absent();
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+
+        assert!(
+            runtime.assignments().contains_key(&e1),
+            "stale-cluster entity must not be pruned (its silence is the cluster's, not its own)"
+        );
+
+        // Cluster recovers and still doesn't report the entity: NOW it prunes.
+        runtime.set_blocked_destinations(HashSet::new());
+        for _ in 0..(grace + 2) {
+            runtime.prune_absent();
+            runtime.run_cycle().expect("run_cycle failed");
+        }
+        assert!(
+            !runtime.assignments().contains_key(&e1),
+            "after recovery, continued absence must prune"
+        );
+    }
+
     /// flips_are_actuated_to_the_bus: Two entities on clusters C1/C2, same party,
     /// positions within proximity radius. Subscribe before cycling. Assert: at least
     /// one frame contains the flip, assignments updated, and frame matches.
@@ -661,6 +812,7 @@ mod tests {
             RuntimeConfig {
                 router_config: make_config(),
                 confirmation_cycles: N,
+                absence_grace_cycles: 8,
             },
         );
 
@@ -801,6 +953,7 @@ mod tests {
             RuntimeConfig {
                 router_config: make_config(),
                 confirmation_cycles: 3,
+                absence_grace_cycles: 8,
             },
         );
 

@@ -331,6 +331,15 @@ async fn control_loop(
                     runtime.set_entity_feature(record.entity_id, name, *value);
                 }
             }
+            // b2. The fetch above is a COMPLETE statement of every live
+            // cluster's entities, so absence means despawn: prune entities
+            // that stopped appearing (grace-windowed; stale clusters and
+            // in-flight migrations exempt). Without this the assignments
+            // overlay and spatial index leak forever.
+            let pruned = runtime.prune_absent();
+            if pruned > 0 {
+                eprintln!("arcane-manager: pruned {pruned} departed entities");
+            }
 
             // c. Staleness check: detect clusters whose ticks haven't advanced.
             // Tick-based (ADR-005 Decision 3 guard): a cluster is stale when its
