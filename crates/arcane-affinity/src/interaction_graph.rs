@@ -57,6 +57,11 @@ struct PairEdge {
 /// Tracks decaying pairwise interaction weights between entities, recording the kind of each edge.
 pub struct InteractionGraph {
     weights: HashMap<EntityPair, PairEdge>,
+    /// Adjacency index: entity -> set of entities it shares an edge with. Kept
+    /// in lockstep with `weights` so `neighbors()` is O(degree) instead of a
+    /// full O(total pairs) scan. The router calls `neighbors()` once per owned
+    /// entity every pass, so the old scan was O(owned x edges) on the hot path.
+    adjacency: HashMap<Uuid, HashSet<Uuid>>,
     tick_count: u32,
 }
 
@@ -64,6 +69,7 @@ impl InteractionGraph {
     pub fn new() -> Self {
         Self {
             weights: HashMap::new(),
+            adjacency: HashMap::new(),
             tick_count: 0,
         }
     }
@@ -75,6 +81,11 @@ impl InteractionGraph {
             return;
         }
         let pair = EntityPair::new(a, b);
+        // Index both directions on the first edge for this pair.
+        if !self.weights.contains_key(&pair) {
+            self.adjacency.entry(a).or_default().insert(b);
+            self.adjacency.entry(b).or_default().insert(a);
+        }
         let edge = self.weights.entry(pair).or_insert_with(|| PairEdge {
             weight: 0.0,
             kinds: HashSet::new(),
@@ -92,7 +103,32 @@ impl InteractionGraph {
         }
 
         if gc_interval > 0 && self.tick_count.is_multiple_of(gc_interval) {
-            self.weights.retain(|_, e| e.weight >= gc_threshold);
+            let adjacency = &mut self.adjacency;
+            self.weights.retain(|pair, e| {
+                let keep = e.weight >= gc_threshold;
+                if !keep {
+                    // Keep the adjacency index in lockstep with the pruned edge.
+                    Self::unindex_pair(adjacency, pair);
+                }
+                keep
+            });
+        }
+    }
+
+    /// Remove one canonical pair from the adjacency index (both directions),
+    /// dropping now-empty entity entries.
+    fn unindex_pair(adjacency: &mut HashMap<Uuid, HashSet<Uuid>>, pair: &EntityPair) {
+        if let Some(set) = adjacency.get_mut(&pair.0) {
+            set.remove(&pair.1);
+            if set.is_empty() {
+                adjacency.remove(&pair.0);
+            }
+        }
+        if let Some(set) = adjacency.get_mut(&pair.1) {
+            set.remove(&pair.0);
+            if set.is_empty() {
+                adjacency.remove(&pair.1);
+            }
         }
     }
 
@@ -105,15 +141,17 @@ impl InteractionGraph {
     }
 
     /// Iterate all entities with non-zero interaction weight with the given entity.
+    /// O(degree) via the adjacency index (not a full O(total pairs) scan).
     pub fn neighbors(&self, entity: Uuid) -> impl Iterator<Item = (Uuid, f64)> + '_ {
-        self.weights.iter().filter_map(move |(pair, edge)| {
-            if pair.0 == entity {
-                Some((pair.1, edge.weight))
-            } else if pair.1 == entity {
-                Some((pair.0, edge.weight))
-            } else {
-                None
-            }
+        self.adjacency.get(&entity).into_iter().flat_map(move |set| {
+            set.iter().map(move |&other| {
+                let w = self
+                    .weights
+                    .get(&EntityPair::new(entity, other))
+                    .map(|e| e.weight)
+                    .unwrap_or(0.0);
+                (other, w)
+            })
         })
     }
 
@@ -156,8 +194,16 @@ impl InteractionGraph {
 
     /// Remove all entries involving an entity (on disconnect/despawn).
     pub fn remove_entity(&mut self, entity: Uuid) {
-        self.weights
-            .retain(|pair, _| pair.0 != entity && pair.1 != entity);
+        let adjacency = &mut self.adjacency;
+        self.weights.retain(|pair, _| {
+            let keep = pair.0 != entity && pair.1 != entity;
+            if !keep {
+                Self::unindex_pair(adjacency, pair);
+            }
+            keep
+        });
+        // The entity itself has no remaining edges; drop its (now-empty) slot.
+        self.adjacency.remove(&entity);
     }
 
     /// Number of tracked pairs. For metrics.
@@ -310,5 +356,70 @@ mod tests {
         g.tick(0.5, 0.0, 0);
         assert!((g.get_weight(uuid(1), uuid(2)) - 5.0).abs() < 1e-10);
         assert!(!g.is_uncuttable(uuid(1), uuid(2)));
+    }
+
+    /// Cross-check helper: `neighbors()` (adjacency-indexed) must return exactly
+    /// what a brute-force scan over `pairs()` would, for every entity.
+    fn assert_neighbors_match_bruteforce(g: &InteractionGraph, entities: &[Uuid]) {
+        for &e in entities {
+            let mut indexed: Vec<(Uuid, f64)> = g.neighbors(e).collect();
+            indexed.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut brute: Vec<(Uuid, f64)> = g
+                .pairs()
+                .filter_map(|(a, b, w)| {
+                    if a == e {
+                        Some((b, w))
+                    } else if b == e {
+                        Some((a, w))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            brute.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(indexed, brute, "neighbors index/bruteforce mismatch");
+        }
+    }
+
+    #[test]
+    fn adjacency_index_matches_bruteforce_across_operations() {
+        // Deterministic pseudo-random sequence of record/tick(GC)/remove ops;
+        // after every checkpoint the adjacency-indexed neighbors() must equal the
+        // brute-force scan for every entity (the invariant the index promises).
+        let ids: Vec<Uuid> = (1u8..=8).map(uuid).collect();
+        let mut g = InteractionGraph::new();
+        let kinds = [
+            InteractionKind::Proximity,
+            InteractionKind::GameAction,
+            InteractionKind::Joint,
+            InteractionKind::SharedDeterministic,
+        ];
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for step in 0..2000u32 {
+            let r = next();
+            let op = r % 10;
+            if op < 7 {
+                let a = ids[(r >> 4) as usize % ids.len()];
+                let b = ids[(r >> 12) as usize % ids.len()];
+                let kind = kinds[(r >> 20) as usize % kinds.len()];
+                let w = 0.1 + ((r >> 24) % 30) as f64 * 0.1;
+                g.record_interaction(a, b, w, kind);
+            } else if op < 9 {
+                g.tick(0.9, 0.05, 1);
+            } else {
+                let e = ids[(r >> 8) as usize % ids.len()];
+                g.remove_entity(e);
+            }
+            if step % 7 == 0 {
+                assert_neighbors_match_bruteforce(&g, &ids);
+            }
+        }
+        assert_neighbors_match_bruteforce(&g, &ids);
     }
 }
