@@ -7,10 +7,7 @@ pub mod partition;
 pub mod predictor;
 pub mod rate_field;
 pub mod refinement;
-pub mod region;
 pub mod scorer;
-pub mod staleness_bench;
-pub mod warm_start;
 
 use config::AffinityConfig;
 use hysteresis::MigrationState;
