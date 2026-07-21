@@ -164,22 +164,33 @@ fn encode_entity_chunk(entity: &EntityStateEntry) -> Vec<u8> {
 /// entities. Subscribers with no visibility filter send this directly,
 /// avoiding per-subscriber chunk concatenation entirely. With N subscribers
 /// and E entities this reduces fan-out from O(N×E) to O(E).
+///
+/// Only ONE of `shared_full_frame` / `shared_empty_frame` is ever transmitted
+/// for a given tick: the full frame when AOI is OFF, the empty frame when AOI
+/// is ON (default-deny; per-subscriber masks add visible chunks). The producer
+/// therefore builds only the frame the active mode uses and leaves the other
+/// `None`. `entity_metadata` is only read on the AOI path, so it is likewise
+/// only populated when a filter is active.
 struct PreEncodedTick {
     header: DeltaHeader,
     entity_chunks: Vec<Arc<Vec<u8>>>,
     removed: Vec<Uuid>,
+    /// Only populated when an AOI filter is active (its sole consumer is
+    /// `compute_visibility_masks`).
     entity_metadata: Vec<(Uuid, Vec3)>,
-    shared_full_frame: Arc<Vec<u8>>,
-    /// Header + removed-ids with NO entity chunks. Sent to a subscriber when an AOI filter is active but
-    /// that subscriber has no known observer position yet — default-DENY, never the full frame.
-    shared_empty_frame: Arc<Vec<u8>>,
+    /// Full-entity frame; `Some` only when AOI is OFF.
+    shared_full_frame: Option<Arc<Vec<u8>>>,
+    /// Header + removed-ids with NO entity chunks. `Some` only when AOI is ON —
+    /// sent to a subscriber that has no known observer position yet
+    /// (default-DENY, never the full frame).
+    shared_empty_frame: Option<Arc<Vec<u8>>>,
 }
 
 /// Per-tick broadcast including pre-encoded entities and precomputed visibility masks.
-/// Masks are wrapped in `Arc` so the producer can cache and reuse them across multiple
-/// ticks without cloning the full HashMap. Recomputation happens every N ticks
-/// (configurable via `ARCANE_VISIBILITY_RECOMPUTE_TICKS`), or immediately when the
-/// entity count changes (mask length would mismatch).
+/// Masks are wrapped in `Arc` so the producer shares one `HashMap` allocation across
+/// all subscriber send-tasks for the tick without cloning it per subscriber. Masks are
+/// recomputed every tick against that tick's entities (no cross-tick reuse — a cached
+/// mask would misalign against the sparse, reordered delta).
 struct TickBroadcast {
     tick: Arc<PreEncodedTick>,
     masks: Arc<HashMap<u64, Vec<bool>>>,
@@ -201,35 +212,48 @@ struct TickBroadcast {
 /// keys on the chunk list. `rayon::par_iter().map(...).collect()`
 /// preserves iteration order, so the resulting `Vec` is bit-for-bit
 /// identical to the serial version's output.
-fn pre_encode_tick(delta: &EntityStateDelta) -> PreEncodedTick {
+fn pre_encode_tick(delta: &EntityStateDelta, has_filter: bool) -> PreEncodedTick {
     let entity_chunks: Vec<Arc<Vec<u8>>> = delta
         .updated
         .par_iter()
         .map(|e| Arc::new(encode_entity_chunk(e)))
         .collect();
-    let entity_metadata: Vec<(Uuid, Vec3)> = delta
-        .updated
-        .iter()
-        .map(|e| (e.entity_id, e.position))
-        .collect();
+    // entity_metadata is only read by compute_visibility_masks (AOI path), so
+    // skip the per-tick O(E) allocation entirely when AOI is off (the default).
+    let entity_metadata: Vec<(Uuid, Vec3)> = if has_filter {
+        delta
+            .updated
+            .iter()
+            .map(|e| (e.entity_id, e.position))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let header = DeltaHeader {
         source_cluster_id: delta.source_cluster_id,
         seq: delta.seq,
         tick: delta.tick,
         timestamp: delta.timestamp,
     };
-    let chunk_refs: Vec<&[u8]> = entity_chunks.iter().map(|c| c.as_slice()).collect();
-    let shared_full_frame = Arc::new(arcane_wire::encode_server_delta_from_chunks(
-        &header,
-        &chunk_refs,
-        &delta.removed,
-    ));
-    // Empty (entity-less) frame for AOI default-deny: same header + removals, zero entity chunks.
-    let shared_empty_frame = Arc::new(arcane_wire::encode_server_delta_from_chunks(
-        &header,
-        &[],
-        &delta.removed,
-    ));
+    // Build only the frame the active mode will actually transmit: the full
+    // frame when AOI is off, the empty (default-deny) frame when AOI is on.
+    // The other is never sent for this tick, so building it is pure waste.
+    let (shared_full_frame, shared_empty_frame) = if has_filter {
+        let empty = Arc::new(arcane_wire::encode_server_delta_from_chunks(
+            &header,
+            &[],
+            &delta.removed,
+        ));
+        (None, Some(empty))
+    } else {
+        let chunk_refs: Vec<&[u8]> = entity_chunks.iter().map(|c| c.as_slice()).collect();
+        let full = Arc::new(arcane_wire::encode_server_delta_from_chunks(
+            &header,
+            &chunk_refs,
+            &delta.removed,
+        ));
+        (Some(full), None)
+    };
     PreEncodedTick {
         header,
         entity_chunks,
@@ -523,7 +547,7 @@ async fn ws_loop(
                         latest_positions.remove(id);
                     }
 
-                    let tick = Arc::new(pre_encode_tick(&d));
+                    let tick = Arc::new(pre_encode_tick(&d, producer_filter.is_some()));
                     // Recompute masks EVERY tick against this tick's entities (no cross-tick reuse — a
                     // cached mask would misalign against the sparse, reordered delta).
                     let masks = Arc::new(compute_visibility_masks(
@@ -616,14 +640,22 @@ async fn ws_loop(
                                         (Message::Binary(b), len)
                                     }
                                     // No mask for this subscriber: full frame iff AOI is OFF; otherwise
-                                    // default-DENY with the empty frame (never leak the world).
+                                    // default-DENY with the empty frame (never leak the world). The
+                                    // producer builds exactly the frame matching `filter_active`, so
+                                    // the corresponding Option is always Some here.
                                     None => {
                                         let frame = if filter_active {
-                                            &broadcast_arc.tick.shared_empty_frame
+                                            broadcast_arc.tick.shared_empty_frame.as_ref()
                                         } else {
-                                            &broadcast_arc.tick.shared_full_frame
+                                            broadcast_arc.tick.shared_full_frame.as_ref()
                                         };
-                                        (Message::Binary((**frame).clone()), frame.len() as u64)
+                                        match frame {
+                                            Some(frame) => {
+                                                (Message::Binary((**frame).clone()), frame.len() as u64)
+                                            }
+                                            // Mode mismatch should be impossible; skip rather than leak.
+                                            None => continue,
+                                        }
                                     }
                                 };
                                 if ws_stream.send(bytes).await.is_err() {
@@ -747,7 +779,7 @@ mod tests {
             updated: vec![mk(1, 0.0), mk(2, 5.0), mk(3, 100.0)],
             removed: Vec::new(),
         };
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, true);
         assert_eq!(pre_tick.entity_chunks.len(), 3);
 
         // Two observers, each bound to an avatar; observer position comes from the avatar's
@@ -981,7 +1013,7 @@ mod tests {
             removed: vec![Uuid::from_u128(5)],
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
         assert_eq!(pre_tick.entity_chunks.len(), 2);
         assert_eq!(pre_tick.removed, vec![Uuid::from_u128(5)]);
         assert_eq!(pre_tick.header.seq, 7);
@@ -1020,7 +1052,7 @@ mod tests {
             updated: Vec::new(),
             removed: Vec::new(),
         };
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
         let bytes = assemble_outbound_frame(&pre_tick, None);
         let decoded = arcane_wire::decode_server(&bytes).expect("decode");
         let ServerFrame::Delta(payload) = decoded else {
@@ -1061,7 +1093,7 @@ mod tests {
             removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
 
-        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta), None);
+        let via_shape_b = assemble_outbound_frame(&pre_encode_tick(&delta, false), None);
 
         // Reference: build the wire DeltaPayload by materializing every
         // WireEntityState inline, encode as one ServerFrame::Delta — the
@@ -1141,7 +1173,7 @@ mod tests {
             removed: vec![],
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
 
         // Decode each chunk back and verify its entity_id matches the
         // input entity at the same index — parallel execution must not
@@ -1276,7 +1308,7 @@ mod tests {
             removed: Vec::new(),
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, true);
 
         // Observer at (0, 0, 0), filter radius 10
         let observer_pos = Vec3::new(0.0, 0.0, 0.0);
@@ -1329,7 +1361,7 @@ mod tests {
             removed: Vec::new(),
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
 
         // No filter (None)
         let bytes_unfiltered = assemble_outbound_frame(&pre_tick, None);
@@ -1369,7 +1401,7 @@ mod tests {
             removed: Vec::new(),
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
 
         // Both should produce identical bytes when mask is None
         let bytes_no_mask = assemble_outbound_frame(&pre_tick, None);
@@ -1405,12 +1437,12 @@ mod tests {
             removed: vec![Uuid::from_u128(999), Uuid::from_u128(1000)],
         };
 
-        let pre_tick = pre_encode_tick(&delta);
+        let pre_tick = pre_encode_tick(&delta, false);
         let assembled = assemble_outbound_frame(&pre_tick, None);
 
         assert_eq!(
             assembled,
-            pre_tick.shared_full_frame.as_slice(),
+            pre_tick.shared_full_frame.as_ref().expect("full frame built when AOI off").as_slice(),
             "shared_full_frame must be byte-identical to assemble_outbound_frame(tick, None)"
         );
     }
