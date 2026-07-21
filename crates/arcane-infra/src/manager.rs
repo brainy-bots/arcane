@@ -3,10 +3,9 @@
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
     types::{Vec2, Vec3},
-    IClusteringModel, IServerPool, ServerHandle,
+    IServerPool, ServerHandle,
 };
 use arcane_pool::LocalPool;
-use arcane_rules::RulesEngine;
 use arcane_spatial::SpatialIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,7 +39,6 @@ type FeatureMap = ();
 
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ArcaneManager {
-    model: Arc<dyn IClusteringModel>,
     pool: Arc<dyn IServerPool>,
     spatial_index: SpatialIndex,
     /// Allocated nodes. active_count = allocated_servers.len().
@@ -382,13 +380,8 @@ fn build_partition_decisions(
 }
 
 impl ArcaneManager {
-    pub fn new(
-        model: Arc<dyn IClusteringModel>,
-        pool: Arc<dyn IServerPool>,
-        spatial_index: SpatialIndex,
-    ) -> Self {
+    pub fn new(pool: Arc<dyn IServerPool>, spatial_index: SpatialIndex) -> Self {
         Self {
-            model,
             pool,
             spatial_index,
             allocated_servers: Vec::new(),
@@ -409,24 +402,19 @@ impl ArcaneManager {
         }
     }
 
-    /// Create with default LocalPool, RulesEngine, and fresh SpatialIndex (for tests / dev).
+    /// Create with default LocalPool and a fresh SpatialIndex (for tests / dev).
     pub fn with_defaults() -> Self {
-        Self::new(
-            Arc::new(RulesEngine::new()),
-            Arc::new(LocalPool::default()),
-            SpatialIndex::new(),
-        )
+        Self::new(Arc::new(LocalPool::default()), SpatialIndex::new())
     }
 
-    /// Create with a named clustering model. Supported values: "rules" (default), "affinity".
-    /// The "affinity" variant requires the `affinity-clustering` feature flag.
-    pub fn with_model(model_type: &str) -> Self {
-        let model: Arc<dyn IClusteringModel> = match model_type {
-            #[cfg(feature = "affinity-clustering")]
-            "affinity" => Arc::new(arcane_affinity::AffinityEngine::default()),
-            _ => Arc::new(RulesEngine::new()),
-        };
-        Self::new(model, Arc::new(LocalPool::default()), SpatialIndex::new())
+    /// Create with a named clustering model. The decision path is the
+    /// interaction-graph partitioner (`build_partition_decisions`); the legacy
+    /// `IClusteringModel` (rules/affinity) that this argument once selected was
+    /// computed-and-discarded and has been removed (arcane#291/#292). The
+    /// argument is retained for call-site compatibility until the swappable
+    /// predictor lands (#292) and is currently ignored.
+    pub fn with_model(_model_type: &str) -> Self {
+        Self::with_defaults()
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
@@ -621,7 +609,6 @@ impl ArcaneManager {
             clusters,
             players,
         };
-        let _decisions = self.model.evaluate(&view);
         // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.
         if !self.allocated_servers.is_empty() {
             return Ok(());
@@ -693,11 +680,8 @@ impl ArcaneManager {
             players,
         };
 
-        // Keep the existing evaluate() call for compatibility.
         let timing = std::env::var("ARCANE_DEBUG_TIMING").as_deref() == Ok("1");
         let t0 = std::time::Instant::now();
-        let _decisions = self.model.evaluate(&view);
-        let t_model = t0.elapsed();
 
         self.migration_state.advance_tick();
 
@@ -948,10 +932,9 @@ impl ArcaneManager {
         let t_partition = t0.elapsed();
         if timing && self.eval_cycle.is_multiple_of(5) {
             eprintln!(
-                "[eval timing] cycle {} model={:?} accrue={:?} screen+predict={:?} partition={:?}",
+                "[eval timing] cycle {} accrue={:?} screen+predict={:?} partition={:?}",
                 self.eval_cycle,
-                t_model,
-                t_accrue - t_model,
+                t_accrue,
                 t_predict - t_accrue,
                 t_partition - t_pre_part
             );
