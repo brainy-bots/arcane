@@ -13,19 +13,6 @@
 use crate::types::Vec3;
 use uuid::Uuid;
 
-/// Configuration for a replication channel to one neighbor.
-#[derive(Clone, Debug)]
-pub struct ChannelConfig {
-    /// Spatial radius (world units) within which entities are replicated to this neighbor.
-    pub observation_radius: f64,
-    /// Maximum number of pending deltas before the channel starts dropping.
-    pub max_queue_depth: usize,
-    /// Minimum interval (ms) between consecutive sends to this neighbor.
-    pub send_interval_ms: u32,
-    /// Whether to compress delta payloads before transmission.
-    pub compression_enabled: bool,
-}
-
 /// Entity state delta sent to a neighbor. Fire-and-forget; no ack.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EntityStateDelta {
