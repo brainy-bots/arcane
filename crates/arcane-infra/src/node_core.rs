@@ -1067,6 +1067,9 @@ impl NodeCore {
                                 entry.velocity.z,
                             ),
                             features,
+                            // Bucket 2 rides the state key so the router path
+                            // can replicate it (frames ARE the channel there).
+                            user_data: entry.user_data.clone(),
                         }
                     })
                     .collect();

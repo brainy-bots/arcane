@@ -253,6 +253,7 @@ mod tests {
             position: Vec2::new(10.0, 20.0),
             velocity: Vec2::new(1.0, 2.0),
             features,
+            user_data: serde_json::Value::Null,
         };
 
         let cluster_id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
@@ -283,6 +284,7 @@ mod tests {
             position: Vec2::new(1.0, 2.0),
             velocity: Vec2::new(0.5, -0.5),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let doc = ClusterStateDoc {
@@ -318,6 +320,7 @@ mod tests {
             position: Vec2::new(1.0, 2.0),
             velocity: Vec2::new(0.0, 0.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let new_doc = ClusterStateDoc {
@@ -349,6 +352,7 @@ mod tests {
                 position: Vec2::new(1.0, 2.0),
                 velocity: Vec2::new(0.0, 0.0),
                 features: FeatureMap::new(),
+                user_data: serde_json::Value::Null,
             }],
             observed_edges: vec![],
         };
@@ -425,6 +429,7 @@ mod tests {
             position: Vec2::new(10.0, 20.0),
             velocity: Vec2::new(1.0, 2.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let doc = ClusterStateDoc {

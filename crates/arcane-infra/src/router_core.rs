@@ -379,6 +379,29 @@ pub fn cadence_due(tick: u64, entity_id: Uuid, rate_hz: f64, config: &RouterConf
     tick % interval == phase
 }
 
+/// Join control-plane state records into router entity state, preserving
+/// bucket-2 `user_data` verbatim. The inbox frame IS the replication channel
+/// on the router path, so this join must not strip game payload: doing so
+/// starved proxies and adoption snapshots of `user_data` (Arena: adopted
+/// NPCs could not identify as NPCs and were never re-simulated).
+pub fn entity_states_from_records(
+    records: &[arcane_affinity::feature_map::EntityRecord],
+) -> HashMap<Uuid, EntityStateEntry> {
+    records
+        .iter()
+        .map(|r| {
+            let mut entry = EntityStateEntry::new(
+                r.entity_id,
+                r.cluster_id,
+                arcane_core::Vec3::new(r.position.x, 0.0, r.position.y),
+                arcane_core::Vec3::new(r.velocity.x, 0.0, r.velocity.y),
+            );
+            entry.user_data = r.user_data.clone();
+            (r.entity_id, entry)
+        })
+        .collect()
+}
+
 pub fn route_from_doc(
     doc: &crate::routing_table::RoutingDoc,
     entity_states: &HashMap<Uuid, EntityStateEntry>,
@@ -484,6 +507,54 @@ mod tests {
                 z: 0.3,
             },
         )
+    }
+
+    #[test]
+    fn record_join_preserves_user_data_through_frame() {
+        // Regression (Arena 512 run): the router's record -> entity-state join
+        // dropped bucket-2 user_data, so inbox frames delivered spine-only
+        // proxies and adoption snapshots. Adopted NPCs could not identify as
+        // NPCs ("ty" tag) and were never re-simulated. The join must carry
+        // user_data verbatim from the state record into the published frame.
+        let c1 = uuid(1);
+        let c2 = uuid(2);
+        let entity_a = uuid(10);
+
+        let record = arcane_affinity::feature_map::EntityRecord {
+            entity_id: entity_a,
+            cluster_id: c1,
+            position: arcane_core::types::Vec2::new(5.0, 6.0),
+            velocity: arcane_core::types::Vec2::new(0.0, 0.0),
+            features: arcane_affinity::feature_map::FeatureMap::new(),
+            user_data: serde_json::json!({"ty": 1, "hp": 77}),
+        };
+        let entity_states = entity_states_from_records(std::slice::from_ref(&record));
+        assert_eq!(
+            entity_states[&entity_a].user_data,
+            serde_json::json!({"ty": 1, "hp": 77}),
+            "join must preserve bucket-2 user_data"
+        );
+
+        // Through route_from_doc: C2 replicates A (forced, so no cadence gate).
+        let doc = crate::routing_table::RoutingDoc {
+            tick: 1,
+            owned: vec![],
+            flips: vec![],
+            interest: vec![crate::routing_table::InterestEntry {
+                entity_id: entity_a,
+                owner: c1,
+                p: 1.0,
+                forced: true,
+            }],
+        };
+        let _ = c2;
+        let frame = route_from_doc(&doc, &entity_states, &RouterConfig::default(), 1);
+        assert_eq!(frame.entities.len(), 1);
+        assert_eq!(
+            frame.entities[0].entry.user_data,
+            serde_json::json!({"ty": 1, "hp": 77}),
+            "published frame must carry user_data to the consuming node"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use arcane_infra::node_inbox::{InboxBus, RedisInboxBus};
 use arcane_infra::router_core::{route_from_doc, RouterConfig};
+
 use arcane_infra::routing_table::{RedisRoutingTable, RoutingTable};
 use arcane_infra::state_keys::RedisStateSource;
 use uuid::Uuid;
@@ -94,18 +95,7 @@ fn main() -> Result<(), String> {
         // docs' interest owners are all clusters in this deployment, so the
         // full fetch IS the bounded join).
         let records = state_source.fetch_all();
-        let entity_states: std::collections::HashMap<_, _> = records
-            .iter()
-            .map(|r| {
-                let entry = arcane_core::replication_channel::EntityStateEntry::new(
-                    r.entity_id,
-                    r.cluster_id,
-                    arcane_core::Vec3::new(r.position.x, 0.0, r.position.y),
-                    arcane_core::Vec3::new(r.velocity.x, 0.0, r.velocity.y),
-                );
-                (r.entity_id, entry)
-            })
-            .collect();
+        let entity_states = arcane_infra::router_core::entity_states_from_records(&records);
 
         // Route + publish: fresh state joined with the last decisions.
         for (cluster, doc) in &docs {

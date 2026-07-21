@@ -12,6 +12,14 @@ pub struct EntityRecord {
     pub velocity: arcane_core::Vec2,
     #[serde(default, skip_serializing_if = "FeatureMap::is_empty")]
     pub features: FeatureMap,
+    /// Bucket-2 replicated game JSON, carried VERBATIM through the control
+    /// plane. On the router path the inbox frame IS the replication channel:
+    /// without this, replicas and adoption snapshots arrive spine-only and
+    /// the game cannot re-simulate an adopted entity (Arena: adopted NPCs
+    /// stayed echo-driven because the "ty" tag never arrived). The manager
+    /// itself never reads it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub user_data: serde_json::Value,
 }
 
 /// Where the Manager reads entity state from. The data of record is external
@@ -72,6 +80,7 @@ mod tests {
             position: arcane_core::Vec2::new(1.0, 2.0),
             velocity: arcane_core::Vec2::new(0.5, -0.5),
             features,
+            user_data: serde_json::Value::Null,
         };
 
         let json = serde_json::to_string(&record).expect("serialize");
@@ -87,6 +96,7 @@ mod tests {
             position: arcane_core::Vec2::new(1.0, 2.0),
             velocity: arcane_core::Vec2::new(0.5, -0.5),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let json = serde_json::to_string(&record).expect("serialize");
@@ -106,6 +116,7 @@ mod tests {
             position: arcane_core::Vec2::new(1.0, 2.0),
             velocity: arcane_core::Vec2::new(0.0, 0.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let record2 = EntityRecord {
@@ -114,6 +125,7 @@ mod tests {
             position: arcane_core::Vec2::new(3.0, 4.0),
             velocity: arcane_core::Vec2::new(1.0, 1.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         source.upsert(record1.clone());
@@ -141,6 +153,7 @@ mod tests {
             position: arcane_core::Vec2::new(1.0, 2.0),
             velocity: arcane_core::Vec2::new(0.0, 0.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         let record2 = EntityRecord {
@@ -149,6 +162,7 @@ mod tests {
             position: arcane_core::Vec2::new(3.0, 4.0),
             velocity: arcane_core::Vec2::new(1.0, 1.0),
             features: FeatureMap::new(),
+            user_data: serde_json::Value::Null,
         };
 
         source.upsert(record1);
