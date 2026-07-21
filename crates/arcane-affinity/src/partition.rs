@@ -65,6 +65,7 @@ impl Partition {
         self.assignment.insert(entity, part);
     }
 
+    #[cfg(test)]
     pub(crate) fn from_assignment(assignment: HashMap<Uuid, usize>) -> Option<Self> {
         if assignment.is_empty() {
             return None;
@@ -284,10 +285,7 @@ pub fn seed_from_assignments(
 
     // Component-level capacity repair.
     if capacity > 0 {
-        loop {
-            let Some(over) = (0..sizes.len()).find(|&i| sizes[i] > capacity) else {
-                break;
-            };
+        while let Some(over) = (0..sizes.len()).find(|&i| sizes[i] > capacity) {
             let mut members: Vec<Uuid> = assignment
                 .iter()
                 .filter(|(_, &p)| p == over)
@@ -369,13 +367,7 @@ pub fn seed_from_assignments(
         // strict-improvement condition terminates the loop. Stickiness is
         // preserved: a balanced-enough world (spread smaller than its
         // smallest movable component) never moves at all.
-        loop {
-            let Some(&max_size) = sizes.iter().max() else {
-                break;
-            };
-            let Some(&min_size) = sizes.iter().min() else {
-                break;
-            };
+        while let (Some(&max_size), Some(&min_size)) = (sizes.iter().max(), sizes.iter().min()) {
             if max_size <= min_size + 1 {
                 break; // balanced to within one entity
             }

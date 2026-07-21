@@ -30,6 +30,9 @@
 //!     --players 4 --duration 60 [--phase static|migrate]
 
 use std::collections::HashMap;
+
+/// One position sighting: when, where, and which cluster attributed it.
+type Sighting = (Instant, (f64, f64, f64), Uuid);
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -258,12 +261,12 @@ struct EntityTrack {
     /// First sighting per observer AFTER the settle cutoff (25s): when, at
     /// what position, attributed to which cluster. The anticipation metric:
     /// distance-at-first-late-sighting on the destination's host observer.
-    first_seen_late: HashMap<usize, (Instant, (f64, f64, f64), Uuid)>,
+    first_seen_late: HashMap<usize, Sighting>,
     /// Full sighting timeline per observer (when, position, attributed
     /// cluster) — the cadence record for the spectrum verdicts. Attribution
     /// distinguishes PROXY sightings (foreign-owned, spectrum-gated) from
     /// OWNED sightings (resident, sim-rate broadcast).
-    sightings: HashMap<usize, Vec<(Instant, (f64, f64, f64), Uuid)>>,
+    sightings: HashMap<usize, Vec<Sighting>>,
     max_jump_seen: f64,
     max_gap_ms_seen: u128,
 }
@@ -446,8 +449,7 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
             let active_target: Option<(f64, f64)> = spec
                 .waypoints
                 .iter()
-                .filter(|(after, _, _)| elapsed >= *after)
-                .next_back()
+                .rfind(|(after, _, _)| elapsed >= *after)
                 .map(|(_, wx, wz)| (*wx, *wz))
                 .or(spec.target);
             let (mut vx, mut vz) = (0.0, 0.0);
@@ -759,7 +761,8 @@ fn main() {
                 // 20u/s (~40s to contact) so p rises SLOWLY through the
                 // screen window and the cadence gradient is observable; at
                 // t=90s it retreats.
-                let (spawn, waypoints): ((f64, f64), Vec<(f64, f64, f64)>) = match i {
+                type SpawnPlan = ((f64, f64), Vec<(f64, f64, f64)>);
+                let (spawn, waypoints): SpawnPlan = match i {
                     0 => ((500.0, 500.0), vec![]),
                     1 => ((530.0, 500.0), vec![]),
                     2 => ((1300.0, 500.0), vec![]),

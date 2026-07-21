@@ -420,7 +420,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
         }
 
         let t_route = t5.elapsed();
-        if timing && self.tick % 5 == 0 {
+        if timing && self.tick.is_multiple_of(5) {
             eprintln!(
                 "[cycle timing] tick {} eval={:?} route={:?} total_so_far={:?}",
                 self.tick,

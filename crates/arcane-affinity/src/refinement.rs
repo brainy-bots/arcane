@@ -50,43 +50,6 @@ fn build_adjacency(edges: &[WeightedEdge]) -> HashMap<Uuid, Vec<Adj>> {
     adj
 }
 
-/// Adjacency-based single-move gain. Same semantics as `gain_single_move` but O(degree).
-fn gain_single_move_adj(
-    entity: Uuid,
-    from_part: usize,
-    to_part: usize,
-    partition: &Partition,
-    adj: &HashMap<Uuid, Vec<Adj>>,
-) -> Option<f64> {
-    let mut internal = 0.0;
-    let mut external = 0.0;
-    if let Some(neighbors) = adj.get(&entity) {
-        for a in neighbors {
-            let other_part = match partition.of(a.other) {
-                Some(p) => p,
-                None => continue,
-            };
-            match a.colocation {
-                Colocation::Hard => {
-                    if other_part == from_part {
-                        return None;
-                    }
-                }
-                Colocation::Soft => {
-                    if other_part == from_part {
-                        internal += a.weight;
-                    }
-                    if other_part == to_part {
-                        external += a.weight;
-                    }
-                }
-                Colocation::CutFree => {}
-            }
-        }
-    }
-    Some(external - internal)
-}
-
 /// Adjacency-based pair-swap gain. Same semantics as `gain_pair_swap` but O(deg(a)+deg(b)).
 /// The shared A-B edge is visited from both endpoints; its before/after cut status is identical
 /// under the swap (a and b exchange partitions, so cut-vs-not is unchanged), contributing 0 net.

@@ -946,7 +946,7 @@ impl ArcaneManager {
         );
 
         let t_partition = t0.elapsed();
-        if timing && self.eval_cycle % 5 == 0 {
+        if timing && self.eval_cycle.is_multiple_of(5) {
             eprintln!(
                 "[eval timing] cycle {} model={:?} accrue={:?} screen+predict={:?} partition={:?}",
                 self.eval_cycle,
@@ -962,7 +962,7 @@ impl ArcaneManager {
         // and the desired-vs-current diff every 20 cycles so "why is it not
         // splitting" is answerable from a live log.
         if std::env::var("ARCANE_DEBUG_PARTITION").as_deref() == Ok("1")
-            && self.eval_cycle % 20 == 0
+            && self.eval_cycle.is_multiple_of(20)
         {
             let mut weights: Vec<f64> = Vec::new();
             for (_, _, w) in self.interaction_graph.pairs() {

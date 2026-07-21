@@ -10,7 +10,7 @@
 //! profiling shows decode alloc/copy on the hot path, switch to the zero-copy
 //! FlatBuffer accessors in the `fb` module directly.
 
-#[allow(unused_imports, dead_code, clippy::all)]
+#[allow(unused_imports, dead_code, mismatched_lifetime_syntaxes, clippy::all)]
 #[path = "generated/arcane_wire_generated.rs"]
 mod arcane_wire_generated;
 

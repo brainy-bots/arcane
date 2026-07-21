@@ -58,8 +58,10 @@ fn main() -> Result<(), String> {
     let mut table = RedisRoutingTable::new(&redis_url)?;
     let state_source = RedisStateSource::new(&redis_url, clusters.clone())?;
     let bus = RedisInboxBus::new(&redis_url)?;
-    let mut config = RouterConfig::default();
-    config.router_hz = 1000.0 / tick_ms as f64;
+    let config = RouterConfig {
+        router_hz: 1000.0 / tick_ms as f64,
+        ..Default::default()
+    };
 
     eprintln!(
         "arcane-router: {} cluster jobs at {} Hz (ROUTER_TICK_MS={tick_ms})",
