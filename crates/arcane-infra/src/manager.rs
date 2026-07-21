@@ -158,29 +158,34 @@ fn build_partition_decisions(
         // - Hard if the pair has any uncuttable (Joint) edge
         // - CutFree if all edges are CutFree
         // - Soft otherwise (with weight = cut_cost for Soft aggregate)
-        let colocation = if interaction_graph.is_uncuttable(a, b) {
-            Colocation::Hard
+        let is_hard = interaction_graph.is_uncuttable(a, b);
+        // cut_cost is the Soft-aggregate weight; compute it once and reuse for
+        // both the class decision and the Soft base weight below.
+        let cut_cost = if is_hard {
+            0.0
         } else {
-            let cut_cost = interaction_graph.cut_cost(a, b);
-            if cut_cost == 0.0 {
-                Colocation::CutFree
-            } else {
-                Colocation::Soft
-            }
+            interaction_graph.cut_cost(a, b)
+        };
+        let colocation = if is_hard {
+            Colocation::Hard
+        } else if cut_cost == 0.0 {
+            Colocation::CutFree
+        } else {
+            Colocation::Soft
         };
 
         // For Soft edges, blend prediction into the weight.
         let final_weight = if colocation == Colocation::Soft {
-            let base_weight = interaction_graph.cut_cost(a, b);
+            let base_weight = cut_cost;
 
             // Compute predictive enhancement if both players are in view
             let predicted_p = if let (Some(player_a), Some(player_b)) =
                 (player_map.get(&a), player_map.get(&b))
             {
+                let dx = player_b.position.x - player_a.position.x;
+                let dy = player_b.position.y - player_a.position.y;
+                let distance = (dx * dx + dy * dy).sqrt();
                 let closing_speed = {
-                    let dx = player_b.position.x - player_a.position.x;
-                    let dy = player_b.position.y - player_a.position.y;
-                    let distance = (dx * dx + dy * dy).sqrt();
                     let rel_vel_x = player_b.velocity.x - player_a.velocity.x;
                     let rel_vel_y = player_b.velocity.y - player_a.velocity.y;
                     if distance > 1e-9 {
@@ -188,12 +193,6 @@ fn build_partition_decisions(
                     } else {
                         0.0
                     }
-                };
-
-                let distance = {
-                    let dx = player_b.position.x - player_a.position.x;
-                    let dy = player_b.position.y - player_a.position.y;
-                    (dx * dx + dy * dy).sqrt()
                 };
 
                 // Prediction is already incorporated into graph weights via the screen+predict pipeline.
@@ -255,13 +254,19 @@ fn build_partition_decisions(
     // old "distinct current clusters" rule, a world where everyone starts on one
     // cluster yields k=1 forever — capacity can never force a spread because no
     // second partition exists to spread INTO. Warm spares must count.
-    let num_partitions = {
+    // The sorted+deduped union of currently-assigned clusters and the known
+    // topology (warm spares included). Built ONCE and reused for the partition
+    // count, the cluster-uuid -> index seed map, and the index -> cluster_id
+    // mapping below, so all three share an identical ordering (required for the
+    // seed identity round-trip) instead of rebuilding the same list three times.
+    let sorted_clusters: Vec<Uuid> = {
         let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
         clusters.extend_from_slice(known_clusters);
         clusters.sort();
         clusters.dedup();
-        std::cmp::max(1, clusters.len())
+        clusters
     };
+    let num_partitions = std::cmp::max(1, sorted_clusters.len());
 
     // Capacity = ceil(ceil(n/k) * capacity_factor). The multiply must CEIL:
     // truncation made a 2-entity/2-cluster world compute capacity 1
@@ -292,13 +297,11 @@ fn build_partition_decisions(
     // partition's plurality cluster is exactly the cluster it was seeded
     // from (identity round-trip for unmoved entities). Greedy still runs on
     // bootstrap (no assignments) or when stickiness is disabled.
-    let cluster_index: HashMap<Uuid, usize> = {
-        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
-        cs.extend_from_slice(known_clusters);
-        cs.sort();
-        cs.dedup();
-        cs.into_iter().enumerate().map(|(i, c)| (c, i)).collect()
-    };
+    let cluster_index: HashMap<Uuid, usize> = sorted_clusters
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
     let partition = if config.seed_from_current && !current_assignments.is_empty() {
         let current_idx: HashMap<Uuid, usize> = current_assignments
             .iter()
@@ -334,15 +337,8 @@ fn build_partition_decisions(
     // by decreasing size; each takes its plurality cluster if still free, else
     // the free known cluster with the most of its members, else any free known
     // cluster (sorted for determinism).
-    let all_clusters: Vec<Uuid> = {
-        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
-        cs.extend_from_slice(known_clusters);
-        cs.sort();
-        cs.dedup();
-        cs
-    };
     let mut free_clusters: std::collections::BTreeSet<Uuid> =
-        all_clusters.iter().copied().collect();
+        sorted_clusters.iter().copied().collect();
     let mut order: Vec<usize> = (0..num_partitions).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(refined_partition.members(i).len()));
 

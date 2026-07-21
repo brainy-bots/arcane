@@ -541,7 +541,9 @@ impl GreedyGrowthPartitioner {
                 continue;
             }
             let w = weights[part_idx];
-            if w > best_weight || (w == best_weight && part_idx < best_partition) {
+            // Ascending iteration means a strictly-greater weight is the only
+            // way to win; ties naturally keep the lower (earlier) index.
+            if w > best_weight {
                 best_weight = w;
                 best_partition = part_idx;
             }
