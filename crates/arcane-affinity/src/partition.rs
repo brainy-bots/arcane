@@ -96,6 +96,72 @@ impl Partition {
     }
 }
 
+/// Connected components among `members` over Soft edges, with RELATIVE
+/// binding: an edge binds only at >= 10% of the strongest edge among the
+/// members. With epsilon binding, the decayed remnants of any past contact
+/// (0.97/cycle takes ~300 cycles to reach zero) kept two long-separated
+/// groups "one component" — repair saw one giant unmovable blob and total
+/// consolidation became permanent (founder-observed: 8 entities from two
+/// parked groups 1800u apart wedged on one cluster). Sustained interaction
+/// (refreshed every cycle) stays near the max and binds; stale contact
+/// falls under the fraction within tens of cycles and stops binding. A
+/// fresh clique (all edges similar) binds fully — cohesion is unaffected.
+/// Components are sorted smallest-first (tie: lowest first member) so
+/// callers move the least mass necessary, deterministically.
+///
+/// Hard edges ALWAYS bind regardless of weight: a joint is a co-location
+/// constraint, not an interaction strength — a pair connected only by a
+/// Hard edge must never appear as two movable singletons (the balance
+/// pass would split the joint; caught by physics_edges tests).
+fn soft_components(members: &[Uuid], edges: &[WeightedEdge]) -> Vec<Vec<Uuid>> {
+    let index: HashMap<Uuid, usize> = members.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+    let max_weight = edges
+        .iter()
+        .filter(|e| {
+            e.colocation == Colocation::Soft
+                && index.contains_key(&e.a)
+                && index.contains_key(&e.b)
+        })
+        .map(|e| e.weight)
+        .fold(0.0f64, f64::max);
+    let bind_threshold = (max_weight * 0.1).max(1e-9);
+    let mut parent: Vec<usize> = (0..members.len()).collect();
+    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
+        if parent[i] != i {
+            let root = find(parent, parent[i]);
+            parent[i] = root;
+        }
+        parent[i]
+    }
+    for edge in edges {
+        let binds = match edge.colocation {
+            Colocation::Hard => true,
+            Colocation::Soft => edge.weight >= bind_threshold,
+            Colocation::CutFree => false,
+        };
+        if !binds {
+            continue;
+        }
+        if let (Some(&i), Some(&j)) = (index.get(&edge.a), index.get(&edge.b)) {
+            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+            if ri != rj {
+                parent[ri] = rj;
+            }
+        }
+    }
+    let mut components: HashMap<usize, Vec<Uuid>> = HashMap::new();
+    for (i, &e) in members.iter().enumerate() {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push(e);
+    }
+    let mut comps: Vec<Vec<Uuid>> = components.into_values().collect();
+    for c in &mut comps {
+        c.sort();
+    }
+    comps.sort_by(|a, b| a.len().cmp(&b.len()).then(a[0].cmp(&b[0])));
+    comps
+}
+
 /// Partition stickiness (arcane#290): build the refinement SEED from the
 /// standing assignments instead of a fresh greedy layout. Refinement only
 /// moves entities on strictly positive gain, so seeding with the current
@@ -231,61 +297,10 @@ pub fn seed_from_assignments(
                 .collect();
             members.sort();
 
-            // Connected components over soft edges among members. Binding is
-            // RELATIVE: an edge binds only at >= 10% of the strongest edge
-            // in this partition. With epsilon binding, the decayed remnants
-            // of any past contact (0.97/cycle takes ~300 cycles to reach
-            // zero) kept two long-separated groups "one component" — repair
-            // saw one giant unmovable blob and total consolidation became
-            // permanent (founder-observed: 8 entities from two parked
-            // groups 1800u apart wedged on one cluster). Sustained
-            // interaction (refreshed every cycle) stays near the max and
-            // binds; stale contact falls under the fraction within tens of
-            // cycles and stops binding. A fresh clique (all edges similar)
-            // binds fully — cohesion is unaffected.
-            let index: HashMap<Uuid, usize> =
-                members.iter().enumerate().map(|(i, &e)| (e, i)).collect();
-            let max_weight = edges
-                .iter()
-                .filter(|e| {
-                    e.colocation == Colocation::Soft
-                        && index.contains_key(&e.a)
-                        && index.contains_key(&e.b)
-                })
-                .map(|e| e.weight)
-                .fold(0.0f64, f64::max);
-            let bind_threshold = (max_weight * 0.1).max(1e-9);
-            let mut parent: Vec<usize> = (0..members.len()).collect();
-            fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-                if parent[i] != i {
-                    let root = find(parent, parent[i]);
-                    parent[i] = root;
-                }
-                parent[i]
-            }
-            for edge in edges {
-                if edge.colocation != Colocation::Soft || edge.weight < bind_threshold {
-                    continue;
-                }
-                if let (Some(&i), Some(&j)) = (index.get(&edge.a), index.get(&edge.b)) {
-                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                    if ri != rj {
-                        parent[ri] = rj;
-                    }
-                }
-            }
-            let mut components: HashMap<usize, Vec<Uuid>> = HashMap::new();
-            for (i, &e) in members.iter().enumerate() {
-                let root = find(&mut parent, i);
-                components.entry(root).or_default().push(e);
-            }
-            let mut comps: Vec<Vec<Uuid>> = components.into_values().collect();
-            for c in &mut comps {
-                c.sort();
-            }
-            // Smallest component first (tie: lowest first member) — move the
-            // least mass necessary.
-            comps.sort_by(|a, b| a.len().cmp(&b.len()).then(a[0].cmp(&b[0])));
+            // Connected components over soft edges among members (relative
+            // binding; see soft_components docs — epsilon binding once
+            // wedged long-separated groups into one unmovable blob).
+            let comps = soft_components(&members, edges);
 
             // Find the first (component, target) pairing that fits. Never
             // move the LAST component out of a partition (that just renames
@@ -338,6 +353,66 @@ pub fn seed_from_assignments(
                 // One giant component (a genuine merged clique), or no move
                 // improves balance: cohesion wins, over-full stands.
                 break;
+            }
+        }
+
+        // Balance pass (arcane#290, measured at the 512-player live run):
+        // capacity repair above only fires while a partition is OVER
+        // capacity. With capacity_factor headroom (ceil(n/k)*1.5), a
+        // 176/176/80/80 layout at n=512/k=4 is fully legal (176 < 192) yet
+        // leaves two nodes doing 2.2x the work of the others — a stable,
+        // silent imbalance the flip metrics cannot see (nothing is over
+        // capacity, so nothing moves, forever). Greedy component-level
+        // rebalancing toward the mean: repeatedly move the smallest movable
+        // component from the most-loaded partition to the least-loaded one,
+        // but ONLY when that strictly shrinks the max-min spread AND the
+        // component fits under capacity at the target. Components stay
+        // whole (cliques never cut), moves are deterministic, and the
+        // strict-improvement condition terminates the loop. Stickiness is
+        // preserved: a balanced-enough world (spread smaller than its
+        // smallest movable component) never moves at all.
+        loop {
+            let Some(&max_size) = sizes.iter().max() else { break };
+            let Some(&min_size) = sizes.iter().min() else { break };
+            if max_size <= min_size + 1 {
+                break; // balanced to within one entity
+            }
+            let over = (0..sizes.len())
+                .filter(|&i| sizes[i] == max_size)
+                .min()
+                .unwrap();
+            let target = (0..sizes.len())
+                .filter(|&i| sizes[i] == min_size)
+                .min()
+                .unwrap();
+            let mut members: Vec<Uuid> = assignment
+                .iter()
+                .filter(|(_, &p)| p == over)
+                .map(|(&e, _)| e)
+                .collect();
+            members.sort();
+            let comps = soft_components(&members, edges);
+            // Smallest component that strictly improves the spread and fits.
+            let mut moved = false;
+            if comps.len() > 1 {
+                for comp in &comps {
+                    let new_over = sizes[over] - comp.len();
+                    let new_target = sizes[target] + comp.len();
+                    let fits = capacity == 0 || new_target <= capacity;
+                    let improves = new_target.max(new_over) < max_size;
+                    if fits && improves {
+                        for e in comp {
+                            assignment.insert(*e, target);
+                        }
+                        sizes[over] = new_over;
+                        sizes[target] = new_target;
+                        moved = true;
+                        break;
+                    }
+                }
+            }
+            if !moved {
+                break; // nothing movable improves balance: done
             }
         }
     }
@@ -806,6 +881,72 @@ mod tests {
             partition.of(c).is_some(),
             "isolated entity must be assigned"
         );
+    }
+
+    #[test]
+    fn seed_balance_spreads_separate_groups_under_capacity() {
+        // The 512-player live finding (arcane#290): 4 groups piled on 2 of 4
+        // partitions is LEGAL under capacity headroom (nothing over cap, so
+        // capacity repair never fires) yet leaves half the topology idle.
+        // The balance pass must spread whole groups toward the mean.
+        let mut entities = Vec::new();
+        let mut current = HashMap::new();
+        let mut edges = Vec::new();
+        for g in 0..4u8 {
+            let members: Vec<Uuid> = (0..4u8).map(|m| uuid(g * 16 + m + 1)).collect();
+            for (i, &a) in members.iter().enumerate() {
+                for &b in members.iter().skip(i + 1) {
+                    edges.push(WeightedEdge {
+                        a,
+                        b,
+                        weight: 3.0,
+                        colocation: Colocation::Soft,
+                    });
+                }
+            }
+            for &e in &members {
+                entities.push(e);
+                current.insert(e, (g % 2) as usize); // all on partitions 0 and 1
+            }
+        }
+        // capacity 12: nothing is over capacity, so only the balance pass moves.
+        let seeded = seed_from_assignments(&entities, &current, 4, 12, &edges);
+        let mut sizes = vec![0usize; 4];
+        for e in &entities {
+            sizes[seeded.of(*e).unwrap()] += 1;
+        }
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![4, 4, 4, 4], "groups should spread to all partitions");
+        // No group may be split.
+        for g in 0..4u8 {
+            let parts: std::collections::HashSet<usize> = (0..4u8)
+                .map(|m| seeded.of(uuid(g * 16 + m + 1)).unwrap())
+                .collect();
+            assert_eq!(parts.len(), 1, "group {g} split by balance pass");
+        }
+    }
+
+    #[test]
+    fn seed_balance_never_splits_single_clique() {
+        // One 8-clique on one partition: balance pressure must NOT split it
+        // (cohesion beats balance).
+        let members: Vec<Uuid> = (1..=8u8).map(uuid).collect();
+        let mut edges = Vec::new();
+        for (i, &a) in members.iter().enumerate() {
+            for &b in members.iter().skip(i + 1) {
+                edges.push(WeightedEdge {
+                    a,
+                    b,
+                    weight: 3.0,
+                    colocation: Colocation::Soft,
+                });
+            }
+        }
+        let current: HashMap<Uuid, usize> = members.iter().map(|&e| (e, 0)).collect();
+        let seeded = seed_from_assignments(&members, &current, 4, 12, &edges);
+        let parts: std::collections::HashSet<usize> =
+            members.iter().map(|&e| seeded.of(e).unwrap()).collect();
+        assert_eq!(parts.len(), 1, "clique must stay whole under balance pressure");
     }
 
     #[test]
