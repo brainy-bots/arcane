@@ -273,6 +273,10 @@ pub struct ReconnectDirective {
 }
 /// Route a binary client frame to the cluster-internal message channel.
 enum ClientMessageOutcome {
+    /// A PlayerState frame was delivered; carries the avatar entity id so the
+    /// caller can bind this subscriber's AOI observer to it.
+    DeliveredPlayerState(Uuid),
+    /// A non-PlayerState frame (e.g. Action) was delivered.
     Delivered,
     Dropped,
 }
@@ -298,8 +302,9 @@ fn handle_binary_client_frame(
             };
             stats.msgs_player_state.fetch_add(1, Ordering::Relaxed);
             stats.note_entity_id(entry.entity_id);
+            let entity_id = entry.entity_id;
             let _ = updates_tx.send(entry);
-            ClientMessageOutcome::Delivered
+            ClientMessageOutcome::DeliveredPlayerState(entity_id)
         }
         Ok(ClientFrame::Action(payload)) => {
             let Some(action) = game_action_from_wire(&payload) else {
@@ -670,15 +675,17 @@ async fn ws_loop(
                     msg = ws_stream.next() => {
                         match msg {
                             Some(Ok(Message::Binary(bytes))) => {
-                                if let Ok(arcane_wire::ClientFrame::PlayerState(payload)) = arcane_wire::decode_client(&bytes) {
-                                    if let Some(entry) = entry_from_wire_player_state(&payload) {
-                                        // Bind this subscriber to its avatar entity. The AOI observer
-                                        // position is then sourced from that entity's AUTHORITATIVE server
-                                        // position — not the client-reported one (which could be spoofed).
-                                        avatars.insert(subscriber_id, Some(entry.entity_id));
-                                    }
+                                // Decode ONCE here (size-checked before decode).
+                                // On a PlayerState frame, bind this subscriber to
+                                // its avatar entity. The AOI observer position is
+                                // then sourced from that entity's AUTHORITATIVE
+                                // server position — not the client-reported one
+                                // (which could be spoofed).
+                                if let ClientMessageOutcome::DeliveredPlayerState(entity_id) =
+                                    handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats)
+                                {
+                                    avatars.insert(subscriber_id, Some(entity_id));
                                 }
-                                let _ = handle_binary_client_frame(&bytes, &updates_tx, &actions_tx, &stats);
                             }
                             Some(Err(_)) | None => {
                                 // Subscriber disconnected; drop its AOI registration.
