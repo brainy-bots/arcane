@@ -30,18 +30,16 @@ fn probe(groups: usize, group_size: usize, clusters: usize, cycles: usize) {
     runtime.set_known_clusters(cluster_ids.clone());
 
     // Groups on a coarse grid, 2000u apart; members in a 40u blob.
-    let entity_ids: Vec<Uuid> = (0..n as u128).map(|i| Uuid::from_u128(0x1000 + i)).collect();
+    let entity_ids: Vec<Uuid> = (0..n as u128)
+        .map(|i| Uuid::from_u128(0x1000 + i))
+        .collect();
     let positions: Vec<Vec3> = (0..n)
         .map(|i| {
             let g = i / group_size;
             let m = i % group_size;
             let gx = (g % 16) as f64 * 2000.0;
             let gz = (g / 16) as f64 * 2000.0;
-            Vec3::new(
-                gx + (m % 8) as f64 * 5.0,
-                0.0,
-                gz + (m / 8) as f64 * 5.0,
-            )
+            Vec3::new(gx + (m % 8) as f64 * 5.0, 0.0, gz + (m / 8) as f64 * 5.0)
         })
         .collect();
 

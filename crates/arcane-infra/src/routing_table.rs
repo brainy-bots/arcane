@@ -315,8 +315,12 @@ mod tests {
         // disappeared (despawns don't linger in the ownership record).
         let mut table = InMemoryRoutingTable::new();
         let c1 = uuid(1);
-        table.write(&[(c1, doc(1, vec![uuid(10)], vec![]))]).unwrap();
-        table.write(&[(c1, doc(2, vec![uuid(11)], vec![]))]).unwrap();
+        table
+            .write(&[(c1, doc(1, vec![uuid(10)], vec![]))])
+            .unwrap();
+        table
+            .write(&[(c1, doc(2, vec![uuid(11)], vec![]))])
+            .unwrap();
         let own = table.read_ownership().unwrap();
         assert!(!own.contains_key(&uuid(10)), "despawned entity dropped");
         assert_eq!(own.get(&uuid(11)), Some(&c1));

@@ -186,9 +186,7 @@ pub fn route(input: &RouterInput, config: &RouterConfig) -> Vec<(Uuid, NodeInbox
                     *existing_tier = RateTier::Full;
                     *existing_hz = config.rate_law.max_hz;
                 })
-                .or_insert_with(|| {
-                    (entity_state.clone(), RateTier::Full, config.rate_law.max_hz)
-                });
+                .or_insert_with(|| (entity_state.clone(), RateTier::Full, config.rate_law.max_hz));
         }
 
         // Step 5: Frame assembly.
@@ -306,7 +304,11 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
             if *to_cluster != cluster_id {
                 continue;
             }
-            let owner = input.assignments.get(entity_id).copied().unwrap_or(cluster_id);
+            let owner = input
+                .assignments
+                .get(entity_id)
+                .copied()
+                .unwrap_or(cluster_id);
             interest
                 .entry(*entity_id)
                 .and_modify(|e| e.forced = true)
@@ -419,12 +421,7 @@ pub fn route_from_doc(
         .interest
         .iter()
         .filter(|c| !c.forced)
-        .map(|c| {
-            (
-                c.entity_id,
-                (c.p * config.default_dynamism).clamp(0.0, 1.0),
-            )
-        })
+        .map(|c| (c.entity_id, (c.p * config.default_dynamism).clamp(0.0, 1.0)))
         .collect();
     let granted = arcane_affinity::rate_field::allocate_rates(
         &signals,
@@ -450,7 +447,10 @@ pub fn route_from_doc(
                 if !cadence_due(router_tick, cand.entity_id, hz, config) {
                     return None; // not due this frame; will be due on its cadence
                 }
-                (hz, rate_tier(cand.p, config.default_dynamism, &config.rate_law))
+                (
+                    hz,
+                    rate_tier(cand.p, config.default_dynamism, &config.rate_law),
+                )
             };
             Some(ReplicatedEntity {
                 entry: state.clone(),
@@ -896,9 +896,24 @@ mod tests {
             entity_states.insert(id, make_entity_state(id, owner));
         }
         let interest = vec![
-            InterestEntry { entity_id: high, owner, p: 0.9, forced: false },
-            InterestEntry { entity_id: low, owner, p: 0.15, forced: false },
-            InterestEntry { entity_id: floor, owner, p: 0.001, forced: false },
+            InterestEntry {
+                entity_id: high,
+                owner,
+                p: 0.9,
+                forced: false,
+            },
+            InterestEntry {
+                entity_id: low,
+                owner,
+                p: 0.15,
+                forced: false,
+            },
+            InterestEntry {
+                entity_id: floor,
+                owner,
+                p: 0.001,
+                forced: false,
+            },
         ];
 
         let mut seen_high = 0usize;
@@ -994,7 +1009,10 @@ mod tests {
         for ((c_a, f_a), (c_b, f_b)) in direct.iter().zip(via_table.iter()) {
             assert_eq!(c_a, c_b, "same cluster order");
             assert_eq!(f_a.tick, f_b.tick);
-            assert_eq!(f_a.owned, f_b.owned, "cluster {c_a}: owned statements differ");
+            assert_eq!(
+                f_a.owned, f_b.owned,
+                "cluster {c_a}: owned statements differ"
+            );
             assert_eq!(f_a.ownership, f_b.ownership, "cluster {c_a}: flips differ");
             assert_eq!(
                 f_a.entities.len(),

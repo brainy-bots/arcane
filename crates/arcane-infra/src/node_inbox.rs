@@ -253,7 +253,7 @@ mod tests {
             ),
             tier: RateTier::Full,
             rate_hz: 30.0,
-                };
+        };
         let entity_2 = ReplicatedEntity {
             entry: EntityStateEntry::new(
                 Uuid::from_u128(101),
@@ -271,7 +271,7 @@ mod tests {
             ),
             tier: RateTier::Low,
             rate_hz: 30.0,
-                };
+        };
 
         let flip = OwnershipFlip {
             entity_id: Uuid::from_u128(200),
@@ -363,7 +363,7 @@ mod tests {
             entry,
             tier: RateTier::Full,
             rate_hz: 30.0,
-                };
+        };
 
         let frame = NodeInboxFrame {
             tick: 123,

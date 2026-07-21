@@ -121,7 +121,10 @@ pub fn screen_candidates(
         grid.entry(key).or_default().push(i);
     }
     for (i, (a, pos_a, vel_a)) in players.iter().enumerate() {
-        let (cx, cy) = ((pos_a.x / cell).floor() as i64, (pos_a.y / cell).floor() as i64);
+        let (cx, cy) = (
+            (pos_a.x / cell).floor() as i64,
+            (pos_a.y / cell).floor() as i64,
+        );
         for dx_cell in -1..=1 {
             for dy_cell in -1..=1 {
                 let Some(bucket) = grid.get(&(cx + dx_cell, cy + dy_cell)) else {
@@ -177,8 +180,7 @@ pub fn screen_candidates(
                 if graph.get_weight(a, b) >= hot_floor {
                     continue; // strongly connected already (same rule as (a))
                 }
-                let (Some(&ia), Some(&ib)) = (player_index.get(&a), player_index.get(&b))
-                else {
+                let (Some(&ia), Some(&ib)) = (player_index.get(&a), player_index.get(&b)) else {
                     continue; // not in the current view
                 };
                 let (_, pos_a, vel_a) = players[ia];
@@ -222,9 +224,7 @@ pub fn screen_candidates(
                     }
 
                     // O(1) lookups via the player index.
-                    if let (Some(&ia), Some(&ib)) =
-                        (player_index.get(&a), player_index.get(&b))
-                    {
+                    if let (Some(&ia), Some(&ib)) = (player_index.get(&a), player_index.get(&b)) {
                         let (_, pos_a, vel_a) = players[ia];
                         let (_, pos_b, vel_b) = players[ib];
                         candidates.push(ScreenCandidate {

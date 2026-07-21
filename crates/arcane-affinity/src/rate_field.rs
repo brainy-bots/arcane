@@ -262,7 +262,12 @@ mod tests {
         // No cliff: adjacent s values (0.5 vs 0.4) must get rates in
         // roughly their signal ratio, NOT full-vs-zero.
         assert!(g(4) > 0.0, "adjacent-s entity fell off a cliff");
-        assert!(g(3) / g(4) < 2.0, "rate gap {} vs {} disproportionate", g(3), g(4));
+        assert!(
+            g(3) / g(4) < 2.0,
+            "rate gap {} vs {} disproportionate",
+            g(3),
+            g(4)
+        );
     }
 
     #[test]
@@ -278,7 +283,10 @@ mod tests {
         assert!((g(1) - config.max_hz).abs() < 1e-9, "top should saturate");
         assert!(g(2) > g(3) && g(3) > 0.0);
         let tail_ratio = g(2) / g(3);
-        assert!((tail_ratio - 2.0).abs() < 0.2, "tail not proportional: {tail_ratio}");
+        assert!(
+            (tail_ratio - 2.0).abs() < 0.2,
+            "tail not proportional: {tail_ratio}"
+        );
     }
 
     #[test]

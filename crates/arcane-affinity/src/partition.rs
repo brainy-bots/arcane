@@ -118,9 +118,7 @@ fn soft_components(members: &[Uuid], edges: &[WeightedEdge]) -> Vec<Vec<Uuid>> {
     let max_weight = edges
         .iter()
         .filter(|e| {
-            e.colocation == Colocation::Soft
-                && index.contains_key(&e.a)
-                && index.contains_key(&e.b)
+            e.colocation == Colocation::Soft && index.contains_key(&e.a) && index.contains_key(&e.b)
         })
         .map(|e| e.weight)
         .fold(0.0f64, f64::max);
@@ -372,8 +370,12 @@ pub fn seed_from_assignments(
         // preserved: a balanced-enough world (spread smaller than its
         // smallest movable component) never moves at all.
         loop {
-            let Some(&max_size) = sizes.iter().max() else { break };
-            let Some(&min_size) = sizes.iter().min() else { break };
+            let Some(&max_size) = sizes.iter().max() else {
+                break;
+            };
+            let Some(&min_size) = sizes.iter().min() else {
+                break;
+            };
             if max_size <= min_size + 1 {
                 break; // balanced to within one entity
             }
@@ -916,7 +918,11 @@ mod tests {
             sizes[seeded.of(*e).unwrap()] += 1;
         }
         sizes.sort_unstable();
-        assert_eq!(sizes, vec![4, 4, 4, 4], "groups should spread to all partitions");
+        assert_eq!(
+            sizes,
+            vec![4, 4, 4, 4],
+            "groups should spread to all partitions"
+        );
         // No group may be split.
         for g in 0..4u8 {
             let parts: std::collections::HashSet<usize> = (0..4u8)
@@ -946,7 +952,11 @@ mod tests {
         let seeded = seed_from_assignments(&members, &current, 4, 12, &edges);
         let parts: std::collections::HashSet<usize> =
             members.iter().map(|&e| seeded.of(e).unwrap()).collect();
-        assert_eq!(parts.len(), 1, "clique must stay whole under balance pressure");
+        assert_eq!(
+            parts.len(),
+            1,
+            "clique must stay whole under balance pressure"
+        );
     }
 
     #[test]

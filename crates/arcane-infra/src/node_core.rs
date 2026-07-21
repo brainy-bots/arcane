@@ -125,10 +125,8 @@ pub fn apply_inbox_frame(
     let mut adopted = Vec::new();
     let mut lost = Vec::new();
 
-    let statement: Option<HashSet<Uuid>> = frame
-        .owned
-        .as_ref()
-        .map(|v| v.iter().copied().collect());
+    let statement: Option<HashSet<Uuid>> =
+        frame.owned.as_ref().map(|v| v.iter().copied().collect());
 
     // 1. Grace cancellation: the control plane has spoken to these entities.
     //    Owned → confirmed ours. Proxy owned by another cluster → not ours
@@ -528,7 +526,10 @@ impl NodeCore {
             spawn_forwarded_inputs_subscriber(cfg.redis_url.clone(), cfg.cluster_id, fwd_tx);
             let publisher = match ForwardedInputsPublisher::new(&cfg.redis_url) {
                 Ok(p) => {
-                    eprintln!("input forwarding enabled (arcane:fwd_inputs:{})", cfg.cluster_id);
+                    eprintln!(
+                        "input forwarding enabled (arcane:fwd_inputs:{})",
+                        cfg.cluster_id
+                    );
                     Some(p)
                 }
                 Err(e) => {
@@ -538,7 +539,9 @@ impl NodeCore {
             };
             (Some(fwd_rx), publisher)
         } else {
-            eprintln!("input forwarding DISABLED (ARCANE_INPUT_FORWARDING=off) — split-brain demo mode");
+            eprintln!(
+                "input forwarding DISABLED (ARCANE_INPUT_FORWARDING=off) — split-brain demo mode"
+            );
             (None, None)
         };
 
@@ -774,7 +777,9 @@ impl NodeCore {
                 for (target, batch) in self.forward_scratch.drain() {
                     let n = (batch.updates.len() + batch.actions.len()) as u64;
                     if publisher.forward(target, batch).is_ok() {
-                        self.stats.fwd_inputs_relayed.fetch_add(n, Ordering::Relaxed);
+                        self.stats
+                            .fwd_inputs_relayed
+                            .fetch_add(n, Ordering::Relaxed);
                     }
                 }
             } else {
@@ -785,7 +790,9 @@ impl NodeCore {
                     .drain()
                     .map(|(_, b)| (b.updates.len() + b.actions.len()) as u64)
                     .sum();
-                self.stats.fwd_inputs_dropped.fetch_add(n, Ordering::Relaxed);
+                self.stats
+                    .fwd_inputs_dropped
+                    .fetch_add(n, Ordering::Relaxed);
             }
         }
         while let Ok(delta) = self.neighbor_rx.try_recv() {
@@ -935,8 +942,7 @@ impl NodeCore {
             let mut graced_this_batch = 0;
             for entry in spine {
                 let id = entry.entity_id;
-                let ours =
-                    self.owned_view.contains(&id) || self.spawn_grace.contains_key(&id);
+                let ours = self.owned_view.contains(&id) || self.spawn_grace.contains_key(&id);
                 if !ours {
                     // The record says another cluster owns it? Then the driver
                     // must not write it (single-writer). This also blocks a
@@ -1252,7 +1258,12 @@ mod forwarding_tests {
     fn proxy(owner: Uuid, id: Uuid) -> (Uuid, EntityStateEntry) {
         (
             id,
-            EntityStateEntry::new(id, owner, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0)),
+            EntityStateEntry::new(
+                id,
+                owner,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
         )
     }
 
@@ -1261,7 +1272,14 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let owned: HashSet<Uuid> = [e].into();
         assert_eq!(
-            forward_target(e, &owned, &HashMap::new(), &HashMap::new(), &HashMap::new(), true),
+            forward_target(
+                e,
+                &owned,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
             None
         );
     }
@@ -1273,7 +1291,14 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let grace: HashMap<Uuid, u64> = [(e, 5u64)].into();
         assert_eq!(
-            forward_target(e, &HashSet::new(), &grace, &HashMap::new(), &HashMap::new(), true),
+            forward_target(
+                e,
+                &HashSet::new(),
+                &grace,
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
             None
         );
     }
@@ -1304,7 +1329,14 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
         assert_eq!(
-            forward_target(e, &HashSet::new(), &HashMap::new(), &proxies, &HashMap::new(), true),
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                true
+            ),
             Some(owner)
         );
     }
@@ -1317,7 +1349,14 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let hints: HashMap<Uuid, (Uuid, u64)> = [(e, (owner, 42u64))].into();
         assert_eq!(
-            forward_target(e, &HashSet::new(), &HashMap::new(), &HashMap::new(), &hints, true),
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &hints,
+                true
+            ),
             Some(owner)
         );
     }
@@ -1328,7 +1367,14 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
         assert_eq!(
-            forward_target(e, &HashSet::new(), &HashMap::new(), &proxies, &HashMap::new(), false),
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                false
+            ),
             None
         );
     }
@@ -1342,13 +1388,27 @@ mod forwarding_tests {
         let e = Uuid::from_u128(10);
         let owned_before: HashSet<Uuid> = [e].into();
         assert_eq!(
-            forward_target(e, &owned_before, &HashMap::new(), &HashMap::new(), &HashMap::new(), true),
+            forward_target(
+                e,
+                &owned_before,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
             None
         );
         let owned_after: HashSet<Uuid> = HashSet::new();
         let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
         assert_eq!(
-            forward_target(e, &owned_after, &HashMap::new(), &proxies, &HashMap::new(), true),
+            forward_target(
+                e,
+                &owned_after,
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                true
+            ),
             Some(owner)
         );
     }
@@ -1978,7 +2038,10 @@ mod tests {
             );
 
             assert_eq!(report.adopted.len(), 1, "statement adopts the entity");
-            assert_eq!(report.adopted[0].position.x, 42.0, "seeded from proxy state");
+            assert_eq!(
+                report.adopted[0].position.x, 42.0,
+                "seeded from proxy state"
+            );
             assert!(
                 !neighbor_entities.contains_key(&entity_id),
                 "adopted entity is no longer a proxy"
@@ -2055,7 +2118,10 @@ mod tests {
             );
 
             assert!(report.lost.is_empty(), "graced spawn must not be released");
-            assert!(grace.contains_key(&spawned), "grace persists until spoken to");
+            assert!(
+                grace.contains_key(&spawned),
+                "grace persists until spoken to"
+            );
         }
 
         #[test]
@@ -2092,7 +2158,10 @@ mod tests {
 
             assert!(!grace.contains_key(&spawned), "statement cancels grace");
             assert!(report.lost.is_empty());
-            assert!(report.adopted.is_empty(), "already in world; nothing to adopt");
+            assert!(
+                report.adopted.is_empty(),
+                "already in world; nothing to adopt"
+            );
         }
 
         #[test]

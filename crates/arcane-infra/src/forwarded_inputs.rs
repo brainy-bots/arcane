@@ -140,7 +140,11 @@ impl ForwardedInputsPublisher {
     }
 
     /// Enqueue a batch for non-blocking relay to the owner cluster.
-    pub fn forward(&self, target_cluster_id: Uuid, batch: ForwardedInputBatch) -> Result<(), String> {
+    pub fn forward(
+        &self,
+        target_cluster_id: Uuid,
+        batch: ForwardedInputBatch,
+    ) -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -173,7 +177,10 @@ pub fn spawn_forwarded_inputs_subscriber(
         let mut conn = match client.get_connection() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("forwarded inputs subscriber: Redis connection failed: {}", e);
+                eprintln!(
+                    "forwarded inputs subscriber: Redis connection failed: {}",
+                    e
+                );
                 return;
             }
         };
@@ -270,7 +277,9 @@ mod tests {
             Err(_) => return, // Client::open rejected the URL — acceptable
         };
         let mut batch = ForwardedInputBatch::new(Uuid::new_v4());
-        batch.updates.push(ForwardedUpdate::new(entry(Uuid::new_v4())));
+        batch
+            .updates
+            .push(ForwardedUpdate::new(entry(Uuid::new_v4())));
         let started = std::time::Instant::now();
         publisher.forward(Uuid::new_v4(), batch).unwrap();
         assert!(

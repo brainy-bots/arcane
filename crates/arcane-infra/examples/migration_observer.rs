@@ -223,7 +223,9 @@ fn http_get(url: &str) -> Result<String, String> {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut buf = String::new();
     stream.read_to_string(&mut buf).map_err(|e| e.to_string())?;
     let body_start = buf
@@ -310,46 +312,47 @@ fn observer_thread(idx: usize, ws_url: String, shared: Arc<Shared>) {
                     continue 'outer;
                 }
             };
-        let tungstenite::Message::Binary(bytes) = msg else {
-            continue;
-        };
-        let Ok(arcane_wire::ServerFrame::Delta(delta)) = arcane_wire::decode_server(&bytes) else {
-            continue;
-        };
-        let now = Instant::now();
-        let mut tracks = shared.tracks.lock().unwrap();
-        for e in &delta.updated {
-            let pos = e.position.to_vec3();
-            let obs = Observation {
-                cluster_id: e.cluster_id,
-                position: (pos.x, pos.y, pos.z),
-                at: now,
+            let tungstenite::Message::Binary(bytes) = msg else {
+                continue;
             };
-            let track = tracks.entry(e.entity_id).or_default();
-            if let Some(prev) = track.latest.get(&idx) {
-                let gap = now.duration_since(prev.at).as_millis();
-                // Re-acquisition: under interest-scoped replication an
-                // observer legitimately loses sight of entities outside its
-                // cluster's interest. After a long blind window the entity
-                // may have moved arbitrarily far and changed owner
-                // arbitrarily often — jump/flip accounting only makes sense
-                // over CONTINUOUS observation. 5s >> the ~1s resync cadence,
-                // so genuinely streamed entities never trip this.
-                const REACQUIRE_MS: u128 = 5000;
-                if gap <= REACQUIRE_MS {
-                    let jump = dist(prev.position, obs.position);
-                    if prev.cluster_id != obs.cluster_id {
-                        track
-                            .flips
-                            .push((idx, prev.cluster_id, obs.cluster_id, jump, now));
-                    } else if jump > track.max_jump_seen {
-                        track.max_jump_seen = jump;
-                    }
-                    if gap > track.max_gap_ms_seen {
-                        track.max_gap_ms_seen = gap;
+            let Ok(arcane_wire::ServerFrame::Delta(delta)) = arcane_wire::decode_server(&bytes)
+            else {
+                continue;
+            };
+            let now = Instant::now();
+            let mut tracks = shared.tracks.lock().unwrap();
+            for e in &delta.updated {
+                let pos = e.position.to_vec3();
+                let obs = Observation {
+                    cluster_id: e.cluster_id,
+                    position: (pos.x, pos.y, pos.z),
+                    at: now,
+                };
+                let track = tracks.entry(e.entity_id).or_default();
+                if let Some(prev) = track.latest.get(&idx) {
+                    let gap = now.duration_since(prev.at).as_millis();
+                    // Re-acquisition: under interest-scoped replication an
+                    // observer legitimately loses sight of entities outside its
+                    // cluster's interest. After a long blind window the entity
+                    // may have moved arbitrarily far and changed owner
+                    // arbitrarily often — jump/flip accounting only makes sense
+                    // over CONTINUOUS observation. 5s >> the ~1s resync cadence,
+                    // so genuinely streamed entities never trip this.
+                    const REACQUIRE_MS: u128 = 5000;
+                    if gap <= REACQUIRE_MS {
+                        let jump = dist(prev.position, obs.position);
+                        if prev.cluster_id != obs.cluster_id {
+                            track
+                                .flips
+                                .push((idx, prev.cluster_id, obs.cluster_id, jump, now));
+                        } else if jump > track.max_jump_seen {
+                            track.max_jump_seen = jump;
+                        }
+                        if gap > track.max_gap_ms_seen {
+                            track.max_gap_ms_seen = gap;
+                        }
                     }
                 }
-            }
                 const SETTLE_CUTOFF_SECS: u64 = 25;
                 if now.duration_since(shared.start).as_secs() >= SETTLE_CUTOFF_SECS {
                     track
@@ -410,7 +413,12 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
     let entity_id = Uuid::new_v4();
     eprintln!(
         "[player {idx}] {entity_id} joined cluster {} at ({}, 0, {}) via {}:{} target={:?}",
-        join.cluster_id, spec.spawn.0, spec.spawn.1, join.server_host, join.server_port, spec.target
+        join.cluster_id,
+        spec.spawn.0,
+        spec.spawn.1,
+        join.server_host,
+        join.server_port,
+        spec.target
     );
 
     let ws_url = format!("ws://{}:{}", join.server_host, join.server_port);
@@ -541,9 +549,7 @@ fn spawn_player(spec: PlayerSpec, manager: &str, shared: Arc<Shared>) -> Option<
                         // Make-before-break: new connection is live; close old.
                         let old = std::mem::replace(&mut socket, new_socket);
                         drop(old);
-                        shared
-                            .reconnects_followed
-                            .fetch_add(1, Ordering::Relaxed);
+                        shared.reconnects_followed.fetch_add(1, Ordering::Relaxed);
                         eprintln!("[player {idx}] followed RECONNECT to {addr}");
                     }
                     Err(e) => {
@@ -608,9 +614,7 @@ fn main() {
                     if shared_c.stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let now_s = Instant::now()
-                        .duration_since(shared_c.start)
-                        .as_secs_f64();
+                    let now_s = Instant::now().duration_since(shared_c.start).as_secs_f64();
                     let mut ev = shared_c.inbox_events.lock().unwrap();
                     for re in &frame.entities {
                         ev.push((now_s, cluster, re.entry.entity_id, re.rate_hz));
@@ -760,7 +764,10 @@ fn main() {
                     1 => ((530.0, 500.0), vec![]),
                     2 => ((1300.0, 500.0), vec![]),
                     3 => ((1330.0, 500.0), vec![]),
-                    4 => ((1300.0, 530.0), vec![(30.0, 530.0, 530.0), (90.0, 1300.0, 530.0)]),
+                    4 => (
+                        (1300.0, 530.0),
+                        vec![(30.0, 530.0, 530.0), (90.0, 1300.0, 530.0)],
+                    ),
                     _ => ((3000.0, 8000.0), vec![]),
                 };
                 PlayerSpec {
@@ -779,9 +786,9 @@ fn main() {
                 let pair = i / 2;
                 let side = (i % 2) as f64;
                 let (bx, bz, sep) = match pair {
-                    0 => (500.0, 500.0, 30.0),     // close: inside proximity radius
-                    1 => (500.0, 6000.0, 400.0),   // mid: predictor gray zone
-                    _ => (6000.0, 500.0, 4000.0),  // far: no interaction ever
+                    0 => (500.0, 500.0, 30.0),    // close: inside proximity radius
+                    1 => (500.0, 6000.0, 400.0),  // mid: predictor gray zone
+                    _ => (6000.0, 500.0, 4000.0), // far: no interaction ever
                 };
                 PlayerSpec {
                     idx: i,
@@ -1086,8 +1093,7 @@ fn main() {
 
         // fresh_vis[k] = set of PLAYER entities observer k saw in the window.
         let n_obs = args.clusters.len();
-        let mut fresh_vis: Vec<std::collections::HashSet<Uuid>> =
-            vec![Default::default(); n_obs];
+        let mut fresh_vis: Vec<std::collections::HashSet<Uuid>> = vec![Default::default(); n_obs];
         for id in &player_entities {
             if let Some(t) = tracks.get(id) {
                 for (obs, o) in &t.latest {
@@ -1099,9 +1105,8 @@ fn main() {
         }
 
         // Group membership by construction: players 2k,2k+1 form group k.
-        let group_of = |id: &Uuid| -> usize {
-            player_entities.iter().position(|e| e == id).unwrap() / 2
-        };
+        let group_of =
+            |id: &Uuid| -> usize { player_entities.iter().position(|e| e == id).unwrap() / 2 };
         // An observer HOSTS group g if any member's end-owner cluster is the
         // cluster this observer watches... we don't know observer->cluster
         // mapping directly, but each entity's fresh observation carries the
@@ -1126,9 +1131,7 @@ fn main() {
         }
         for (obs, counts) in per_obs_group_counts.iter().enumerate() {
             let total: usize = counts.iter().sum();
-            eprintln!(
-                "observer {obs}: fresh entities={total} groups={counts:?}"
-            );
+            eprintln!("observer {obs}: fresh entities={total} groups={counts:?}");
         }
         // Each group is hosted somewhere.
         for g in 0..4 {
@@ -1340,10 +1343,8 @@ fn main() {
                     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     Some(v[v.len() / 2])
                 };
-                let mut far_gaps: Vec<f64> =
-                    far_ts.windows(2).map(|w| w[1] - w[0]).collect();
-                let mut near_gaps: Vec<f64> =
-                    near_ts.windows(2).map(|w| w[1] - w[0]).collect();
+                let mut far_gaps: Vec<f64> = far_ts.windows(2).map(|w| w[1] - w[0]).collect();
+                let mut near_gaps: Vec<f64> = near_ts.windows(2).map(|w| w[1] - w[0]).collect();
                 match (
                     median(&mut far_gaps),
                     median(&mut near_gaps),

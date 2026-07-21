@@ -603,10 +603,8 @@ mod tests {
         }
 
         let owner = |id: &Uuid| runtime.assignments().get(id).copied();
-        let east_owners: std::collections::HashSet<_> =
-            east.iter().filter_map(&owner).collect();
-        let west_owners: std::collections::HashSet<_> =
-            west.iter().filter_map(&owner).collect();
+        let east_owners: std::collections::HashSet<_> = east.iter().filter_map(&owner).collect();
+        let west_owners: std::collections::HashSet<_> = west.iter().filter_map(&owner).collect();
         let all_owners: std::collections::HashSet<_> =
             east.iter().chain(west.iter()).filter_map(&owner).collect();
 

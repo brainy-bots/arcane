@@ -886,12 +886,8 @@ impl ArcaneManager {
                     ),
                     horizon_secs: self.config.horizon_secs,
                     history_weight: c.history_weight,
-                    features_a: feature_lookup
-                        .get(&c.a)
-                        .unwrap_or(&empty_features),
-                    features_b: feature_lookup
-                        .get(&c.b)
-                        .unwrap_or(&empty_features),
+                    features_a: feature_lookup.get(&c.a).unwrap_or(&empty_features),
+                    features_b: feature_lookup.get(&c.b).unwrap_or(&empty_features),
                 };
                 use arcane_affinity::predictor::InteractionPredictor as _;
                 let p = predictor.predict(&ctx);

@@ -774,8 +774,8 @@ mod tests {
         let decode = |sub: u64| {
             let bytes = assemble_outbound_frame(&pre_tick, Some(&masks[&sub]));
             let ServerFrame::Delta(p) = arcane_wire::decode_server(&bytes).expect("decode") else {
-            panic!("expected Delta frame");
-        };
+                panic!("expected Delta frame");
+            };
             p.updated
                 .into_iter()
                 .map(|e| e.entity_id)

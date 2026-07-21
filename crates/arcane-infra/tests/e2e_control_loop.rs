@@ -120,7 +120,8 @@ impl SimNode {
             if let Some(statement) = report.statement {
                 self.owned_view = statement;
             }
-            self.adopted.extend(report.adopted.iter().map(|e| e.entity_id));
+            self.adopted
+                .extend(report.adopted.iter().map(|e| e.entity_id));
             self.released.extend(report.lost.iter().copied());
         }
     }
