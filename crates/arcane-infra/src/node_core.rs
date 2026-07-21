@@ -46,7 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use std::sync::atomic::Ordering;
 
@@ -314,8 +314,6 @@ pub struct NodeCore {
     stats: Arc<NodeStats>,
     tick_count: u64,
     cluster_id: Uuid,
-    #[allow(dead_code)]
-    dt_seconds: f64,
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
@@ -473,9 +471,6 @@ impl NodeCore {
         #[cfg(not(feature = "spacetimedb-persist"))]
         let _persist = ();
 
-        let interval = Duration::from_millis(1000 / tick_rate_hz);
-        let dt_seconds = interval.as_secs_f64();
-
         // #289: no ownership-flip pub/sub subscriber and no folded map. The
         // node's ownership view is the record: each inbox frame's `owned`
         // statement replaces it wholesale.
@@ -585,7 +580,6 @@ impl NodeCore {
             stats: stats.clone(),
             tick_count: 0,
             cluster_id: cfg.cluster_id,
-            dt_seconds,
             submitted_routed_physics: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
@@ -1109,31 +1103,26 @@ impl NodeCore {
         }
         let _ = self.state_tx.send(merged_delta);
 
-        self.stats.set_entities(self.server.entity_count() as u64);
-        self.stats
-            .tick
-            .store(self.server.current_tick(), Ordering::Relaxed);
-        self.stats
-            .seq
-            .store(self.server.current_seq() as u64, Ordering::Relaxed);
+        // Read the per-tick server counters ONCE (each locks the entity map)
+        // and reuse them for stats, logging, and the outcome — avoids 3x
+        // entity_count() lock and re-reads of tick/seq on the 60 Hz path.
+        let entity_count = self.server.entity_count();
+        self.stats.set_entities(entity_count as u64);
+        self.stats.tick.store(outcome_tick, Ordering::Relaxed);
+        self.stats.seq.store(outcome_seq as u64, Ordering::Relaxed);
         self.stats
             .last_tick_us
             .store(tick_elapsed.as_micros() as u64, Ordering::Relaxed);
 
         self.tick_count += 1;
         if self.tick_count.is_multiple_of(LOG_EVERY_TICKS) {
-            eprintln!(
-                "tick {} seq {}",
-                self.server.current_tick(),
-                self.server.current_seq()
-            );
+            eprintln!("tick {} seq {}", outcome_tick, outcome_seq);
         }
         if self.tick_count.is_multiple_of(LOG_STATS_EVERY_TICKS) {
-            let entities = self.server.entity_count();
             let clusters = 1u32;
             eprintln!(
                 "ArcaneServerStats: entities={} clusters={} tick_ms={:.2} ws_accepts={} msgs_ps={} msgs_ga={} parse_fail={} bytes_in={} bytes_out={} lagged_events={} lagged_frames={} send_err={}",
-                entities,
+                entity_count,
                 clusters,
                 tick_elapsed_ms,
                 self.stats.ws_accepts.load(Ordering::Relaxed),
@@ -1151,7 +1140,7 @@ impl NodeCore {
         PumpOutcome {
             tick: outcome_tick,
             seq: outcome_seq,
-            entity_count: self.server.entity_count(),
+            entity_count,
         }
     }
 }

@@ -39,7 +39,7 @@ impl RedisReplicationChannel {
                     break;
                 }
                 if let Ok(payload) = serde_json::to_string(&delta) {
-                    let _: Result<i32, redis::RedisError> = conn.publish(topic_t.clone(), payload);
+                    let _: Result<i32, redis::RedisError> = conn.publish(&topic_t, payload);
                 }
             }
         });

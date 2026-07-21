@@ -1,9 +1,10 @@
 //! ArcaneManager (IN-01) — central coordinator.
 
+use arcane_core::{types::Vec3, IServerPool, ServerHandle};
+#[cfg(feature = "migration")]
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
-    types::{Vec2, Vec3},
-    IServerPool, ServerHandle,
+    types::Vec2,
 };
 use arcane_pool::LocalPool;
 use arcane_spatial::SpatialIndex;
@@ -81,6 +82,9 @@ pub struct ArcaneManager {
     /// entities are pruned with the graph.
     prediction_memo: std::collections::HashMap<(Uuid, Uuid), (f64, u64)>,
     /// Manager evaluation cycle counter (drives the prediction cadence).
+    /// Only read on the migration path (prediction memo + timing logs); the
+    /// default build increments it but never reads it.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     eval_cycle: u64,
 }
 
@@ -563,52 +567,6 @@ impl ArcaneManager {
             return Ok(());
         }
 
-        // Build entity data for WorldStateView.players
-        let entity_data = self.spatial_index.snapshot_entities();
-        let mut cluster_player_ids: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
-        for &(entity_id, cluster_id, _) in &entity_data {
-            cluster_player_ids
-                .entry(cluster_id)
-                .or_default()
-                .push(entity_id);
-        }
-
-        let clusters: Vec<ClusterInfo> = snapshot
-            .into_iter()
-            .map(|g| ClusterInfo {
-                cluster_id: g.cluster_id,
-                server_host: "localhost".to_string(),
-                player_ids: cluster_player_ids.remove(&g.cluster_id).unwrap_or_default(),
-                player_count: g.entity_count,
-                cpu_pct: 0.0,
-                centroid: Vec2::new(g.centroid.x, g.centroid.z),
-                spread_radius: g.spread_radius as f32,
-                rpc_rate_out: 0.0,
-            })
-            .collect();
-
-        let players: Vec<PlayerInfo> = entity_data
-            .iter()
-            .map(|&(entity_id, cluster_id, pos)| {
-                let v = self
-                    .spatial_index
-                    .velocity_of(entity_id)
-                    .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
-                PlayerInfo {
-                    player_id: entity_id,
-                    cluster_id,
-                    position: Vec2::new(pos.x, pos.z),
-                    velocity: Vec2::new(v.x, v.z),
-                }
-            })
-            .collect();
-
-        let view = WorldStateView {
-            timestamp: 0.0,
-            evaluation_budget_ms: 50,
-            clusters,
-            players,
-        };
         // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.
         if !self.allocated_servers.is_empty() {
             return Ok(());
