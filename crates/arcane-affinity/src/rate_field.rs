@@ -121,11 +121,20 @@ pub fn allocate_rates(
         // proportion to s, k = (budget - m*max) / (max * sum_tail_s).
         // Consistency: the first unsaturated entity must really be under
         // the cap (k*s < 1) and the last saturated one over it (k*s >= 1).
-        // k is monotone in m, so exactly one m is consistent; n is small
-        // (one doc's candidates), the linear scan is fine.
+        // k is monotone in m, so exactly one m is consistent.
+        //
+        // Precompute suffix sums of `s` ONCE so each candidate's tail_s is an
+        // O(1) lookup instead of an O(n-m) re-sum — the whole search is O(n)
+        // rather than O(n^2). `route_from_doc` calls this per consumer on the
+        // router hot path, where a crowded consumer made the re-sum quadratic.
+        // suffix_s[m] = sum(active[m..].s); suffix_s[n] = 0.0.
+        let mut suffix_s = vec![0.0f64; n + 1];
+        for m in (0..n).rev() {
+            suffix_s[m] = suffix_s[m + 1] + active[m].1;
+        }
         let mut chosen = 0.0;
         for m in 0..n {
-            let tail_s: f64 = active[m..].iter().map(|(_, s)| s).sum();
+            let tail_s = suffix_s[m];
             if tail_s <= 0.0 {
                 break;
             }
