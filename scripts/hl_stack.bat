@@ -27,6 +27,7 @@ set FWD=on
 set LEGACY=on
 set ROUTER=on
 set DBGPART=%ARCANE_DEBUG_PARTITION%
+set DBGTIME=%ARCANE_DEBUG_TIMING%
 :parse
 if "%1"=="nopin" ( set PIN_NODE=& set PIN_MGR=& shift & goto parse )
 if "%1"=="nofwd" ( set FWD=off& shift & goto parse )
@@ -61,7 +62,7 @@ exit /b
 timeout /t 3 /nobreak >nul
 set MROUTE=on
 if "%ROUTER%"=="on" set MROUTE=off
-start "manager" /min cmd /c "set MANAGER_CLUSTERS=%C1%:127.0.0.1:8080,%C2%:127.0.0.1:8082,%C3%:127.0.0.1:8084,%C4%:127.0.0.1:8086&& set MANAGER_HTTP_PORT=7777&& set REDIS_URL=%REDIS_URL%&& set MANAGER_CADENCE_MS=250&& set MANAGER_JOIN_POLICY=round-robin&& set MANAGER_PIN_FEATURE=%PIN_MGR%&& set MANAGER_ROUTE=%MROUTE%&& set ARCANE_DEBUG_PARTITION=%DBGPART%&& %BIN%\arcane-manager.exe 2> %ROOT%\..\temp\hl_manager.log"
+start "manager" /min cmd /c "set MANAGER_CLUSTERS=%C1%:127.0.0.1:8080,%C2%:127.0.0.1:8082,%C3%:127.0.0.1:8084,%C4%:127.0.0.1:8086&& set MANAGER_HTTP_PORT=7777&& set REDIS_URL=%REDIS_URL%&& set MANAGER_CADENCE_MS=250&& set MANAGER_JOIN_POLICY=round-robin&& set MANAGER_PIN_FEATURE=%PIN_MGR%&& set MANAGER_ROUTE=%MROUTE%&& set ARCANE_DEBUG_PARTITION=%DBGPART%&& set ARCANE_DEBUG_TIMING=%DBGTIME%&& %BIN%\arcane-manager.exe 2> %ROOT%\..\temp\hl_manager.log"
 if "%ROUTER%"=="on" (
   timeout /t 2 /nobreak >nul
   start "router" /min cmd /c "set ROUTER_CLUSTERS=%C1%,%C2%,%C3%,%C4%&& set REDIS_URL=%REDIS_URL%&& set ROUTER_TICK_MS=100&& %BIN%\arcane-router.exe 2> %ROOT%\..\temp\hl_router.log"
