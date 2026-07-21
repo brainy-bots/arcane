@@ -10,7 +10,7 @@
 //! profiling shows decode alloc/copy on the hot path, switch to the zero-copy
 //! FlatBuffer accessors in the `fb` module directly.
 
-#[allow(unused_imports, dead_code, clippy::all)]
+#[allow(unused_imports, dead_code, mismatched_lifetime_syntaxes, clippy::all)]
 #[path = "generated/arcane_wire_generated.rs"]
 mod arcane_wire_generated;
 
@@ -169,10 +169,28 @@ pub enum ClientFrame {
     Action(GameActionPayload),
 }
 
+/// Server -> client redirect hint (epic #287, Session Relay L0 — D2).
+///
+/// "Your entity's owner is reachable at `addr`; make-before-break reconnect
+/// there and resume with `token`." Timing is deliberately uncritical: the
+/// forwarding invariant (D1) keeps inputs correct while the client switches,
+/// and a client that ignores the frame entirely stays correct (longer path).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconnectPayload {
+    /// WebSocket URL of the new ingress (e.g. "ws://10.0.0.5:8082").
+    pub addr: String,
+    /// Opaque resume token presented on the new connection (L0: entity UUID
+    /// string; relay tiers may carry signed session tokens).
+    pub token: String,
+    /// Entity this redirect applies to.
+    pub entity_id: Uuid,
+}
+
 /// One message from the cluster to a client.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerFrame {
     Delta(DeltaPayload),
+    Reconnect(ReconnectPayload),
 }
 
 /// Header fields for a [`DeltaPayload`] — everything except the entity and
@@ -381,6 +399,33 @@ pub fn encode_server(frame: &ServerFrame) -> Vec<u8> {
             };
             encode_server_delta_from_chunks(&header, &chunk_refs, &delta.removed)
         }
+        ServerFrame::Reconnect(rc) => {
+            let mut fbb = FlatBufferBuilder::with_capacity(128);
+            let addr = fbb.create_string(&rc.addr);
+            let token = if rc.token.is_empty() {
+                None
+            } else {
+                Some(fbb.create_string(&rc.token))
+            };
+            let eid = uuid_to_fb(&rc.entity_id);
+            let rc_fb = fb::ReconnectPayload::create(
+                &mut fbb,
+                &fb::ReconnectPayloadArgs {
+                    addr: Some(addr),
+                    token,
+                    entity_id: Some(&eid),
+                },
+            );
+            let frame_fb = fb::ServerFrame::create(
+                &mut fbb,
+                &fb::ServerFrameArgs {
+                    payload_type: fb::ServerPayload::Reconnect,
+                    payload: Some(rc_fb.as_union_value()),
+                },
+            );
+            fbb.finish_minimal(frame_fb);
+            fbb.finished_data().to_vec()
+        }
     }
 }
 
@@ -422,6 +467,14 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerFrame, Error> {
                 timestamp: delta.timestamp(),
                 updated,
                 removed,
+            }))
+        }
+        fb::ServerPayload::Reconnect => {
+            let rc = frame.payload_as_reconnect().expect("verified by root()");
+            Ok(ServerFrame::Reconnect(ReconnectPayload {
+                addr: rc.addr().to_string(),
+                token: rc.token().unwrap_or_default().to_string(),
+                entity_id: uuid_from_fb(rc.entity_id()),
             }))
         }
         other => Err(Error::UnknownPayloadVariant("ServerPayload", other.0)),
@@ -598,7 +651,9 @@ mod tests {
         });
         let bytes = encode_server(&frame);
         let back = decode_server(&bytes).unwrap();
-        let ServerFrame::Delta(payload) = back;
+        let ServerFrame::Delta(payload) = back else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated[0].client_seq, e.client_seq);
     }
 
@@ -612,6 +667,83 @@ mod tests {
         let bytes = encode_client(&frame);
         let back = decode_client(&bytes).unwrap();
         assert_eq!(frame, back);
+    }
+
+    /// Reference-vector generator for engine-plugin codec tests
+    /// (ArcaneWireReferenceVectors.h in arcane-unreal). Run with:
+    /// cargo test -p arcane-wire print_reconnect_reference -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn print_reconnect_reference_vector() {
+        let entity = Uuid::parse_str("a1a2a3a4-b1b2-c1c2-d1d2-e1e2e3e4e5e6").unwrap();
+        let frame = ServerFrame::Reconnect(ReconnectPayload {
+            addr: "ws://127.0.0.1:8082".into(),
+            token: entity.to_string(),
+            entity_id: entity,
+        });
+        let bytes = encode_server(&frame);
+        print!("    static const uint8 ServerFrameReconnect[] = {{");
+        for (i, b) in bytes.iter().enumerate() {
+            if i % 12 == 0 {
+                print!("\n        ");
+            }
+            print!("0x{b:02X}");
+            if i + 1 < bytes.len() {
+                print!(", ");
+            }
+        }
+        println!("\n    }};");
+        println!(
+            "    static constexpr int32 ServerFrameReconnectSize = {};",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn server_frame_reconnect_roundtrip() {
+        let frame = ServerFrame::Reconnect(ReconnectPayload {
+            addr: "ws://10.1.2.3:8082".into(),
+            token: "resume-me".into(),
+            entity_id: Uuid::from_u128(0xDEAD_BEEF),
+        });
+        let bytes = encode_server(&frame);
+        let decoded = decode_server(&bytes).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn server_frame_reconnect_empty_token_roundtrip() {
+        let frame = ServerFrame::Reconnect(ReconnectPayload {
+            addr: "ws://127.0.0.1:9000".into(),
+            token: String::new(),
+            entity_id: Uuid::from_u128(0xDEAD_BEEF),
+        });
+        let bytes = encode_server(&frame);
+        let decoded = decode_server(&bytes).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn reconnect_is_distinguishable_from_delta_on_the_wire() {
+        // A client reading mixed frames must be able to route by payload type;
+        // the two variants must never decode into each other.
+        let rc = ServerFrame::Reconnect(ReconnectPayload {
+            addr: "ws://h:1".into(),
+            token: "t".into(),
+            entity_id: Uuid::from_u128(0xDEAD_BEEF),
+        });
+        let delta = ServerFrame::Delta(DeltaPayload {
+            source_cluster_id: Uuid::from_u128(0xCAFE),
+            seq: 1,
+            tick: 1,
+            timestamp: 0.0,
+            updated: vec![sample_entity()],
+            removed: vec![],
+        });
+        let rc_decoded = decode_server(&encode_server(&rc)).unwrap();
+        let delta_decoded = decode_server(&encode_server(&delta)).unwrap();
+        assert!(matches!(rc_decoded, ServerFrame::Reconnect(_)));
+        assert!(matches!(delta_decoded, ServerFrame::Delta(_)));
     }
 
     #[test]
@@ -728,7 +860,9 @@ mod tests {
         let via_chunks = encode_server_delta_from_chunks(&header, &[], &[]);
 
         let decoded = decode_server(&via_chunks).unwrap();
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.source_cluster_id, header.source_cluster_id);
         assert_eq!(payload.seq, header.seq);
         assert_eq!(payload.tick, header.tick);
@@ -746,7 +880,9 @@ mod tests {
         let via_chunks = encode_server_delta_from_chunks(&header, &[chunk1.as_slice()], &[]);
 
         let decoded = decode_server(&via_chunks).unwrap();
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 1);
         assert_eq!(payload.updated[0], e1);
         assert!(payload.removed.is_empty());
@@ -776,7 +912,9 @@ mod tests {
         let via_chunks = encode_server_delta_from_chunks(&header, &chunk_refs, &[]);
 
         let decoded = decode_server(&via_chunks).unwrap();
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 200);
         assert_eq!(payload.updated[150], entities[150]);
 
@@ -827,7 +965,9 @@ mod tests {
             encode_server_delta_from_chunks(&header, &[c1.as_slice(), c3.as_slice()], &[]);
 
         let decoded = decode_server(&via_chunks).unwrap();
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 2);
         assert_eq!(payload.updated[0], e1);
         assert_eq!(payload.updated[1], e3);
@@ -851,7 +991,9 @@ mod tests {
         let via_chunks = encode_server_delta_from_chunks(&header, &[chunk.as_slice()], &[]);
 
         let decoded = decode_server(&via_chunks).unwrap();
-        let ServerFrame::Delta(payload) = decoded;
+        let ServerFrame::Delta(payload) = decoded else {
+            panic!("expected Delta frame");
+        };
         assert_eq!(payload.updated.len(), 1);
         assert_eq!(payload.updated[0].user_data, e.user_data);
     }

@@ -95,6 +95,7 @@ pub fn score_entity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interaction_graph::InteractionKind;
 
     fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
@@ -146,7 +147,7 @@ mod tests {
         let (members, centroids, sizes) = build_test_clusters(&assignments);
 
         let mut graph = InteractionGraph::new();
-        graph.record_interaction(e, f2, 10.0); // heavy interaction with c2 entity
+        graph.record_interaction(e, f2, 10.0, InteractionKind::Proximity); // heavy interaction with c2 entity
 
         let config = AffinityConfig {
             spatial_weight: 0.0, // pure interaction

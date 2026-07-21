@@ -1,11 +1,20 @@
+pub mod cold_pair;
 pub mod config;
+pub mod feature_map;
 pub mod hysteresis;
 pub mod interaction_graph;
+pub mod partition;
+pub mod predictor;
+pub mod rate_field;
+pub mod refinement;
+pub mod region;
 pub mod scorer;
+pub mod staleness_bench;
+pub mod warm_start;
 
 use config::AffinityConfig;
 use hysteresis::MigrationState;
-use interaction_graph::InteractionGraph;
+use interaction_graph::{InteractionGraph, InteractionKind};
 use scorer::score_entity;
 
 use arcane_core::{
@@ -50,34 +59,8 @@ impl AffinityEngine {
             self.config.gc_interval,
         );
 
-        // Phase 1b: inject party/guild signals
+        // Phase 1b: social signals removed (now handled via feature-based EdgeRules in ArcaneManager)
         let players = &view.players;
-        for i in 0..players.len() {
-            for j in (i + 1)..players.len() {
-                let a = &players[i];
-                let b = &players[j];
-
-                if let (Some(pa), Some(pb)) = (a.party_id, b.party_id) {
-                    if pa == pb {
-                        graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            self.config.weight_party_member,
-                        );
-                    }
-                }
-
-                if let (Some(ga), Some(gb)) = (a.guild_id, b.guild_id) {
-                    if ga == gb {
-                        graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            self.config.weight_guild_member,
-                        );
-                    }
-                }
-            }
-        }
 
         // Phase 1c: inject proximity signals
         let r_sq = self.config.proximity_radius * self.config.proximity_radius;
@@ -92,6 +75,7 @@ impl AffinityEngine {
                         a.player_id,
                         b.player_id,
                         self.config.weight_proximity_per_tick,
+                        InteractionKind::Proximity,
                     );
                 }
             }
@@ -422,8 +406,6 @@ mod tests {
             cluster_id,
             position: Vec2::new(x, y),
             velocity: Vec2::new(0.0, 0.0),
-            guild_id: None,
-            party_id: None,
         }
     }
 
@@ -607,7 +589,7 @@ mod tests {
         // Seed a single interaction with the C2 partner (weight 1.0).
         {
             let mut graph = engine.interaction_graph.lock().unwrap();
-            graph.record_interaction(entity, c2_partner, 1.0);
+            graph.record_interaction(entity, c2_partner, 1.0, InteractionKind::Proximity);
         }
 
         let view_threshold = make_view(
@@ -633,7 +615,7 @@ mod tests {
         // Add strong interaction with C2 partner: total weight now >> migration_threshold.
         {
             let mut graph = engine.interaction_graph.lock().unwrap();
-            graph.record_interaction(entity, c2_partner, 10.0);
+            graph.record_interaction(entity, c2_partner, 10.0, InteractionKind::Proximity);
         }
         // Also clear any existing assignment cache so entity starts fresh from C1.
         {
@@ -655,7 +637,7 @@ mod tests {
             let mut graph = engine.interaction_graph.lock().unwrap();
             // Replace weights: heavy C1 interaction, zero C2
             graph.remove_entity(c2_partner);
-            graph.record_interaction(entity, c1_partner, 20.0);
+            graph.record_interaction(entity, c1_partner, 20.0, InteractionKind::Proximity);
         }
 
         let view_cooldown = make_view(

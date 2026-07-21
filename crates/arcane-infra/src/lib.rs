@@ -43,6 +43,23 @@ pub mod ws_server;
 #[cfg(feature = "rapier-cluster")]
 pub mod rapier_cluster;
 
+#[cfg(feature = "migration")]
+pub mod forwarded_inputs;
+#[cfg(feature = "migration")]
+pub mod manager_runtime;
+#[cfg(feature = "migration")]
+pub mod node_inbox;
+#[cfg(feature = "migration")]
+pub mod ownership_migration;
+#[cfg(feature = "migration")]
+pub mod replication_gate;
+#[cfg(feature = "migration")]
+pub mod router_core;
+#[cfg(feature = "migration")]
+pub mod routing_table;
+#[cfg(feature = "migration")]
+pub mod state_keys;
+
 #[cfg(feature = "cluster-ws")]
 pub use arcane_core::cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 #[cfg(feature = "cluster-ws")]

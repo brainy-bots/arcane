@@ -84,12 +84,24 @@ where
 {
     let mut core = NodeCore::new(NodeConfig {
         cluster_id,
-        redis_url,
+        redis_url: redis_url.clone(),
         neighbor_ids,
         ws_port,
         // The standalone production node requires Redis; single-node mode is for the C-ABI/dev path.
         allow_single_node: false,
     })?;
+
+    #[cfg(feature = "migration")]
+    match crate::node_inbox::RedisInboxBus::new(&redis_url) {
+        Ok(bus) => {
+            core.attach_inbox(bus);
+            eprintln!("node inbox attached (arcane:inbox:{})", cluster_id);
+        }
+        Err(e) => eprintln!(
+            "node inbox attach failed ({}); running on legacy channels only",
+            e
+        ),
+    }
 
     let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     let interval = Duration::from_millis(1000 / tick_rate_hz);
@@ -109,6 +121,22 @@ where
         for mut e in inputs.client_updates.drain(..) {
             e.cluster_id = cluster_id;
             world.insert(e.entity_id, e);
+        }
+        // §8 adoption/loss: entities whose ownership flipped TO this node enter the
+        // world seeded from their replicated state; entities flipped AWAY leave it
+        // (the new owner simulates them; we see them as proxies).
+        #[cfg(feature = "migration")]
+        {
+            for mut e in inputs.adopted_entities.drain(..) {
+                e.cluster_id = cluster_id;
+                eprintln!("adopted entity {} (ownership flip)", e.entity_id);
+                world.insert(e.entity_id, e);
+            }
+            for id in inputs.lost_entities.drain(..) {
+                if world.remove(&id).is_some() {
+                    eprintln!("released entity {} (ownership flip away)", id);
+                }
+            }
         }
         for mut e in extra_entities_for_tick(core.current_tick()) {
             e.cluster_id = cluster_id;

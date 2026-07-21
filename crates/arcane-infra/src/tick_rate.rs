@@ -15,7 +15,11 @@
 //! were `const TICK_RATE_HZ: u64 = 20`, and configs/tfvars in callers that
 //! don't set the env var should see no behavioral change.
 
-const ENV_VAR: &str = "BENCHMARK_TICK_RATE_HZ";
+const ENV_VAR: &str = "ARCANE_TICK_RATE_HZ";
+/// Legacy name from the scaling-benchmark era; honored as a fallback so
+/// existing configs keep working. The tick rate is a general node property,
+/// not a benchmark knob — hence the rename.
+const LEGACY_ENV_VAR: &str = "BENCHMARK_TICK_RATE_HZ";
 const DEFAULT_HZ: u64 = 20;
 const MIN_HZ: u64 = 5;
 const MAX_HZ: u64 = 128;
@@ -34,7 +38,10 @@ fn resolve(raw: Option<&str>) -> u64 {
 /// call repeatedly — it re-reads the env var each time — but typical callers
 /// resolve it once at startup.
 pub fn tick_rate_hz() -> u64 {
-    resolve(std::env::var(ENV_VAR).ok().as_deref())
+    let raw = std::env::var(ENV_VAR)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_ENV_VAR).ok());
+    resolve(raw.as_deref())
 }
 
 #[cfg(test)]

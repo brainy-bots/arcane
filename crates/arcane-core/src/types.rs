@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub use uuid::Uuid as EntityId;
 
 /// 2D vector (e.g. centroid in 2D plane, or x/z).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vec2 {
     /// X-axis component.
     pub x: f64,

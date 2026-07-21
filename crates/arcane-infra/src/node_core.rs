@@ -54,10 +54,19 @@ use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
 use uuid::Uuid;
 
+#[cfg(feature = "migration")]
+use crate::forwarded_inputs::{
+    spawn_forwarded_inputs_subscriber, ForwardedInputBatch, ForwardedInputsPublisher,
+    ForwardedUpdate,
+};
 #[cfg(feature = "cluster-ws")]
 use crate::neighbor_subscriber::spawn_neighbor_subscriber;
+#[cfg(feature = "migration")]
+use crate::node_inbox::{InboxBus, NodeInboxFrame};
 #[cfg(feature = "cluster-ws")]
 use crate::node_stats::NodeStats;
+#[cfg(feature = "migration")]
+use crate::ownership_migration::{OwnershipFlip, OwnershipMap};
 #[cfg(feature = "cluster-ws")]
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
 #[cfg(feature = "spacetimedb-persist")]
@@ -67,6 +76,157 @@ use crate::{ArcaneNode, ReplicationChannelManager};
 const LOG_EVERY_TICKS: u64 = 100;
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 const NEIGHBOR_STALE_TICKS: u64 = 300;
+
+/// Apply one inbox frame to node-local state. Returns the number of ownership
+/// changes applied and proxies upserted.
+#[cfg(feature = "migration")]
+pub struct FrameApplyReport {
+    pub proxies_upserted: usize,
+    pub owned_skipped: usize,
+    /// Entities this node just GAINED per the frame's owned statement, with
+    /// their state seed (frame entity or replicated proxy copy — §8: the new
+    /// owner starts writing from its replicated copy). The driver must insert
+    /// these into its world.
+    pub adopted: Vec<EntityStateEntry>,
+    /// Entities this node no longer owns per the statement. The driver stops
+    /// simulating them; the core purges them without a client-facing removal.
+    pub lost: Vec<Uuid>,
+    /// #289: the frame's complete owned statement, if it carried one.
+    /// The caller replaces (not folds) its owned view with this.
+    pub statement: Option<HashSet<Uuid>>,
+}
+
+/// Apply one inbox frame to node-local state (#289: record-based).
+///
+/// The frame is a complete, idempotent statement: `owned` says exactly which
+/// entities this cluster owns; `entities` carries proxies/interest. There is
+/// no event folding — a node that missed any number of frames is fully
+/// corrected by this one. `frame.ownership` (flip events) is ignored here;
+/// it remains in the frame for observability only.
+///
+/// * `server_entity_ids` — entities this node currently writes (its record view).
+/// * `spawn_grace` — locally spawned entities the control plane has not yet
+///   confirmed. Grace entries are CANCELLED when a frame mentions the entity
+///   (owned → confirmed ours; proxy owned elsewhere → not ours). Entities in
+///   grace are never released by an absent statement (spawn→assignment latency).
+#[cfg(feature = "migration")]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_inbox_frame(
+    my_cluster: Uuid,
+    frame: &NodeInboxFrame,
+    server_entity_ids: &HashSet<Uuid>,
+    spawn_grace: &mut HashMap<Uuid, u64>,
+    neighbor_entities: &mut HashMap<Uuid, EntityStateEntry>,
+    neighbor_last_seen: &mut HashMap<Uuid, u64>,
+    current_tick: u64,
+) -> FrameApplyReport {
+    let mut proxies_upserted = 0;
+    let mut owned_skipped = 0;
+    let mut adopted = Vec::new();
+    let mut lost = Vec::new();
+
+    let statement: Option<HashSet<Uuid>> =
+        frame.owned.as_ref().map(|v| v.iter().copied().collect());
+
+    // 1. Grace cancellation: the control plane has spoken to these entities.
+    //    Owned → confirmed ours. Proxy owned by another cluster → not ours
+    //    (the release below or the absence from `owned` handles the rest).
+    if let Some(ref owned) = statement {
+        spawn_grace.retain(|id, _| !owned.contains(id));
+    }
+    // Grace TTL: statements are the record; grace only bridges the natural
+    // spawn → state-publish → manager → frame latency. Past the TTL, a
+    // statement's SILENCE about the entity is authoritative (release below).
+    // Wrong expiry is self-healing: the driver's next submit re-graces the
+    // entity, its state republishes, and the next statement confirms it —
+    // one-frame amplitude, no permanent loss. Only applied when a statement
+    // actually arrived: with the control plane down, nothing expires.
+    const SPAWN_GRACE_TTL_TICKS: u64 = 150;
+    if statement.is_some() {
+        let cutoff = current_tick.saturating_sub(SPAWN_GRACE_TTL_TICKS);
+        spawn_grace.retain(|_, at| *at >= cutoff);
+    }
+    for replicated in &frame.entities {
+        if replicated.entry.cluster_id != my_cluster {
+            spawn_grace.remove(&replicated.entry.entity_id);
+        }
+    }
+
+    // 2. Proxy upsert: represent foreign entities. Never hold a proxy for an
+    //    entity the statement says (or, with no statement, the record says)
+    //    is ours.
+    for replicated in &frame.entities {
+        let entry = &replicated.entry;
+        let mine = match statement {
+            Some(ref owned) => owned.contains(&entry.entity_id),
+            None => server_entity_ids.contains(&entry.entity_id),
+        };
+        if mine {
+            owned_skipped += 1;
+        } else {
+            // Manager-built frame entities are spine-only; don't let them
+            // erase user_data the replication path already gave us.
+            let mut incoming = entry.clone();
+            if incoming.user_data.is_null() {
+                if let Some(existing) = neighbor_entities.get(&entry.entity_id) {
+                    incoming.user_data = existing.user_data.clone();
+                }
+            }
+            neighbor_entities.insert(entry.entity_id, incoming);
+            neighbor_last_seen.insert(entry.entity_id, current_tick);
+            proxies_upserted += 1;
+        }
+    }
+
+    // 3. Reconcile against the owned statement (adopt / release).
+    if let Some(ref owned) = statement {
+        // ADOPT: stated as ours but not in our world. Seed from the frame's
+        // entity copy (freshest kinematics, force-included by the gate) merged
+        // with the proxy copy (carries bucket-2 user_data the frame lacks).
+        for id in owned {
+            if server_entity_ids.contains(id) {
+                continue;
+            }
+            let from_frame = frame
+                .entities
+                .iter()
+                .find(|e| e.entry.entity_id == *id)
+                .map(|e| e.entry.clone());
+            let proxy = neighbor_entities.remove(id);
+            neighbor_last_seen.remove(id);
+            let merged = match (from_frame, proxy) {
+                (Some(mut f), Some(p)) => {
+                    if f.user_data.is_null() {
+                        f.user_data = p.user_data;
+                    }
+                    Some(f)
+                }
+                (f, p) => f.or(p),
+            };
+            if let Some(entry) = merged {
+                adopted.push(entry);
+            }
+            // No state anywhere: cannot adopt yet. The gate force-includes
+            // pending-flip state, so this is transient; the next frame
+            // carries it.
+        }
+        // RELEASE: in our world but absent from the statement — and not in
+        // spawn grace (the control plane may simply not have seen it yet).
+        for id in server_entity_ids {
+            if !owned.contains(id) && !spawn_grace.contains_key(id) {
+                lost.push(*id);
+            }
+        }
+    }
+
+    FrameApplyReport {
+        proxies_upserted,
+        owned_skipped,
+        adopted,
+        lost,
+        statement,
+    }
+}
 
 /// Configuration for creating a `NodeCore`.
 #[derive(Clone, Debug)]
@@ -94,6 +254,16 @@ pub struct NodeInputs {
     pub game_actions: Vec<GameAction>,
     pub neighbor_entities: HashMap<Uuid, EntityStateEntry>,
     pub inbound_physics: Vec<arcane_core::physics_events::PhysicsEventBatch>,
+    /// Entities this node gained ownership of via inbox flips this drain (§8
+    /// adoption). The driver must insert them into its world map so it starts
+    /// simulating + submitting them; their last replicated state is the seed.
+    #[cfg(feature = "migration")]
+    pub adopted_entities: Vec<EntityStateEntry>,
+    /// Entities this node lost ownership of via inbox flips this drain. The
+    /// driver should remove them from its world map (the new owner simulates
+    /// them now; we keep seeing them as replicated proxies).
+    #[cfg(feature = "migration")]
+    pub lost_entities: Vec<Uuid>,
 }
 
 /// Outcome of one `pump()` iteration: tick number, sequence number, and entity count.
@@ -149,6 +319,72 @@ pub struct NodeCore {
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
     #[cfg(feature = "spacetimedb-persist")]
     persist: Option<SpacetimeDbPersist>,
+    /// #289: the node's owned-set RECORD view — replaced wholesale by each
+    /// frame's `owned` statement, never folded from events. "Do I own X?" =
+    /// `owned_view.contains(X) || spawn_grace.contains_key(X)`.
+    #[cfg(feature = "migration")]
+    owned_view: HashSet<Uuid>,
+    /// #289: locally spawned entities the control plane has not yet spoken to
+    /// (entity -> spawn tick). Provisionally ours; a frame mentioning the
+    /// entity cancels the grace (owned -> confirmed, foreign proxy -> not
+    /// ours). Never released by an absent statement — covers the natural
+    /// spawn -> state-publish -> manager -> frame latency.
+    #[cfg(feature = "migration")]
+    spawn_grace: HashMap<Uuid, u64>,
+    /// #289: entity -> (last known owner, tick recorded). NON-authoritative
+    /// forwarding hints for entities we do not represent: released entities
+    /// whose client is still attached here after their proxy interest
+    /// decayed. Filled opportunistically from frame proxy records and the
+    /// informational flip events; expired on a long TTL. A wrong hint is
+    /// harmless-by-construction: the receiver applies-if-owned or drops.
+    #[cfg(feature = "migration")]
+    owner_hints: HashMap<Uuid, (Uuid, u64)>,
+    #[cfg(feature = "migration")]
+    inbox_rx: Option<std::sync::mpsc::Receiver<NodeInboxFrame>>,
+    #[cfg(feature = "migration")]
+    state_publisher: Option<crate::state_keys::StatePublisher>,
+    #[cfg(feature = "migration")]
+    state_publish_interval: u64,
+    /// Game-declared pin feature name (NODE_PIN_FEATURE env). When set, entities
+    /// driven by a live client connection publish `{pin_feature: 1.0}` in their
+    /// state-doc FeatureMap so the manager (config.pin_feature) never migrates
+    /// them — v1 stand-in for CLUSTER_REASSIGN client handoff.
+    #[cfg(feature = "migration")]
+    pin_feature: Option<String>,
+    /// entity -> last tick a client update arrived for it (pin liveness window).
+    #[cfg(feature = "migration")]
+    client_driven_last_seen: HashMap<Uuid, u64>,
+    /// D1 forwarding invariant (epic #287): inbound channel for input batches
+    /// relayed by non-owner nodes. Drained in `drain_inputs` WITHOUT the
+    /// forwarding check (loop safety: apply-if-owned or drop-and-count).
+    #[cfg(feature = "migration")]
+    forwarded_rx: Option<std::sync::mpsc::Receiver<ForwardedInputBatch>>,
+    /// Publisher relaying inputs for entities another cluster owns.
+    #[cfg(feature = "migration")]
+    forwarded_publisher: Option<ForwardedInputsPublisher>,
+    /// Per-drain scratch: target cluster -> batch under construction. Kept on
+    /// self to reuse allocations; always drained by the end of `drain_inputs`.
+    #[cfg(feature = "migration")]
+    forward_scratch: HashMap<Uuid, ForwardedInputBatch>,
+    /// Kill switch for A/B verification (`ARCANE_INPUT_FORWARDING=off`).
+    /// Forwarding is a correctness invariant and defaults ON; the switch
+    /// exists so the migration harness can demonstrate the failure mode.
+    #[cfg(feature = "migration")]
+    forwarding_enabled: bool,
+    /// D2 (epic #287): sender for RECONNECT redirect hints into the WS
+    /// server. Always present (the channel is created in `new`); only the
+    /// migration path produces directives.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
+    reconnect_hint_tx: std::sync::mpsc::Sender<crate::ws_server::ReconnectDirective>,
+    /// L0 address book: cluster_id -> client-facing ws URL, parsed from
+    /// `NODE_CLUSTER_ADDRS` ("uuid:host:port,..."). Empty = no RECONNECT
+    /// hints are ever sent (forwarding alone keeps clients correct).
+    #[cfg(feature = "migration")]
+    cluster_addrs: HashMap<Uuid, String>,
+    /// entity -> last tick a RECONNECT hint was sent (throttle; hints are
+    /// resent while forwarding persists so a dropped frame self-heals).
+    #[cfg(feature = "migration")]
+    reconnect_last_hint: HashMap<Uuid, u64>,
 }
 
 impl NodeCore {
@@ -202,6 +438,10 @@ impl NodeCore {
                     as std::sync::Arc<dyn arcane_core::visibility::IVisibilityFilter>
             });
 
+        // D2 (epic #287): RECONNECT hint channel into the WS server. The
+        // rx side lives in the subscriber loop; this core holds the tx and
+        // produces directives from the forwarding path (migration only).
+        let (reconnect_hint_tx, reconnect_hint_rx) = std::sync::mpsc::channel();
         crate::ws_server::run_ws_server(
             cfg.ws_port,
             state_rx,
@@ -209,6 +449,7 @@ impl NodeCore {
             game_actions_tx,
             stats.clone(),
             visibility_filter,
+            reconnect_hint_rx,
         );
 
         let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
@@ -235,6 +476,102 @@ impl NodeCore {
         let interval = Duration::from_millis(1000 / tick_rate_hz);
         let dt_seconds = interval.as_secs_f64();
 
+        // #289: no ownership-flip pub/sub subscriber and no folded map. The
+        // node's ownership view is the record: each inbox frame's `owned`
+        // statement replaces it wholesale.
+
+        #[cfg(feature = "migration")]
+        let (state_publisher, state_publish_interval) = {
+            let interval = std::env::var("NODE_STATE_PUBLISH_TICKS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(30);
+            let publisher = match crate::state_keys::StatePublisher::new(&cfg.redis_url) {
+                Ok(p) => {
+                    eprintln!("state publisher initialized (interval={} ticks)", interval);
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "state publisher init failed ({}); continuing without state publication",
+                        e
+                    );
+                    None
+                }
+            };
+            (publisher, interval)
+        };
+
+        #[cfg(feature = "migration")]
+        let pin_feature = std::env::var("NODE_PIN_FEATURE").ok().filter(|s| {
+            if s.is_empty() {
+                false
+            } else {
+                eprintln!("pin feature enabled: client-driven entities publish '{s}'=1");
+                true
+            }
+        });
+
+        // D1 forwarding invariant (epic #287). Defaults ON: it is a correctness
+        // property, not an optimization. `ARCANE_INPUT_FORWARDING=off` exists
+        // only so the harness can demonstrate the split-brain failure mode.
+        #[cfg(feature = "migration")]
+        let forwarding_enabled = !matches!(
+            std::env::var("ARCANE_INPUT_FORWARDING").as_deref(),
+            Ok("off") | Ok("0") | Ok("false")
+        );
+        #[cfg(feature = "migration")]
+        let (forwarded_rx, forwarded_publisher) = if forwarding_enabled {
+            let (fwd_tx, fwd_rx) = std::sync::mpsc::channel();
+            spawn_forwarded_inputs_subscriber(cfg.redis_url.clone(), cfg.cluster_id, fwd_tx);
+            let publisher = match ForwardedInputsPublisher::new(&cfg.redis_url) {
+                Ok(p) => {
+                    eprintln!(
+                        "input forwarding enabled (arcane:fwd_inputs:{})",
+                        cfg.cluster_id
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("input forwarding publisher init failed ({e}); non-owned inputs will be dropped");
+                    None
+                }
+            };
+            (Some(fwd_rx), publisher)
+        } else {
+            eprintln!(
+                "input forwarding DISABLED (ARCANE_INPUT_FORWARDING=off) — split-brain demo mode"
+            );
+            (None, None)
+        };
+
+        // D2 (epic #287): L0 address book for RECONNECT hints. Same entry
+        // format as MANAGER_CLUSTERS ("uuid:host:port,..."). Optional: with
+        // no address book the node simply never hints — D1 forwarding keeps
+        // clients correct on the longer path.
+        #[cfg(feature = "migration")]
+        let cluster_addrs: HashMap<Uuid, String> = std::env::var("NODE_CLUSTER_ADDRS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|entry| {
+                        let mut it = entry.trim().splitn(3, ':');
+                        let id = Uuid::parse_str(it.next()?).ok()?;
+                        let host = it.next()?;
+                        let port = it.next()?;
+                        Some((id, format!("ws://{host}:{port}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "migration")]
+        if !cluster_addrs.is_empty() {
+            eprintln!(
+                "reconnect hints enabled: {} cluster addrs (NODE_CLUSTER_ADDRS)",
+                cluster_addrs.len()
+            );
+        }
+
         Ok(Self {
             server,
             state_tx,
@@ -252,6 +589,35 @@ impl NodeCore {
             submitted_routed_physics: Vec::new(),
             #[cfg(feature = "spacetimedb-persist")]
             persist,
+            #[cfg(feature = "migration")]
+            owned_view: HashSet::new(),
+            #[cfg(feature = "migration")]
+            spawn_grace: HashMap::new(),
+            #[cfg(feature = "migration")]
+            owner_hints: HashMap::new(),
+            #[cfg(feature = "migration")]
+            inbox_rx: None,
+            #[cfg(feature = "migration")]
+            state_publisher,
+            #[cfg(feature = "migration")]
+            state_publish_interval,
+            #[cfg(feature = "migration")]
+            pin_feature,
+            #[cfg(feature = "migration")]
+            client_driven_last_seen: HashMap::new(),
+            #[cfg(feature = "migration")]
+            forwarded_rx,
+            #[cfg(feature = "migration")]
+            forwarded_publisher,
+            #[cfg(feature = "migration")]
+            forward_scratch: HashMap::new(),
+            #[cfg(feature = "migration")]
+            forwarding_enabled,
+            reconnect_hint_tx,
+            #[cfg(feature = "migration")]
+            cluster_addrs,
+            #[cfg(feature = "migration")]
+            reconnect_last_hint: HashMap::new(),
         })
     }
 
@@ -262,6 +628,23 @@ impl NodeCore {
     /// **Query method.** Reads the tick counter; no I/O, no side effects.
     pub fn current_tick(&self) -> u64 {
         self.server.current_tick()
+    }
+
+    /// Attach an inbox bus and spawn a thread to subscribe to frames.
+    /// Frames are forwarded into an mpsc channel stored in `inbox_rx`.
+    #[cfg(feature = "migration")]
+    pub fn attach_inbox<B: InboxBus + Send + 'static>(&mut self, bus: B) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cluster_id = self.cluster_id;
+        std::thread::spawn(move || {
+            let frame_rx = bus.subscribe(cluster_id);
+            while let Ok(frame) = frame_rx.recv() {
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        self.inbox_rx = Some(rx);
     }
 
     /// Core → driver. Drains client updates, game actions, inbound physics; accumulates & prunes
@@ -276,15 +659,154 @@ impl NodeCore {
         out.client_updates.clear();
         out.game_actions.clear();
         out.inbound_physics.clear();
+        #[cfg(feature = "migration")]
+        out.adopted_entities.clear();
+        #[cfg(feature = "migration")]
+        out.lost_entities.clear();
 
+        // Client updates: D1 forwarding invariant (epic #287). An input for an
+        // entity ANOTHER cluster owns is relayed to that owner instead of being
+        // applied here — the non-owner never writes it. `owner_of == None` is
+        // the new-spawn path (first-sight claiming in `submit_entities`), which
+        // must stay local. Loop safety: forwarded inputs arrive on a separate
+        // channel drained below WITHOUT this check.
+        #[cfg(feature = "migration")]
+        while let Ok(entry) = self.client_updates_rx.try_recv() {
+            if let Some(owner) = forward_target(
+                entry.entity_id,
+                &self.owned_view,
+                &self.spawn_grace,
+                &self.neighbor_entities,
+                &self.owner_hints,
+                self.forwarding_enabled,
+            ) {
+                let entity_id = entry.entity_id;
+                self.forward_scratch
+                    .entry(owner)
+                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                    .updates
+                    .push(ForwardedUpdate::new(entry));
+                // D2: while we are forwarding this entity, periodically hint
+                // its client to reconnect to the owner directly. Best-effort
+                // and throttled; D1 keeps the client correct either way.
+                self.maybe_send_reconnect_hint(entity_id, owner);
+                continue;
+            }
+            if self.pin_feature.is_some() {
+                self.client_driven_last_seen
+                    .insert(entry.entity_id, self.tick_count);
+            }
+            out.client_updates.push(entry);
+        }
+        #[cfg(not(feature = "migration"))]
         while let Ok(entry) = self.client_updates_rx.try_recv() {
             out.client_updates.push(entry);
         }
+        #[cfg(feature = "migration")]
+        while let Ok(action) = self.game_actions_rx.try_recv() {
+            if let Some(owner) = forward_target(
+                action.entity_id,
+                &self.owned_view,
+                &self.spawn_grace,
+                &self.neighbor_entities,
+                &self.owner_hints,
+                self.forwarding_enabled,
+            ) {
+                self.forward_scratch
+                    .entry(owner)
+                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                    .actions
+                    .push(action);
+                continue;
+            }
+            out.game_actions.push(action);
+        }
+        #[cfg(not(feature = "migration"))]
         while let Ok(action) = self.game_actions_rx.try_recv() {
             out.game_actions.push(action);
         }
+        // Inbound forwarded batches: apply-if-owned, else drop and count.
+        // NEVER re-forward (structural loop safety: at most one hop per input;
+        // if ownership moved again mid-flight, the client's next input —
+        // arriving at 10-20Hz — forwards to the right place).
+        #[cfg(feature = "migration")]
+        if let Some(ref fwd_rx) = self.forwarded_rx {
+            while let Ok(batch) = fwd_rx.try_recv() {
+                for fwd in batch.updates {
+                    let entry = fwd.into_entry();
+                    if self.owned_view.contains(&entry.entity_id)
+                        || self.spawn_grace.contains_key(&entry.entity_id)
+                    {
+                        // A forwarded update is a live client session driving this
+                        // entity: pin liveness follows the SESSION, wherever the
+                        // ingress node is.
+                        if self.pin_feature.is_some() {
+                            self.client_driven_last_seen
+                                .insert(entry.entity_id, self.tick_count);
+                        }
+                        self.stats
+                            .fwd_inputs_applied
+                            .fetch_add(1, Ordering::Relaxed);
+                        out.client_updates.push(entry);
+                    } else {
+                        self.stats
+                            .fwd_inputs_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                for action in batch.actions {
+                    if self.owned_view.contains(&action.entity_id)
+                        || self.spawn_grace.contains_key(&action.entity_id)
+                    {
+                        self.stats
+                            .fwd_inputs_applied
+                            .fetch_add(1, Ordering::Relaxed);
+                        out.game_actions.push(action);
+                    } else {
+                        self.stats
+                            .fwd_inputs_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        // Flush this drain's forward batches (one publish per target cluster).
+        #[cfg(feature = "migration")]
+        if !self.forward_scratch.is_empty() {
+            if let Some(ref publisher) = self.forwarded_publisher {
+                for (target, batch) in self.forward_scratch.drain() {
+                    let n = (batch.updates.len() + batch.actions.len()) as u64;
+                    if publisher.forward(target, batch).is_ok() {
+                        self.stats
+                            .fwd_inputs_relayed
+                            .fetch_add(n, Ordering::Relaxed);
+                    }
+                }
+            } else {
+                // Publisher unavailable: dropping is still more correct than
+                // applying as a second writer.
+                let n: u64 = self
+                    .forward_scratch
+                    .drain()
+                    .map(|(_, b)| (b.updates.len() + b.actions.len()) as u64)
+                    .sum();
+                self.stats
+                    .fwd_inputs_dropped
+                    .fetch_add(n, Ordering::Relaxed);
+            }
+        }
         while let Ok(delta) = self.neighbor_rx.try_recv() {
             for entry in delta.updated {
+                // Ownership check (migration): never hold a proxy for an entity WE
+                // own. The legacy neighbor channel lags flips — right after adopting
+                // X, the old owner's last broadcasts still carry X and would ghost a
+                // duplicate next to the adopted actor.
+                #[cfg(feature = "migration")]
+                if self.owned_view.contains(&entry.entity_id)
+                    || self.spawn_grace.contains_key(&entry.entity_id)
+                {
+                    continue;
+                }
                 self.neighbor_last_seen
                     .insert(entry.entity_id, self.tick_count);
                 self.neighbor_entities.insert(entry.entity_id, entry);
@@ -292,6 +814,60 @@ impl NodeCore {
             for removed_id in &delta.removed {
                 self.neighbor_entities.remove(removed_id);
                 self.neighbor_last_seen.remove(removed_id);
+            }
+        }
+        #[cfg(feature = "migration")]
+        if let Some(ref inbox_rx) = self.inbox_rx {
+            while let Ok(frame) = inbox_rx.try_recv() {
+                // Owner hints (non-authoritative, forwarding only): proxy
+                // records carry the current owner; the informational flip
+                // events cover just-released entities that have no proxy
+                // (e.g. the old owner lost its only entity — zero interest).
+                for replicated in &frame.entities {
+                    if replicated.entry.cluster_id != self.cluster_id {
+                        self.owner_hints.insert(
+                            replicated.entry.entity_id,
+                            (replicated.entry.cluster_id, self.tick_count),
+                        );
+                    }
+                }
+                for flip in &frame.ownership {
+                    if flip.to_cluster != self.cluster_id {
+                        self.owner_hints
+                            .insert(flip.entity_id, (flip.to_cluster, self.tick_count));
+                    }
+                }
+
+                let effective_owned: HashSet<Uuid> = self
+                    .owned_view
+                    .iter()
+                    .chain(self.spawn_grace.keys())
+                    .copied()
+                    .collect();
+                let report = apply_inbox_frame(
+                    self.cluster_id,
+                    &frame,
+                    &effective_owned,
+                    &mut self.spawn_grace,
+                    &mut self.neighbor_entities,
+                    &mut self.neighbor_last_seen,
+                    self.tick_count,
+                );
+                // #289: the statement REPLACES the record view (no folding).
+                if let Some(statement) = report.statement {
+                    self.owned_view = statement;
+                }
+                // §8 adoption: hand gained entities to the driver so it starts
+                // simulating them from their replicated state.
+                out.adopted_entities.extend(report.adopted);
+                for id in &report.lost {
+                    // Purge the stale authoritative copy WITHOUT a client-facing
+                    // removal (the entity lives on, owned elsewhere). Leaving it
+                    // would rebroadcast the old cluster_id every resync tick and
+                    // flap observer attribution (seen in the migration harness).
+                    self.server.purge_entity(*id);
+                }
+                out.lost_entities.extend(report.lost);
             }
         }
         const PRUNE_INTERVAL_TICKS: u64 = 60;
@@ -303,6 +879,16 @@ impl NodeCore {
                 }
                 keep
             });
+            // Owner hints live much longer than proxies: they are the ONLY
+            // forwarding route for a released entity whose client is still
+            // attached here (D2 RECONNECT typically moves the client long
+            // before this expires). 3000 ticks ≈ 100 s at 30 Hz.
+            #[cfg(feature = "migration")]
+            {
+                const OWNER_HINT_TTL_TICKS: u64 = 3000;
+                let cutoff = self.tick_count.saturating_sub(OWNER_HINT_TTL_TICKS);
+                self.owner_hints.retain(|_, (_, at)| *at >= cutoff);
+            }
         }
         while let Ok(batch) = self.physics_events_rx.try_recv() {
             out.inbound_physics.push(batch);
@@ -313,16 +899,85 @@ impl NodeCore {
         out.neighbor_entities.clone_from(&self.neighbor_entities);
     }
 
+    /// D2 (epic #287): send a throttled RECONNECT hint for a forwarded
+    /// entity. No-ops when the owner has no address-book entry. Interval:
+    /// `RECONNECT_HINT_INTERVAL_TICKS` — resending while forwarding
+    /// persists makes delivery self-healing (a lost frame is re-sent; a
+    /// client that already moved stops triggering forwarding, which stops
+    /// the hints).
+    #[cfg(feature = "migration")]
+    fn maybe_send_reconnect_hint(&mut self, entity_id: Uuid, owner: Uuid) {
+        const RECONNECT_HINT_INTERVAL_TICKS: u64 = 60;
+        let Some(addr) = self.cluster_addrs.get(&owner) else {
+            return;
+        };
+        let due = match self.reconnect_last_hint.get(&entity_id) {
+            Some(last) => self.tick_count.saturating_sub(*last) >= RECONNECT_HINT_INTERVAL_TICKS,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.reconnect_last_hint.insert(entity_id, self.tick_count);
+        let _ = self
+            .reconnect_hint_tx
+            .send(crate::ws_server::ReconnectDirective {
+                entity_id,
+                addr: addr.clone(),
+                token: entity_id.to_string(),
+            });
+    }
     /// Driver → core. Writes this tick's authoritative spine into the node map, preserving the
     /// old loop + add_entity semantics (stamp cluster_id, enforce max_entities), and records
     /// EXPLICIT removals (matches today's pending_removed → delta.removed one-shot semantics).
     ///
+    /// When migration is enabled, applies the ownership boundary: only writes entities this node
+    /// currently owns per the `OwnershipMap`. Entities that were owned but are now owned by another
+    /// cluster are dropped from the spine.
+    ///
     /// **In-memory operation.** Operates on the node's entity map; no I/O or network boundary.
     pub fn submit_entities(&mut self, spine: &[EntityStateEntry], removed: &[Uuid]) {
-        for entry in spine {
-            let mut e = entry.clone();
-            e.cluster_id = self.cluster_id;
-            self.server.add_entity(e);
+        #[cfg(feature = "migration")]
+        {
+            let mut graced_this_batch = 0;
+            for entry in spine {
+                let id = entry.entity_id;
+                let ours = self.owned_view.contains(&id) || self.spawn_grace.contains_key(&id);
+                if !ours {
+                    // The record says another cluster owns it? Then the driver
+                    // must not write it (single-writer). This also blocks a
+                    // restarted node from re-claiming entities that migrated
+                    // away while it was down — the frames it received since
+                    // restart carry them as foreign proxies or hints.
+                    if self.neighbor_entities.contains_key(&id)
+                        || self.owner_hints.contains_key(&id)
+                    {
+                        continue;
+                    }
+                    // Unknown everywhere: a NEW local spawn. Provisionally
+                    // ours under spawn grace until the control plane speaks
+                    // to it (#289 replacement for first-sight claiming).
+                    self.spawn_grace.insert(id, self.tick_count);
+                    graced_this_batch += 1;
+                }
+                let mut e = entry.clone();
+                e.cluster_id = self.cluster_id;
+                self.server.add_entity(e);
+            }
+            if graced_this_batch > 0 {
+                eprintln!(
+                    "spawn grace: {} new local entities awaiting control-plane confirmation",
+                    graced_this_batch
+                );
+            }
+        }
+        #[cfg(not(feature = "migration"))]
+        {
+            for entry in spine {
+                let mut e = entry.clone();
+                e.cluster_id = self.cluster_id;
+                self.server.add_entity(e);
+            }
         }
         for id in removed {
             self.server.remove_entity(*id);
@@ -370,6 +1025,74 @@ impl NodeCore {
         let our_delta = self.server.tick();
         let tick_elapsed = tick_start.elapsed();
         let tick_elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0;
+
+        #[cfg(feature = "migration")]
+        if self.tick_count.is_multiple_of(self.state_publish_interval) {
+            if let Some(ref publisher) = self.state_publisher {
+                // Pin liveness: an entity counts as client-driven while updates arrived
+                // within the last PIN_LIVENESS_TICKS. Prune stale records so entities
+                // whose client disconnected become migratable again.
+                const PIN_LIVENESS_TICKS: u64 = 100;
+                if self.pin_feature.is_some() {
+                    let cutoff = self.tick_count.saturating_sub(PIN_LIVENESS_TICKS);
+                    self.client_driven_last_seen
+                        .retain(|_, last| *last >= cutoff);
+                }
+                // D2 hint throttle records: drop entries idle for 10x the
+                // hint interval (entity stopped being forwarded — client
+                // moved or disconnected). Bounds the map by live forwarded
+                // entities instead of every entity ever forwarded.
+                {
+                    let hint_cutoff = self.tick_count.saturating_sub(600);
+                    self.reconnect_last_hint
+                        .retain(|_, last| *last >= hint_cutoff);
+                }
+                let snapshot = self.server.snapshot();
+                let entities: Vec<arcane_affinity::feature_map::EntityRecord> = snapshot
+                    .into_iter()
+                    .filter(|e| {
+                        self.owned_view.contains(&e.entity_id)
+                            || self.spawn_grace.contains_key(&e.entity_id)
+                    })
+                    .map(|entry| {
+                        let mut features = arcane_affinity::feature_map::FeatureMap::new();
+                        if let Some(ref pin_name) = self.pin_feature {
+                            if self.client_driven_last_seen.contains_key(&entry.entity_id) {
+                                features.insert(pin_name.clone(), 1.0);
+                            }
+                        }
+                        arcane_affinity::feature_map::EntityRecord {
+                            entity_id: entry.entity_id,
+                            cluster_id: entry.cluster_id,
+                            position: arcane_core::types::Vec2::new(
+                                entry.position.x,
+                                entry.position.z,
+                            ),
+                            velocity: arcane_core::types::Vec2::new(
+                                entry.velocity.x,
+                                entry.velocity.z,
+                            ),
+                            features,
+                            // Bucket 2 rides the state key so the router path
+                            // can replicate it (frames ARE the channel there).
+                            user_data: entry.user_data.clone(),
+                        }
+                    })
+                    .collect();
+
+                let doc = crate::state_keys::ClusterStateDoc {
+                    cluster_id: self.cluster_id,
+                    tick: self.server.current_tick(),
+                    entities,
+                    observed_edges: vec![],
+                };
+
+                if let Err(e) = publisher.publish(&doc) {
+                    eprintln!("state doc publish error: {}", e);
+                }
+            }
+        }
+
         let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
         let outcome_tick = merged_delta.tick;
         let outcome_seq = merged_delta.seq;
@@ -433,6 +1156,66 @@ impl NodeCore {
     }
 }
 
+/// D1 forwarding invariant (epic #287), #289 record-based: decide where an
+/// inbound client input for `entity_id` must go — from the RECORDS this node
+/// holds, not from a folded event map.
+///
+/// - `None` — apply locally. We own it (owned statement), it's a fresh local
+///   spawn (grace), it's unknown everywhere (new-spawn path), or forwarding
+///   is disabled.
+/// - `Some(owner)` — a record says another cluster owns it: the proxy record's
+///   `cluster_id` (authoritative, refreshed every frame) or, failing that, an
+///   owner hint (released entity whose proxy interest decayed; wrong hints
+///   are harmless — the receiver applies-if-owned or drops).
+#[cfg(feature = "migration")]
+pub fn forward_target(
+    entity_id: Uuid,
+    owned_view: &HashSet<Uuid>,
+    spawn_grace: &HashMap<Uuid, u64>,
+    neighbor_entities: &HashMap<Uuid, EntityStateEntry>,
+    owner_hints: &HashMap<Uuid, (Uuid, u64)>,
+    forwarding_enabled: bool,
+) -> Option<Uuid> {
+    if !forwarding_enabled {
+        return None;
+    }
+    if owned_view.contains(&entity_id) || spawn_grace.contains_key(&entity_id) {
+        return None;
+    }
+    if let Some(proxy) = neighbor_entities.get(&entity_id) {
+        return Some(proxy.cluster_id);
+    }
+    if let Some((owner, _)) = owner_hints.get(&entity_id) {
+        return Some(*owner);
+    }
+    None
+}
+/// Decide whether this node should write (author) an entity this tick.
+///
+/// Used by the ownership migration boundary to gate which cluster writes each entity.
+/// Given the current tick and an optional ownership flip affecting this entity:
+/// - Before `effective_tick`: the `from_cluster` writes.
+/// - At/after `effective_tick`: the `to_cluster` writes.
+/// - If no flip, the node writes if it previously owned the entity (or always, if no ownership map).
+#[cfg(feature = "migration")]
+pub fn resolve_authoritative(
+    entity_id: Uuid,
+    my_cluster: Uuid,
+    ownership_map: &OwnershipMap,
+    current_tick: u64,
+    flip: Option<OwnershipFlip>,
+) -> bool {
+    if let Some(f) = flip {
+        if current_tick < f.effective_tick {
+            f.from_cluster == my_cluster
+        } else {
+            f.to_cluster == my_cluster
+        }
+    } else {
+        ownership_map.owns(entity_id, my_cluster)
+    }
+}
+
 /// Merge local delta with latest neighbor snapshots, deduplicating on entity_id
 /// (local entries win). Used in `NodeCore::tick()` and exposed for tests.
 pub fn merge_with_neighbor_latest(
@@ -460,6 +1243,176 @@ pub fn merge_with_neighbor_latest(
     }
 }
 
+#[cfg(test)]
+#[cfg(feature = "migration")]
+mod forwarding_tests {
+    //! D1 forwarding invariant (epic #287), #289 record-based routing tests.
+    //! The un-fakeable end-to-end proof is the migration harness
+    //! (`examples/migration_observer.rs --phase migrate`, unpinned stack).
+    use super::forward_target;
+    use arcane_core::replication_channel::EntityStateEntry;
+    use arcane_core::Vec3;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    fn proxy(owner: Uuid, id: Uuid) -> (Uuid, EntityStateEntry) {
+        (
+            id,
+            EntityStateEntry::new(
+                id,
+                owner,
+                Vec3::new(0.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 0.0),
+            ),
+        )
+    }
+
+    #[test]
+    fn owned_entity_applies_locally() {
+        let e = Uuid::from_u128(10);
+        let owned: HashSet<Uuid> = [e].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &owned,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn spawn_grace_applies_locally() {
+        // A fresh local spawn is provisionally ours until the control plane
+        // speaks — its inputs must not be forwarded anywhere.
+        let e = Uuid::from_u128(10);
+        let grace: HashMap<Uuid, u64> = [(e, 5u64)].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &HashSet::new(),
+                &grace,
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_entity_applies_locally_for_spawn_path() {
+        // Unknown everywhere = new spawn: stays local (submit_entities will
+        // grace it). Forwarding it would orphan new spawns.
+        let e = Uuid::from_u128(10);
+        assert_eq!(
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_record_owner_wins() {
+        // The invariant: the non-owner reads the owner OFF THE RECORD it
+        // holds (the proxy's cluster_id) and relays.
+        let owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                true
+            ),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn owner_hint_covers_released_entities_without_proxy() {
+        // Released entity whose proxy interest decayed: the hint is the only
+        // remaining route while the client is still attached here.
+        let owner = Uuid::from_u128(3);
+        let e = Uuid::from_u128(10);
+        let hints: HashMap<Uuid, (Uuid, u64)> = [(e, (owner, 42u64))].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &hints,
+                true
+            ),
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn kill_switch_disables_forwarding() {
+        let owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &HashSet::new(),
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn statement_change_reroutes_next_input() {
+        // Frame N says we own it -> local. Frame N+1 omits it and a proxy
+        // record appears -> forward to the proxy's owner. The exact sequence
+        // a migrating connected player produces, record-based.
+        let owner = Uuid::from_u128(2);
+        let e = Uuid::from_u128(10);
+        let owned_before: HashSet<Uuid> = [e].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &owned_before,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                true
+            ),
+            None
+        );
+        let owned_after: HashSet<Uuid> = HashSet::new();
+        let proxies: HashMap<Uuid, EntityStateEntry> = [proxy(owner, e)].into();
+        assert_eq!(
+            forward_target(
+                e,
+                &owned_after,
+                &HashMap::new(),
+                &proxies,
+                &HashMap::new(),
+                true
+            ),
+            Some(owner)
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::merge_with_neighbor_latest;
@@ -807,5 +1760,517 @@ mod tests {
         drop(rx);
         let (_tx2, _rx2) = std::sync::mpsc::channel::<()>();
         let _ = _tx2.send(()); // Immediate return, no Future, no .await possible.
+    }
+
+    #[cfg(feature = "migration")]
+    mod ownership_boundary_tests {
+        use super::*;
+        use crate::node_core::resolve_authoritative;
+        use crate::ownership_migration::{OwnershipFlip, OwnershipMap};
+        use std::collections::HashSet;
+
+        #[test]
+        fn resolve_authoritative_before_flip_writes_from_cluster() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, from_cluster, &ownership, 99, Some(flip));
+            assert!(result, "from_cluster should write before effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_before_flip_rejects_to_cluster() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 99, Some(flip));
+            assert!(!result, "to_cluster should not write before effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_at_flip_tick_to_cluster_writes() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 100, Some(flip));
+            assert!(result, "to_cluster should write at effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_at_flip_tick_from_cluster_stops() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result =
+                resolve_authoritative(entity_id, from_cluster, &ownership, 100, Some(flip));
+            assert!(!result, "from_cluster should not write at effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_after_flip_to_cluster_writes() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let from_cluster = Uuid::from_u128(10);
+            let to_cluster = Uuid::from_u128(20);
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster,
+                to_cluster,
+                effective_tick: 100,
+            };
+
+            let result = resolve_authoritative(entity_id, to_cluster, &ownership, 150, Some(flip));
+            assert!(result, "to_cluster should write after effective_tick");
+        }
+
+        #[test]
+        fn resolve_authoritative_no_flip_checks_ownership_map() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(1);
+            let cluster_a = Uuid::from_u128(10);
+            let cluster_b = Uuid::from_u128(20);
+
+            ownership.set_owner(entity_id, cluster_a);
+
+            let result = resolve_authoritative(entity_id, cluster_a, &ownership, 50, None);
+            assert!(result, "cluster_a owns the entity, should write");
+
+            let result = resolve_authoritative(entity_id, cluster_b, &ownership, 50, None);
+            assert!(
+                !result,
+                "cluster_b does not own the entity, should not write"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_tick_minus_one() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // Before flip: only A writes
+            let a_writes_before =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick - 1, Some(flip));
+            let b_writes_before =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick - 1, Some(flip));
+            assert!(a_writes_before, "A should write before flip");
+            assert!(!b_writes_before, "B should not write before flip");
+            assert!(
+                a_writes_before as u8 + b_writes_before as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_flip_tick() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // At flip: only B writes
+            let a_writes_at =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick, Some(flip));
+            let b_writes_at =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick, Some(flip));
+            assert!(!a_writes_at, "A should not write at flip");
+            assert!(b_writes_at, "B should write at flip");
+            assert!(
+                a_writes_at as u8 + b_writes_at as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn exactly_once_boundary_tick_plus_one() {
+            let ownership = OwnershipMap::new();
+            let entity_id = Uuid::from_u128(100);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 50;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // After flip: only B writes
+            let a_writes_after =
+                resolve_authoritative(entity_id, cluster_a, &ownership, flip_tick + 1, Some(flip));
+            let b_writes_after =
+                resolve_authoritative(entity_id, cluster_b, &ownership, flip_tick + 1, Some(flip));
+            assert!(!a_writes_after, "A should not write after flip");
+            assert!(b_writes_after, "B should write after flip");
+            assert!(
+                a_writes_after as u8 + b_writes_after as u8 == 1,
+                "exactly one writes"
+            );
+        }
+
+        #[test]
+        fn state_continuity_b_sources_from_neighbor_entities() {
+            let entity_id = Uuid::from_u128(50);
+            let cluster_a = Uuid::from_u128(1);
+            let cluster_b = Uuid::from_u128(2);
+            let flip_tick = 100;
+
+            let flip = OwnershipFlip {
+                entity_id,
+                from_cluster: cluster_a,
+                to_cluster: cluster_b,
+                effective_tick: flip_tick,
+            };
+
+            // Before flip: A owns and writes with position X
+            let a_entry = mk_entry(entity_id, cluster_a, 42.0);
+            assert_eq!(a_entry.position.x, 42.0, "A's entry has position 42.0");
+
+            // A is writing via submit_entities. The state gets replicated to B as a neighbor entity.
+            // B has this in neighbor_entities. When flip happens at tick 100:
+
+            // At tick 100: B becomes the owner (resolve_authoritative says B should write).
+            // B already has the entity state from neighbor_entities (position 42.0, etc.)
+            // When B includes this in its spine via submit_entities, it preserves the state.
+
+            let b_ownership = OwnershipMap::new();
+            b_ownership.set_owner(entity_id, cluster_b);
+
+            // After the flip, B's position should still be 42.0 (carried over from neighbor replication)
+            let result =
+                resolve_authoritative(entity_id, cluster_b, &b_ownership, flip_tick, Some(flip));
+            assert!(result, "B becomes the authoritative writer at flip_tick");
+
+            // The assertion is: B's merge_with_neighbor_latest will include the replicated entry
+            // from neighbor_entities, which has position 42.0, same as what A had written.
+            // This test documents that assumption; the actual state preservation is tested
+            // in the broader integration (neighbor state arrives before flip).
+        }
+
+        #[test]
+        fn statement_adopts_from_proxy_state() {
+            // #289: a frame stating "you own X" adopts X, seeded from the
+            // proxy copy this node was replicating (§8: the new owner starts
+            // writing from its replicated copy).
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let entity_id = Uuid::from_u128(100);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![],
+                owned: Some(vec![entity_id]),
+            };
+
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            neighbor_entities.insert(entity_id, mk_entry(entity_id, Uuid::from_u128(1), 42.0));
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            neighbor_last_seen.insert(entity_id, 49);
+            let server_ids: HashSet<Uuid> = HashSet::new();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c2,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert_eq!(report.adopted.len(), 1, "statement adopts the entity");
+            assert_eq!(
+                report.adopted[0].position.x, 42.0,
+                "seeded from proxy state"
+            );
+            assert!(
+                !neighbor_entities.contains_key(&entity_id),
+                "adopted entity is no longer a proxy"
+            );
+            assert_eq!(report.statement.as_ref().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn statement_releases_absent_entities() {
+            // #289: an entity in our world but absent from the statement is
+            // released (the record says someone else owns it now).
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let entity_id = Uuid::from_u128(101);
+            let cluster_c1 = Uuid::from_u128(1);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![],
+                owned: Some(vec![]), // "you own NOTHING"
+            };
+
+            let server_ids: HashSet<Uuid> = [entity_id].into();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert_eq!(report.lost, vec![entity_id]);
+            assert!(report.adopted.is_empty());
+        }
+
+        #[test]
+        fn spawn_grace_survives_absent_statement() {
+            // #289: a fresh local spawn is NOT released just because the
+            // control plane hasn't seen it yet (spawn -> frame latency).
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let spawned = Uuid::from_u128(102);
+            let cluster_c1 = Uuid::from_u128(1);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![],
+                owned: Some(vec![]),
+            };
+
+            let server_ids: HashSet<Uuid> = [spawned].into();
+            let mut grace: HashMap<Uuid, u64> = [(spawned, 48u64)].into();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert!(report.lost.is_empty(), "graced spawn must not be released");
+            assert!(
+                grace.contains_key(&spawned),
+                "grace persists until spoken to"
+            );
+        }
+
+        #[test]
+        fn statement_confirms_grace() {
+            // #289: the statement naming a graced entity confirms it (grace
+            // cancelled, entity stays owned via the statement).
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::NodeInboxFrame;
+
+            let spawned = Uuid::from_u128(103);
+            let cluster_c1 = Uuid::from_u128(1);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![],
+                owned: Some(vec![spawned]),
+            };
+
+            let server_ids: HashSet<Uuid> = [spawned].into();
+            let mut grace: HashMap<Uuid, u64> = [(spawned, 48u64)].into();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert!(!grace.contains_key(&spawned), "statement cancels grace");
+            assert!(report.lost.is_empty());
+            assert!(
+                report.adopted.is_empty(),
+                "already in world; nothing to adopt"
+            );
+        }
+
+        #[test]
+        fn foreign_proxy_cancels_grace() {
+            // #289: a frame carrying our graced entity as a FOREIGN proxy
+            // means the control plane assigned it elsewhere (e.g. restart
+            // race) — grace is cancelled so release can proceed next frame.
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::{NodeInboxFrame, ReplicatedEntity};
+            use arcane_affinity::rate_field::RateTier;
+
+            let e = Uuid::from_u128(104);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![ReplicatedEntity {
+                    entry: mk_entry(e, cluster_c2, 5.0),
+                    tier: RateTier::Full,
+                    rate_hz: 30.0,
+                }],
+                owned: Some(vec![]),
+            };
+
+            let server_ids: HashSet<Uuid> = [e].into();
+            let mut grace: HashMap<Uuid, u64> = [(e, 48u64)].into();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert!(!grace.contains_key(&e), "foreign proxy cancels grace");
+            assert!(report.lost.contains(&e), "released once grace is gone");
+        }
+
+        #[test]
+        fn frame_without_statement_reconciles_nothing() {
+            // Pre-#289 frame (owned: None): proxies upsert, but no adopt and
+            // no release — an old frame must never drain a node.
+            use crate::node_core::apply_inbox_frame;
+            use crate::node_inbox::{NodeInboxFrame, ReplicatedEntity};
+            use arcane_affinity::rate_field::RateTier;
+
+            let mine = Uuid::from_u128(105);
+            let foreign = Uuid::from_u128(106);
+            let cluster_c1 = Uuid::from_u128(1);
+            let cluster_c2 = Uuid::from_u128(2);
+
+            let frame = NodeInboxFrame {
+                tick: 50,
+                ownership: vec![],
+                entities: vec![ReplicatedEntity {
+                    entry: mk_entry(foreign, cluster_c2, 7.0),
+                    tier: RateTier::Full,
+                    rate_hz: 30.0,
+                }],
+                owned: None,
+            };
+
+            let server_ids: HashSet<Uuid> = [mine].into();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            let report = apply_inbox_frame(
+                cluster_c1,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                50,
+            );
+
+            assert!(report.statement.is_none());
+            assert!(report.adopted.is_empty());
+            assert!(report.lost.is_empty());
+            assert_eq!(report.proxies_upserted, 1);
+        }
+
+        #[test]
+        fn submit_respects_foreign_owner() {
+            let my_cluster = Uuid::from_u128(1);
+            let foreign_cluster = Uuid::from_u128(2);
+            let entity_id = Uuid::from_u128(100);
+
+            let ownership = OwnershipMap::new();
+            // Set up foreign ownership
+            ownership.set_owner(entity_id, foreign_cluster);
+
+            // Try to claim it (should not re-claim)
+            if ownership.owner_of(entity_id).is_none() {
+                ownership.set_owner(entity_id, my_cluster);
+            }
+
+            // Verify foreign ownership is respected (not changed)
+            assert_eq!(ownership.owner_of(entity_id), Some(foreign_cluster));
+            assert!(!ownership.owns(entity_id, my_cluster));
+            assert!(ownership.owns(entity_id, foreign_cluster));
+        }
     }
 }

@@ -78,6 +78,27 @@ table GameActionPayload {
   payload: [ubyte];
 }
 
+/// Server -> client: redirect hint (epic #287, Session Relay L0 — D2).
+///
+/// "Your entity's owner is reachable at `addr`; make-before-break reconnect
+/// there and resume with `token`." Tier-agnostic: at L0 a node sends it after
+/// an ownership flip so a direct-connected client can restore the short path;
+/// higher relay tiers reuse the identical frame for session moves. Timing is
+/// deliberately UNCRITICAL: the forwarding invariant (D1) keeps inputs
+/// correct while the client takes its time switching — a client may even
+/// ignore RECONNECT entirely and stay correct (just on a longer path).
+table ReconnectPayload {
+  /// WebSocket URL of the new ingress (e.g. "ws://10.0.0.5:8082").
+  addr: string (required);
+  /// Opaque resume token the client presents on the new connection.
+  /// L0: the entity UUID string (the new owner already knows the entity;
+  /// presenting it merely re-binds the subscriber's avatar). Relay tiers
+  /// may carry signed session tokens here without a schema change.
+  token: string;
+  /// Entity this redirect applies to (a client may drive several).
+  entity_id: UUID (required);
+}
+
 /// Client-to-server frame envelope.
 union ClientPayload {
   PlayerState: PlayerStatePayload,
@@ -91,6 +112,7 @@ table ClientFrame {
 /// Server-to-client frame envelope.
 union ServerPayload {
   Delta: DeltaPayload,
+  Reconnect: ReconnectPayload,
 }
 
 table ServerFrame {

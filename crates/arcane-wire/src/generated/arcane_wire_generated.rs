@@ -124,14 +124,17 @@ pub mod arcane_wire {
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
-    pub const ENUM_MAX_SERVER_PAYLOAD: u8 = 1;
+    pub const ENUM_MAX_SERVER_PAYLOAD: u8 = 2;
     #[deprecated(
         since = "2.0.0",
         note = "Use associated constants instead. This will no longer be generated in 2021."
     )]
     #[allow(non_camel_case_types)]
-    pub const ENUM_VALUES_SERVER_PAYLOAD: [ServerPayload; 2] =
-        [ServerPayload::NONE, ServerPayload::Delta];
+    pub const ENUM_VALUES_SERVER_PAYLOAD: [ServerPayload; 3] = [
+        ServerPayload::NONE,
+        ServerPayload::Delta,
+        ServerPayload::Reconnect,
+    ];
 
     /// Server-to-client frame envelope.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -141,15 +144,17 @@ pub mod arcane_wire {
     impl ServerPayload {
         pub const NONE: Self = Self(0);
         pub const Delta: Self = Self(1);
+        pub const Reconnect: Self = Self(2);
 
         pub const ENUM_MIN: u8 = 0;
-        pub const ENUM_MAX: u8 = 1;
-        pub const ENUM_VALUES: &'static [Self] = &[Self::NONE, Self::Delta];
+        pub const ENUM_MAX: u8 = 2;
+        pub const ENUM_VALUES: &'static [Self] = &[Self::NONE, Self::Delta, Self::Reconnect];
         /// Returns the variant's name or "" if unknown.
         pub fn variant_name(self) -> Option<&'static str> {
             match self {
                 Self::NONE => Some("NONE"),
                 Self::Delta => Some("Delta"),
+                Self::Reconnect => Some("Reconnect"),
                 _ => None,
             }
         }
@@ -247,8 +252,15 @@ pub mod arcane_wire {
         type Output = UUID;
         #[inline]
         unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-            let src = ::core::slice::from_raw_parts(self as *const UUID as *const u8, Self::size());
+            let src = ::core::slice::from_raw_parts(
+                self as *const UUID as *const u8,
+                <Self as flatbuffers::Push>::size(),
+            );
             dst.copy_from_slice(src);
+        }
+        #[inline]
+        fn alignment() -> flatbuffers::PushAlignment {
+            flatbuffers::PushAlignment::new(8)
         }
     }
 
@@ -371,9 +383,15 @@ pub mod arcane_wire {
         type Output = Vec3Q;
         #[inline]
         unsafe fn push(&self, dst: &mut [u8], _written_len: usize) {
-            let src =
-                ::core::slice::from_raw_parts(self as *const Vec3Q as *const u8, Self::size());
+            let src = ::core::slice::from_raw_parts(
+                self as *const Vec3Q as *const u8,
+                <Self as flatbuffers::Push>::size(),
+            );
             dst.copy_from_slice(src);
+        }
+        #[inline]
+        fn alignment() -> flatbuffers::PushAlignment {
+            flatbuffers::PushAlignment::new(2)
         }
     }
 
@@ -1428,6 +1446,184 @@ pub mod arcane_wire {
             ds.finish()
         }
     }
+    pub enum ReconnectPayloadOffset {}
+    #[derive(Copy, Clone, PartialEq)]
+
+    /// Server -> client: redirect hint (epic #287, Session Relay L0 — D2).
+    ///
+    /// "Your entity's owner is reachable at `addr`; make-before-break reconnect
+    /// there and resume with `token`." Tier-agnostic: at L0 a node sends it after
+    /// an ownership flip so a direct-connected client can restore the short path;
+    /// higher relay tiers reuse the identical frame for session moves. Timing is
+    /// deliberately UNCRITICAL: the forwarding invariant (D1) keeps inputs
+    /// correct while the client takes its time switching — a client may even
+    /// ignore RECONNECT entirely and stay correct (just on a longer path).
+    pub struct ReconnectPayload<'a> {
+        pub _tab: flatbuffers::Table<'a>,
+    }
+
+    impl<'a> flatbuffers::Follow<'a> for ReconnectPayload<'a> {
+        type Inner = ReconnectPayload<'a>;
+        #[inline]
+        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
+            Self {
+                _tab: flatbuffers::Table::new(buf, loc),
+            }
+        }
+    }
+
+    impl<'a> ReconnectPayload<'a> {
+        pub const VT_ADDR: flatbuffers::VOffsetT = 4;
+        pub const VT_TOKEN: flatbuffers::VOffsetT = 6;
+        pub const VT_ENTITY_ID: flatbuffers::VOffsetT = 8;
+
+        #[inline]
+        pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
+            ReconnectPayload { _tab: table }
+        }
+        #[allow(unused_mut)]
+        pub fn create<
+            'bldr: 'args,
+            'args: 'mut_bldr,
+            'mut_bldr,
+            A: flatbuffers::Allocator + 'bldr,
+        >(
+            _fbb: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr, A>,
+            args: &'args ReconnectPayloadArgs<'args>,
+        ) -> flatbuffers::WIPOffset<ReconnectPayload<'bldr>> {
+            let mut builder = ReconnectPayloadBuilder::new(_fbb);
+            if let Some(x) = args.entity_id {
+                builder.add_entity_id(x);
+            }
+            if let Some(x) = args.token {
+                builder.add_token(x);
+            }
+            if let Some(x) = args.addr {
+                builder.add_addr(x);
+            }
+            builder.finish()
+        }
+
+        /// WebSocket URL of the new ingress (e.g. "ws://10.0.0.5:8082").
+        #[inline]
+        pub fn addr(&self) -> &'a str {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(ReconnectPayload::VT_ADDR, None)
+                    .unwrap()
+            }
+        }
+        /// Opaque resume token the client presents on the new connection.
+        /// L0: the entity UUID string (the new owner already knows the entity;
+        /// presenting it merely re-binds the subscriber's avatar). Relay tiers
+        /// may carry signed session tokens here without a schema change.
+        #[inline]
+        pub fn token(&self) -> Option<&'a str> {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<flatbuffers::ForwardsUOffset<&str>>(ReconnectPayload::VT_TOKEN, None)
+            }
+        }
+        /// Entity this redirect applies to (a client may drive several).
+        #[inline]
+        pub fn entity_id(&self) -> &'a UUID {
+            // Safety:
+            // Created from valid Table for this object
+            // which contains a valid value in this slot
+            unsafe {
+                self._tab
+                    .get::<UUID>(ReconnectPayload::VT_ENTITY_ID, None)
+                    .unwrap()
+            }
+        }
+    }
+
+    impl flatbuffers::Verifiable for ReconnectPayload<'_> {
+        #[inline]
+        fn run_verifier(
+            v: &mut flatbuffers::Verifier,
+            pos: usize,
+        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+            use self::flatbuffers::Verifiable;
+            v.visit_table(pos)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("addr", Self::VT_ADDR, true)?
+                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("token", Self::VT_TOKEN, false)?
+                .visit_field::<UUID>("entity_id", Self::VT_ENTITY_ID, true)?
+                .finish();
+            Ok(())
+        }
+    }
+    pub struct ReconnectPayloadArgs<'a> {
+        pub addr: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub token: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub entity_id: Option<&'a UUID>,
+    }
+    impl<'a> Default for ReconnectPayloadArgs<'a> {
+        #[inline]
+        fn default() -> Self {
+            ReconnectPayloadArgs {
+                addr: None, // required field
+                token: None,
+                entity_id: None, // required field
+            }
+        }
+    }
+
+    pub struct ReconnectPayloadBuilder<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> {
+        fbb_: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+        start_: flatbuffers::WIPOffset<flatbuffers::TableUnfinishedWIPOffset>,
+    }
+    impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ReconnectPayloadBuilder<'a, 'b, A> {
+        #[inline]
+        pub fn add_addr(&mut self, addr: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(ReconnectPayload::VT_ADDR, addr);
+        }
+        #[inline]
+        pub fn add_token(&mut self, token: flatbuffers::WIPOffset<&'b str>) {
+            self.fbb_
+                .push_slot_always::<flatbuffers::WIPOffset<_>>(ReconnectPayload::VT_TOKEN, token);
+        }
+        #[inline]
+        pub fn add_entity_id(&mut self, entity_id: &UUID) {
+            self.fbb_
+                .push_slot_always::<&UUID>(ReconnectPayload::VT_ENTITY_ID, entity_id);
+        }
+        #[inline]
+        pub fn new(
+            _fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>,
+        ) -> ReconnectPayloadBuilder<'a, 'b, A> {
+            let start = _fbb.start_table();
+            ReconnectPayloadBuilder {
+                fbb_: _fbb,
+                start_: start,
+            }
+        }
+        #[inline]
+        pub fn finish(self) -> flatbuffers::WIPOffset<ReconnectPayload<'a>> {
+            let o = self.fbb_.end_table(self.start_);
+            self.fbb_.required(o, ReconnectPayload::VT_ADDR, "addr");
+            self.fbb_
+                .required(o, ReconnectPayload::VT_ENTITY_ID, "entity_id");
+            flatbuffers::WIPOffset::new(o.value())
+        }
+    }
+
+    impl core::fmt::Debug for ReconnectPayload<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut ds = f.debug_struct("ReconnectPayload");
+            ds.field("addr", &self.addr());
+            ds.field("token", &self.token());
+            ds.field("entity_id", &self.entity_id());
+            ds.finish()
+        }
+    }
     pub enum ClientFrameOffset {}
     #[derive(Copy, Clone, PartialEq)]
 
@@ -1711,6 +1907,20 @@ pub mod arcane_wire {
                 None
             }
         }
+
+        #[inline]
+        #[allow(non_snake_case)]
+        pub fn payload_as_reconnect(&self) -> Option<ReconnectPayload<'a>> {
+            if self.payload_type() == ServerPayload::Reconnect {
+                let u = self.payload();
+                // Safety:
+                // Created from a valid Table for this object
+                // Which contains a valid union in this slot
+                Some(unsafe { ReconnectPayload::init_from_table(u) })
+            } else {
+                None
+            }
+        }
     }
 
     impl flatbuffers::Verifiable for ServerFrame<'_> {
@@ -1731,6 +1941,11 @@ pub mod arcane_wire {
                         ServerPayload::Delta => v
                             .verify_union_variant::<flatbuffers::ForwardsUOffset<DeltaPayload>>(
                                 "ServerPayload::Delta",
+                                pos,
+                            ),
+                        ServerPayload::Reconnect => v
+                            .verify_union_variant::<flatbuffers::ForwardsUOffset<ReconnectPayload>>(
+                                "ServerPayload::Reconnect",
                                 pos,
                             ),
                         _ => Ok(()),
@@ -1808,6 +2023,16 @@ pub mod arcane_wire {
                         )
                     }
                 }
+                ServerPayload::Reconnect => {
+                    if let Some(x) = self.payload_as_reconnect() {
+                        ds.field("payload", &x)
+                    } else {
+                        ds.field(
+                            "payload",
+                            &"InvalidFlatbuffer: Union discriminant does not match value.",
+                        )
+                    }
+                }
                 _ => {
                     let x: Option<()> = None;
                     ds.field("payload", &x)
@@ -1823,9 +2048,7 @@ pub mod arcane_wire {
     /// catch every error, or be maximally performant. For the
     /// previous, unchecked, behavior use
     /// `root_as_server_frame_unchecked`.
-    pub fn root_as_server_frame(
-        buf: &[u8],
-    ) -> Result<ServerFrame<'_>, flatbuffers::InvalidFlatbuffer> {
+    pub fn root_as_server_frame(buf: &[u8]) -> Result<ServerFrame, flatbuffers::InvalidFlatbuffer> {
         flatbuffers::root::<ServerFrame>(buf)
     }
     #[inline]
@@ -1837,7 +2060,7 @@ pub mod arcane_wire {
     /// `size_prefixed_root_as_server_frame_unchecked`.
     pub fn size_prefixed_root_as_server_frame(
         buf: &[u8],
-    ) -> Result<ServerFrame<'_>, flatbuffers::InvalidFlatbuffer> {
+    ) -> Result<ServerFrame, flatbuffers::InvalidFlatbuffer> {
         flatbuffers::size_prefixed_root::<ServerFrame>(buf)
     }
     #[inline]
@@ -1870,14 +2093,14 @@ pub mod arcane_wire {
     /// Assumes, without verification, that a buffer of bytes contains a ServerFrame and returns it.
     /// # Safety
     /// Callers must trust the given bytes do indeed contain a valid `ServerFrame`.
-    pub unsafe fn root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame<'_> {
+    pub unsafe fn root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame {
         flatbuffers::root_unchecked::<ServerFrame>(buf)
     }
     #[inline]
     /// Assumes, without verification, that a buffer of bytes contains a size prefixed ServerFrame and returns it.
     /// # Safety
     /// Callers must trust the given bytes do indeed contain a valid size prefixed `ServerFrame`.
-    pub unsafe fn size_prefixed_root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame<'_> {
+    pub unsafe fn size_prefixed_root_as_server_frame_unchecked(buf: &[u8]) -> ServerFrame {
         flatbuffers::size_prefixed_root_unchecked::<ServerFrame>(buf)
     }
     #[inline]
