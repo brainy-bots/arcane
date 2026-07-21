@@ -1,4 +1,4 @@
-//! Integration tests: ArcaneManager + LocalPool + SpatialIndex + RulesEngine (no SpacetimeDB).
+//! Integration tests: ArcaneManager + LocalPool + SpatialIndex (no SpacetimeDB).
 //! Plus Redis: smoke test and RedisReplicationChannel publish/subscribe (run with `docker compose up -d`).
 
 use std::sync::mpsc;
