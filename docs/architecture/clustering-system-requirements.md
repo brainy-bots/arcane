@@ -7,7 +7,7 @@
 | **Component ID** | SYS-01 |
 | **Layer** | System requirements spec |
 | **Type** | Requirements — defines *what* the clustering system must do, not *how* |
-| **Relates to** | [IF-01 IClusteringModel](interface-iclusteringmodel.md) · [IN-01 ArcaneManager](module-arcane-manager.md) · [IN-04 RulesEngine](module-rules-engine.md) · [WHY_ARCANE](../../WHY_ARCANE.md) |
+| **Relates to** | [IN-01 ArcaneManager](module-arcane-manager.md) · [ADR-004 global partitioning & ML seams](adr/004-global-partitioning-and-ml-seams.md) · [WHY_ARCANE](../../WHY_ARCANE.md) · design history: [IF-01 IClusteringModel](interface-iclusteringmodel.md), [IN-04 RulesEngine](module-rules-engine.md) (both superseded 2026-07 by the in-crate global partition, see ADR-004) |
 | **Language** | System-level English |
 | **Status** | Current as of 2026-04-21 |
 
@@ -15,11 +15,11 @@
 
 ## 1. Purpose
 
-This spec defines the **requirements and capabilities** of Arcane's clustering system at the system level. It is the system-level companion to [IF-01](interface-iclusteringmodel.md), which defines the interface contract for the model plugged into the ArcaneManager.
+This spec defines the **requirements and capabilities** of Arcane's clustering system at the system level. It is the system-level companion to the clustering decision path in the ArcaneManager, which is now the in-crate global graph partition `build_partition_decisions` (see [ADR-004](adr/004-global-partitioning-and-ml-seams.md)). The former `IClusteringModel` trait ([IF-01](interface-iclusteringmodel.md)) is retained as design history.
 
-IF-01 answers *"what is the Rust trait the model implements?"* This spec answers *"what must the clustering system eventually do, end-to-end, to deliver the value proposition in [WHY_ARCANE](../../WHY_ARCANE.md)?"* It frames the responsibilities, input signals, outputs, and non-goals so contributors working on individual clustering epics can see how their work composes into the whole.
+This spec answers *"what must the clustering system eventually do, end-to-end, to deliver the value proposition in [WHY_ARCANE](../../WHY_ARCANE.md)?"* It frames the responsibilities, input signals, outputs, and non-goals so contributors working on individual clustering epics can see how their work composes into the whole. The current mechanism is the global graph partitioner (`GreedyGrowthPartitioner` + KL/FM `refine`); the ML seam is the pluggable `InteractionPredictor` (rule-based `HeuristicPredictor` today).
 
-The current implementation is an MVP with a static rules engine (IN-04). This doc describes the production target — what the full system looks like once the ML-backed model, heterogeneous node types, dynamic migration, and cost-aware placement are in place. Each numbered epic in the roadmap is a slice of that target.
+The current implementation partitions the interaction graph with a rule-based predictor and heuristic edge weights (the retired static `RulesEngine`/IN-04 is design history). This doc describes the production target — what the full system looks like once the ML-backed predictor, heterogeneous node types, dynamic migration, and cost-aware placement are in place. Each numbered epic in the roadmap is a slice of that target.
 
 ---
 
@@ -144,7 +144,7 @@ The model does not directly call AWS APIs or the migration mechanism. It emits d
 
 ### Evaluation cadence
 
-Per IF-01, evaluation runs on a fixed cadence — fast enough to catch interaction shifts but limited by inference latency and resource budget. 50–200 ms is a reasonable working range. The model is stateful across evaluations: its choices must be *stable* under noise (players moving back and forth across a boundary shouldn't cause merge/split thrash). Stability is a model property, not imposed externally through hysteresis rules.
+Evaluation runs on a fixed cadence — fast enough to catch interaction shifts but limited by inference latency and resource budget. 50–200 ms is a reasonable working range. The system is stateful across evaluations: its choices must be *stable* under noise (players moving back and forth across a boundary shouldn't cause merge/split thrash). The target is for stability to be a property of the solve itself; today the migration cooldown in `MigrationState` supplies the anti-thrash guardrail.
 
 ---
 
@@ -289,9 +289,9 @@ This is also the strongest empirical argument for why affinity clustering is a n
 
 ## 15. References
 
-- [IF-01 IClusteringModel](interface-iclusteringmodel.md) — interface contract the model implements.
-- [IN-01 ArcaneManager](module-arcane-manager.md) — the component that calls the model.
-- [IN-04 RulesEngine](module-rules-engine.md) — MVP static-rules implementation of IF-01.
+- [IN-01 ArcaneManager](module-arcane-manager.md) — the component that runs the clustering decision (`build_partition_decisions`).
+- [ADR-004 global partitioning & ML seams](adr/004-global-partitioning-and-ml-seams.md) — the decision that made the global graph partition the clustering core and demoted per-entity scoring.
+- Design history: [IF-01 IClusteringModel](interface-iclusteringmodel.md) (superseded interface contract) and [IN-04 RulesEngine](module-rules-engine.md) (removed static-rules implementation).
 - [progressive-api.md](progressive-api.md) — design pillar this system respects.
 - [WHY_ARCANE.md](../../WHY_ARCANE.md) — external-facing positioning that pillar #1 (AI-driven affinity clustering) directly corresponds to.
 - [arcane-scaling-benchmarks/REPRODUCIBILITY.md](https://github.com/brainy-bots/arcane-scaling-benchmarks/blob/main/REPRODUCIBILITY.md) — the benchmark methodology and empirical evidence cited in §14.

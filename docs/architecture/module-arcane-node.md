@@ -40,7 +40,7 @@ ArcaneNode is the process that clients connect to for a given cluster. It owns a
 ## 3. What It Does NOT Do
 
 - **Assign players or entities to clusters** — ArcaneManager writes assignments; ArcaneNode only reads.
-- **Decide merge/split or topology** — ArcaneManager and IClusteringModel do that; ArcaneNode reacts to subscription updates (drop entities no longer mine, ReplicationChannelManager opens/closes subscriptions from topology).
+- **Decide merge/split or topology** — ArcaneManager computes ownership via the global graph partition (`arcane_infra::manager::build_partition_decisions`, ADR-004) and pushes the resulting migrations; ArcaneNode reacts to subscription updates (drop entities no longer mine, ReplicationChannelManager opens/closes subscriptions from topology).
 - **Authenticate players** — Auth may be done at Manager connection or at first Cluster message; ArcaneNode trusts that ArcaneManager only assigned valid players to this cluster (or validates token if provided).
 - **Guarantee replication delivery** — Replication is fire-and-forget; gap recovery is via SpacetimeDB full sync.
 - **Run ArcaneManager or ReplicationChannelManager** — Those are separate processes or components; ArcaneNode uses ReplicationChannelManager (and IReplicationChannel) for publish/subscribe.
@@ -56,7 +56,7 @@ ArcaneNode is a long-running process. It does not expose a public API to other s
 Internal interfaces it uses:
 - **SpacetimeDB client:** Subscribe to cluster_assignments, entity_assignments, entity_state (filtered by cluster_id); call reducers upsert_entity_state, delete_entity_state.
 - **ReplicationChannelManager:** Get IReplicationChannel instances for each neighbor; call send(delta) on each; receive callbacks or stream of deltas from subscriptions. ReplicationChannelManager subscribes to cluster_topology and opens/closes channels — ArcaneNode only feeds data and consumes received data.
-- **IWorldSimulator (optional):** For unobserved or low-priority entities, call FastForward or equivalent (see IF-04). ArcaneNode may delegate to a component that implements IWorldSimulator for entities not currently observed by any player.
+- **IWorldSimulator (design-only, removed):** The unobserved-entity simulation seam (IF-04) was never implemented and the trait/module were deleted (arcane#291/#292). ArcaneNode has no world-simulator dependency today. The [IF-04 spec](interface-iworldsimulator.md) is retained as design history.
 
 ---
 
@@ -86,7 +86,7 @@ Internal interfaces it uses:
 | ReplicationChannelManager (IN-06) | Neighbor list and IReplicationChannel instances; send(delta), receive deltas | ArcaneNode must still produce and consume deltas with seq; IN-06 handles who to subscribe to. |
 | IReplicationChannel (IF-03) | send(EntityStateDelta), receive path (callback or stream) | Delta shape and seq semantics must match; gap recovery behavior is specified in IF-03. |
 | RPCHandler (IN-05) | Optional. TCP endpoint for non-game RPC only | If used, ArcaneNode hosts it; game logic does not flow through it. |
-| IWorldSimulator (IF-04) | Optional: FastForward for unobserved entities | If used, ArcaneNode or a sub-component calls it; IF-04 defines the contract. |
+| ~~IWorldSimulator (IF-04)~~ | **Removed (arcane#291/#292).** Never implemented — no world-simulator dependency exists. | See [IF-04 spec](interface-iworldsimulator.md), retained as design history. |
 
 ---
 

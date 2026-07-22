@@ -243,7 +243,7 @@ Migration timing is `#34`'s scope (dynamic tier migration as a platform primitiv
 |---|---|
 | Entity state buckets (where each field lives) | [four-bucket-state-model.md](four-bucket-state-model.md) |
 | Physics integration shape (Unreal/Chaos and Rapier) | [physics-backends-and-unreal.md](physics-backends-and-unreal.md) |
-| Affinity clustering / PGP | [interface-iclusteringmodel.md](interface-iclusteringmodel.md) |
+| Affinity clustering / PGP (decision path) | Global graph partition `arcane_infra::manager::build_partition_decisions` + predictor seam `arcane_affinity::predictor::InteractionPredictor` ([ADR-004](adr/004-global-partitioning-and-ml-seams.md)). Historical design: [interface-iclusteringmodel.md](interface-iclusteringmodel.md) (REMOVED, arcane#291/#292). |
 | Replication channels and wire format | [interface-ireplicationchannel.md](interface-ireplicationchannel.md) |
 
 ---

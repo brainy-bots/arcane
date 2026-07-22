@@ -6,15 +6,16 @@ Multiplayer backend library: affinity clustering, node management, and replicati
 
 ## Crates
 
+Six crates (`arcane-core`, `arcane-affinity`, `arcane-spatial`, `arcane-pool`, `arcane-wire`, `arcane-infra`).
+
 | Crate | Description |
 |-------|-------------|
-| **arcane-core** | Traits and shared types — `IClusteringModel`, `IServerPool`, `IReplicationChannel` (no I/O). |
-| **arcane-affinity** | AffinityEngine — interaction-weighted clustering: interaction graph, cluster scoring, migration hysteresis. Integration into the live manager loop is in progress. |
+| **arcane-core** | Traits and shared types — `IServerPool`, `IReplicationChannel`, `IVisibilityFilter`, plus the `WorldStateView` view types and `Vec2`/`Vec3`/`ClusterGeometry` (no I/O). |
+| **arcane-affinity** | Interaction-weighted clustering: interaction graph, cold-pair screening, predictor, rate field, and the global graph **partition/refine** decision pipeline consumed by the manager (`build_partition_decisions`). |
 | **arcane-wire** | FlatBuffers wire format — single `.fbs` schema shared by the Rust server and all engine client plugins. |
-| **arcane-spatial** | SpatialIndex — in-memory entity/cluster index for neighbor and geometry queries (flat linear-scan implementation; a spatial-grid index is planned). |
-| **arcane-rules** | RulesEngine — minimal rule-based `IClusteringModel` stub. |
+| **arcane-spatial** | SpatialIndex — in-memory 3D sparse-hash index over cluster entities for neighbor and geometry queries. |
 | **arcane-pool** | LocalPool — server pool implementation. |
-| **arcane-infra** | ArcaneManager, ArcaneNode, Rapier physics nodes, replication; binaries `arcane-node`, `arcane-manager`, `arcane-rapier-node`. |
+| **arcane-infra** | ArcaneManager, ArcaneNode, the Router, Rapier physics nodes, replication; binaries `arcane-node`, `arcane-manager`, `arcane-router`, `arcane-rapier-node`. |
 
 ## Build and test
 

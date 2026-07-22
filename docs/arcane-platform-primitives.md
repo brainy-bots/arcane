@@ -73,7 +73,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 | **Outbound pipeline** | #13, #4, #2 *(read path)* | Per-subscriber per-tick: what each client receives |
 | **Simulation loop** | #1, #3, #6 | Per-tick: what the cluster computes |
 | **Entity lifecycle** | #8, #14 | SpacetimeDB: creation, transfer, persistence |
-| **Cluster management** | #5, #15 | `IClusteringModel` / tier system: authority partitioning |
+| **Cluster management** | #5, #15 | clustering decision (`build_partition_decisions`) / tier system: authority partitioning |
 | **Composite entities** | #10, #11, #12 | Hierarchical relationships, transforms, input routing |
 | **Validation** | #7 | Inbound path: server-side checks on client claims |
 | **Infrastructure** | #9, #16 | Self-contained subsystems with own transport or data structures |
@@ -97,7 +97,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 
 **Entity lifecycle and persistence** — #14 (linear persistent entities) and #8 (replay recording) both operate through SpacetimeDB transactional paths. Independent of the tick-rate simulation and the outbound pipeline.
 
-**Cluster management** — #5 (terrain authority) and #15 (activity-based world simulation hooks) interact with `IClusteringModel` and the tier system ([#33](https://github.com/brainy-bots/arcane/issues/33) / [#34](https://github.com/brainy-bots/arcane/issues/34)). They don't touch the per-client outbound pipeline.
+**Cluster management** — #5 (terrain authority) and #15 (activity-based world simulation hooks) interact with the clustering decision (`build_partition_decisions`, the global graph partition) and the tier system ([#33](https://github.com/brainy-bots/arcane/issues/33) / [#34](https://github.com/brainy-bots/arcane/issues/34)). They don't touch the per-client outbound pipeline.
 
 **Composite entity system** — #10 (composite entities), #11 (relative coordinate frames), #12 (role-based input arbitration) are tightly coupled by design. They describe different aspects of the same concept — multi-occupant vehicles and structures — with each owning a distinct concern: topology (#10), geometry (#11), input (#12). Shared data structures, no conflict.
 

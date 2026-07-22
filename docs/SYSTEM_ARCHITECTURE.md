@@ -44,7 +44,7 @@ flowchart TB
 | Component | Responsibility |
 |-----------|----------------|
 | **Client** | Connect to Manager for join/leave and cluster assignment; connect to Arcane Node for game session; send PLAYER_INPUT; receive STATE_UPDATE, RPC_RESULT, CLUSTER_ASSIGN/REASSIGN. |
-| **ArcaneManager** | Single coordinator: assign players to clusters, maintain spatial index and neighbor topology, run clustering model (merge/split), write assignments and topology to SpacetimeDB; send CLUSTER_ASSIGN/REASSIGN to clients. Does not simulate or replicate. |
+| **ArcaneManager** | Single coordinator: assign players to clusters, maintain spatial index and neighbor topology, run the clustering decision (global graph partition of the interaction graph via `build_partition_decisions`, yielding merge/split as partition changes), write assignments and topology to SpacetimeDB; send CLUSTER_ASSIGN/REASSIGN to clients. Does not simulate or replicate. |
 | **ArcaneNode** | One per cluster: run simulation (movement, physics, AI) for owned entities; accept client Cluster WebSocket; send STATE_UPDATE each tick; receive PLAYER_INPUT; publish entity state to Redis for neighbors; subscribe to neighbors via Redis; read assignments/topology from SpacetimeDB; write entity state to SpacetimeDB at throttled rate; call SpacetimeDB reducers for discrete events (e.g. attack hit). |
 | **ReplicationChannelManager** | Runs inside each ArcaneNode: subscribe to SpacetimeDB cluster_topology; open/close one IReplicationChannel per neighbor; deliver outbound deltas to Redis and inbound deltas from Redis to ArcaneNode. Does not decide neighbors (Manager does). |
 | **Redis** | Pub/sub transport for real-time entity state between neighboring clusters. Each cluster publishes to its topic; neighbors subscribe. Fire-and-forget; no delivery guarantee. |
@@ -150,7 +150,7 @@ sequenceDiagram
     participant S2 as ArcaneNode B
     participant C as Client
 
-    Note over M: Evaluation cadence: IClusteringModel.evaluate(view)
+    Note over M: Evaluation cadence: build_partition_decisions (global graph partition)
     M->>M: Merge or split decision (e.g. merge B into A)
     M->>SDB: Update cluster_assignments, cluster_topology (remove B's neighbors, etc.)
     SDB-->>S1: Subscription: topology updated (neighbors change)

@@ -93,3 +93,13 @@ Explicitly **rejected** framings:
 4. `IPartitioner` ML warm-start seam; deferred impl.
 
 The migration executor (#207), rate field (#210), predictor (#209), and edge taxonomy (#211) are **unaffected** — they consume/produce assignments and edge weights and do not care whether a greedy scorer, a multilevel partitioner, or a GNN produced the partition.
+
+## Implementation status (2026-07)
+
+Recording what actually landed against the migration-path items above (this section is an append; the Context/Decision/Consequences prose is unchanged). Verified against code on branch `initiative/meta-control-layer`, arcane#291/#292 cleanup.
+
+- **Global partition is live and is the clustering core.** `arcane_infra::manager::build_partition_decisions` (`crates/arcane-infra/src/manager.rs:122`) derives weighted edges from the persistent `InteractionGraph`, partitions with `GreedyGrowthPartitioner` (`crates/arcane-affinity/src/partition.rs:434`), refines with KL/FM pair moves (`refine`, `crates/arcane-affinity/src/refinement.rs:162`), and maps partition indices to cluster ids. It is called once per `run_evaluation_cycle` (`manager.rs:877`). Migration-path item 1 (partitioner + Manager consuming a partition and diffing) landed; a `GreedyGrowthPartitioner` implements the `IPartitioner` trait rather than a full multilevel/METIS partitioner (item 1's "or greedy-growth" option).
+- **Per-entity scoring removed, not just demoted.** The standalone `AffinityEngine` + `scorer` and the whole `arcane-rules` crate (`RulesEngine`, the static `IClusteringModel` impl) were **deleted**. The `IClusteringModel` trait / `ClusterDecision` / `evaluate()` seam in `arcane-core` was removed; `clustering_model` now holds only the view types (`WorldStateView`, `ClusterInfo`, `PlayerInfo`). Workspace is now 6 crates.
+- **`convergence.rs` was DELETED** (migration-path item 2). Verified: the file no longer exists in the tree; the pair-move (KL/FM) refinement predicted to make it obsolete has landed, so the 2-cycle detection pass is gone.
+- **Predictor seam is live** (ADR §4). The ML seam is `arcane_affinity::predictor::InteractionPredictor` with the rule-based `HeuristicPredictor` as the permanent baseline (`crates/arcane-affinity/src/predictor.rs:24`/`56`). `build_partition_decisions` blends `p` into Soft edge weights. Items 3 (`IRegionSelector`) and 4 (`IPartitioner` ML warm-start) remain deferred, as designed.
+- **Migration cooldown/hysteresis** lives in `arcane_infra::manager::MigrationState` (`manager.rs:94`), the deterministic guardrail layer — consistent with the mechanism/policy split in §4 (the enforcement layer is not an ML seam).

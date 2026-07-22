@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **arcane-infra**: Renamed `ClusterServer` type to `ArcaneNode`; file `cluster_server.rs` → `node.rs`. "Node" is the industry-standard term for one server in a distributed fleet; "cluster" now unambiguously means the group of entities.
+- **clustering model**: The clustering decision is now a **global graph partition** (ADR-004), not a per-entity merge/split decision. `arcane_infra::manager::build_partition_decisions` derives weighted edges from the interaction graph, partitions (`GreedyGrowthPartitioner`), refines with KL/FM pair moves (`refine`), and maps partitions to cluster ids. The pluggable model seam is now `arcane_affinity::predictor::InteractionPredictor` (rule-based `HeuristicPredictor` today).
+- **arcane-spatial**: `SpatialIndex` is a **3D sparse spatial hash** (was documented as a 2D grid).
+
+### Removed
+- **workspace**: Deleted the `arcane-rules` crate (the static `IClusteringModel` `RulesEngine`). The workspace is now **6 crates** (arcane-core, arcane-affinity, arcane-spatial, arcane-pool, arcane-wire, arcane-infra).
+- **arcane-core**: Removed the `IClusteringModel` trait, `ClusterDecision`, `ModelInfo`, and `evaluate()` — the manager computed and discarded the result (dead pre-partition path). The view types `WorldStateView`, `ClusterInfo`, `PlayerInfo` remain in `clustering_model`. The core contract set is now **three interfaces** (`IServerPool`, `IReplicationChannel`, `IVisibilityFilter`).
+- **arcane-core**: Removed the `IWorldSimulator` trait + `world_simulator` module (no implementer or caller ever existed in-repo), `ChannelConfig` (never constructed), and the unused `EntityId` alias.
+- **arcane-affinity**: Removed `AffinityEngine` + `scorer` (per-entity greedy scoring, superseded by the global partition), the `hysteresis` module (live migration cooldown is `arcane_infra::manager::MigrationState`), and 12 dead legacy `AffinityConfig` fields (`weight_*`, `spatial_weight`, `migration_threshold`, `cooldown_ticks`, `max_entities_per_cluster`, `capacity_soft_limit_fraction`, `merge_entity_threshold`, `physics_edge_weight`).
+- **arcane-spatial**: Removed the duplicate `RadiusVisibilityFilter` (the live copy lives only in `arcane-core::visibility`).
+
+### Performance
+- **arcane-affinity**: `InteractionGraph::neighbors()` is now O(degree) via an adjacency index (was O(total pairs) per call on the router hot path). `rate_field::allocate_rates` water-level search is O(n) via suffix sums (was O(n²)).
+- **arcane-spatial**: `SpatialIndex::get_neighbors` is O(N)/cycle via a cached global max weighted spread (was O(N²)).
+- **arcane-infra**: `router_core::build_routing_docs` buckets `owner → entities` once, O(N) (was O(clusters × entities)); `ws_server` decodes each inbound frame once with the size guard applied before decode, and builds only the frame the active AOI mode transmits; `node_core::pump` reads the per-tick server counters once.
 
 ## [0.2.0] - 2026-04-18
 

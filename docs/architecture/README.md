@@ -22,19 +22,21 @@ This folder contains interface and module responsibility specs for the `arcane` 
 
 ## Interfaces
 
-- `interface-iclusteringmodel.md`
 - `interface-iserverpool.md`
 - `interface-ireplicationchannel.md`
-- `interface-iworldsimulator.md`
+- `interface-iclusteringmodel.md` — **REMOVED / SUPERSEDED (arcane#291/#292); retained as design history.** The clustering decision is now the global graph partition `arcane_infra::manager::build_partition_decisions` ([ADR-004](adr/004-global-partitioning-and-ml-seams.md)); the ML seam is `arcane_affinity::predictor::InteractionPredictor`.
+- `interface-iworldsimulator.md` — **REMOVED (arcane#291/#292); retained as design history.** Trait/module deleted; no implementer ever existed.
+
+The live core also exposes `IVisibilityFilter` (`arcane_core::visibility`, default `RadiusVisibilityFilter`) — the third live contract alongside `IServerPool` and `IReplicationChannel` — which has no standalone spec file here.
 
 ## Modules
 
 - `module-arcane-manager.md`
 - `module-arcane-node.md`
 - `module-spatial-index.md`
-- `module-rules-engine.md`
 - `module-rpc-handler.md`
 - `module-replication-channel-manager.md`
+- `module-rules-engine.md` — **REMOVED (arcane#291/#292); retained as design history.** The `arcane-rules` crate and its static `IClusteringModel` impl were deleted; see the global partition (`build_partition_decisions`, ADR-004).
 
 ## Mapping
 

@@ -309,7 +309,7 @@ separation**, not the interaction min-cut: peel off the geographically-distant
 group so its terrain unloads. So: CPU-bound → min-cut; memory-bound → spatial cut.
 See §9.
 
-Hysteresis/cooldown (already in `arcane-affinity`) rate-limits splits so they do
+Hysteresis/cooldown (live in `arcane_infra::manager::MigrationState`) rate-limits splits so they do
 not thrash; `SCALING_MODEL.md`'s K_max slack (~218 boundary entities on demo
 constants) means there is large tolerance before action is forced.
 
@@ -547,7 +547,7 @@ converge:
    distance + closing velocity + combat state), measured against binary AOI
    (paper C2). No SpacetimeDB brain, no self-scheduling meta-rates yet.
 3. **Manager owns the graph + partition decisions** (single, in-memory, the hot
-   graph). Predictor as a rule-based `p(i,j,T)` behind `arcane-affinity`'s scorer.
+   graph). Predictor as a rule-based `p(i,j,T)` in `arcane-affinity`'s `predictor` module (`InteractionPredictor` trait, `HeuristicPredictor` today).
 4. **Router as a distinct component** once whole-cluster replication is shown
    insufficient by measurement — not before. The full continuous-rate router with
    the manager/router split and the Redis-bus form is the **regime-3 / C2-full
