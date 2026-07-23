@@ -56,6 +56,10 @@ pub struct AffinityConfig {
     /// are repaired minimally before refinement. false = the old
     /// from-scratch behavior (A/B).
     pub seed_from_current: bool,
+
+    /// Partition objective weights (epic #293): the cost model that balances
+    /// cut, crowding, instance cost, and churn.
+    pub objective: super::objective::ObjectiveWeights,
 }
 
 impl Default for AffinityConfig {
@@ -83,6 +87,8 @@ impl Default for AffinityConfig {
             pin_feature: None,
 
             seed_from_current: true,
+
+            objective: Default::default(),
         }
     }
 }
