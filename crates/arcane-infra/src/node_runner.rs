@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::node_core::{NodeConfig, NodeCore, NodeInputs};
 
 /// Node-binary environment configuration (NODE_ID, REDIS_URL,
-/// NEIGHBOR_IDS, NODE_WS_PORT). Shared by every node-binary entry point
+/// NEIGHBOR_IDS, NODE_WS_PORT, NODE_CLIENT_IDLE_TIMEOUT_SECS). Shared by every node-binary entry point
 /// so the env contract stays in one place.
 #[derive(Clone, Debug)]
 pub struct NodeEnv {
@@ -30,11 +30,13 @@ pub struct NodeEnv {
     pub redis_url: String,
     pub neighbor_ids: Vec<Uuid>,
     pub ws_port: u16,
+    pub client_idle_timeout_secs: u64,
 }
 
 impl NodeEnv {
     /// Read the standard node env vars. `NODE_ID` is required; the rest
-    /// have defaults (Redis at `127.0.0.1:6379`, no neighbors, WS port `8080`).
+    /// have defaults (Redis at `127.0.0.1:6379`, no neighbors, WS port `8080`,
+    /// client idle timeout disabled).
     pub fn from_env() -> Result<Self, String> {
         let cluster_id =
             std::env::var("NODE_ID").map_err(|_| "NODE_ID env var required (UUID)".to_string())?;
@@ -55,11 +57,16 @@ impl NodeEnv {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8080);
+        let client_idle_timeout_secs: u64 = std::env::var("NODE_CLIENT_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         Ok(Self {
             cluster_id,
             redis_url,
             neighbor_ids,
             ws_port,
+            client_idle_timeout_secs,
         })
     }
 }
@@ -82,6 +89,13 @@ pub fn run_node_loop<F>(
 where
     F: FnMut(u64) -> Vec<EntityStateEntry>,
 {
+    let tick_rate_hz = crate::tick_rate::tick_rate_hz();
+    let client_idle_timeout_ticks = (std::env::var("NODE_CLIENT_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        * tick_rate_hz as f64) as u64;
+
     let mut core = NodeCore::new(NodeConfig {
         cluster_id,
         redis_url: redis_url.clone(),
@@ -89,6 +103,7 @@ where
         ws_port,
         // The standalone production node requires Redis; single-node mode is for the C-ABI/dev path.
         allow_single_node: false,
+        client_idle_timeout_ticks,
     })?;
 
     #[cfg(feature = "migration")]
@@ -103,7 +118,6 @@ where
         ),
     }
 
-    let tick_rate_hz = crate::tick_rate::tick_rate_hz();
     let interval = Duration::from_millis(1000 / tick_rate_hz);
     let dt_seconds = interval.as_secs_f64();
 

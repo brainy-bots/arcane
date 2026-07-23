@@ -240,6 +240,9 @@ pub struct NodeConfig {
     /// replication** (sim + client WS still work). Intended for engine/dev use without full infra
     /// (e.g. driving the C-ABI boundary locally); never silently degrade a production node.
     pub allow_single_node: bool,
+    /// Client-driven entity idle timeout in ticks. Entities with no client update for longer
+    /// than this period are despawned. `0` disables (default).
+    pub client_idle_timeout_ticks: u64,
 }
 
 /// Inputs the driver's ClusterSimulation needs this tick. Contains everything a
@@ -349,9 +352,13 @@ pub struct NodeCore {
     /// them — v1 stand-in for CLUSTER_REASSIGN client handoff.
     #[cfg(feature = "migration")]
     pin_feature: Option<String>,
-    /// entity -> last tick a client update arrived for it (pin liveness window).
+    /// entity -> last tick a client update arrived for it (pin liveness window and idle timeout).
     #[cfg(feature = "migration")]
     client_driven_last_seen: HashMap<Uuid, u64>,
+    /// Client-driven entity idle timeout in ticks. When enabled (>0), entities in
+    /// `client_driven_last_seen` with no update for this many ticks are despawned.
+    #[cfg(feature = "migration")]
+    client_idle_timeout_ticks: u64,
     /// D1 forwarding invariant (epic #287): inbound channel for input batches
     /// relayed by non-owner nodes. Drained in `drain_inputs` WITHOUT the
     /// forwarding check (loop safety: apply-if-owned or drop-and-count).
@@ -612,6 +619,8 @@ impl NodeCore {
             cluster_addrs,
             #[cfg(feature = "migration")]
             reconnect_last_hint: HashMap::new(),
+            #[cfg(feature = "migration")]
+            client_idle_timeout_ticks: cfg.client_idle_timeout_ticks,
         })
     }
 
@@ -686,10 +695,8 @@ impl NodeCore {
                 self.maybe_send_reconnect_hint(entity_id, owner);
                 continue;
             }
-            if self.pin_feature.is_some() {
-                self.client_driven_last_seen
-                    .insert(entry.entity_id, self.tick_count);
-            }
+            self.client_driven_last_seen
+                .insert(entry.entity_id, self.tick_count);
             out.client_updates.push(entry);
         }
         #[cfg(not(feature = "migration"))]
@@ -732,12 +739,9 @@ impl NodeCore {
                         || self.spawn_grace.contains_key(&entry.entity_id)
                     {
                         // A forwarded update is a live client session driving this
-                        // entity: pin liveness follows the SESSION, wherever the
-                        // ingress node is.
-                        if self.pin_feature.is_some() {
-                            self.client_driven_last_seen
-                                .insert(entry.entity_id, self.tick_count);
-                        }
+                        // entity: idle timeout follows the SESSION, wherever the ingress node is.
+                        self.client_driven_last_seen
+                            .insert(entry.entity_id, self.tick_count);
                         self.stats
                             .fwd_inputs_applied
                             .fetch_add(1, Ordering::Relaxed);
@@ -1022,6 +1026,25 @@ impl NodeCore {
 
         #[cfg(feature = "migration")]
         if self.tick_count.is_multiple_of(self.state_publish_interval) {
+            // Client-driven entity idle timeout: despawn entities whose last client
+            // update is older than the configured timeout. Only entities in
+            // `client_driven_last_seen` are eligible — sim-spawned entities are never touched.
+            if self.client_idle_timeout_ticks > 0 {
+                let cutoff = self
+                    .tick_count
+                    .saturating_sub(self.client_idle_timeout_ticks);
+                let to_remove: Vec<Uuid> = self
+                    .client_driven_last_seen
+                    .iter()
+                    .filter(|&(_, last_seen)| *last_seen < cutoff)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for id in to_remove {
+                    self.server.remove_entity(id);
+                    self.client_driven_last_seen.remove(&id);
+                }
+            }
+
             if let Some(ref publisher) = self.state_publisher {
                 // Pin liveness: an entity counts as client-driven while updates arrived
                 // within the last PIN_LIVENESS_TICKS. Prune stale records so entities
@@ -2260,6 +2283,79 @@ mod tests {
             assert_eq!(ownership.owner_of(entity_id), Some(foreign_cluster));
             assert!(!ownership.owns(entity_id, my_cluster));
             assert!(ownership.owns(entity_id, foreign_cluster));
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn client_driven_entity_despawned_after_idle_timeout() {
+            // Entity added via client update, no further updates → despawned after timeout ticks.
+            let entity_id = Uuid::from_u128(100);
+            let mut client_driven_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            let timeout_ticks = 100u64;
+            let current_tick = 150u64;
+
+            client_driven_last_seen.insert(entity_id, 49u64);
+
+            let cutoff = current_tick.saturating_sub(timeout_ticks);
+            let stale: Vec<Uuid> = client_driven_last_seen
+                .iter()
+                .filter(|&(_, last_seen)| *last_seen < cutoff)
+                .map(|(&id, _)| id)
+                .collect();
+
+            assert_eq!(
+                stale.len(),
+                1,
+                "entity older than timeout should be marked for despawn"
+            );
+            assert!(stale.contains(&entity_id));
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn client_driven_entity_refreshed_by_input_stays() {
+            // Entity refreshed by client or forwarded input → stays.
+            let entity_id = Uuid::from_u128(100);
+            let mut client_driven_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            let timeout_ticks = 100u64;
+            let current_tick = 150u64;
+
+            client_driven_last_seen.insert(entity_id, 120u64);
+
+            let cutoff = current_tick.saturating_sub(timeout_ticks);
+            let stale: Vec<Uuid> = client_driven_last_seen
+                .iter()
+                .filter(|&(_, last_seen)| *last_seen < cutoff)
+                .map(|(&id, _)| id)
+                .collect();
+
+            assert!(
+                stale.is_empty(),
+                "recently-updated entity should not be despawned"
+            );
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn sim_spawned_entities_not_affected_by_timeout() {
+            // Sim-spawned (non-client) entities are not in `client_driven_last_seen`,
+            // so they are never despawned by the idle timeout.
+            let _sim_entity = Uuid::from_u128(200);
+            let client_driven_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            let timeout_ticks = 100u64;
+            let current_tick = 150u64;
+
+            let cutoff = current_tick.saturating_sub(timeout_ticks);
+            let stale: Vec<Uuid> = client_driven_last_seen
+                .iter()
+                .filter(|&(_, last_seen)| *last_seen < cutoff)
+                .map(|(&id, _)| id)
+                .collect();
+
+            assert!(
+                stale.is_empty(),
+                "sim-spawned entities not in client_driven_last_seen should not be despawned"
+            );
         }
     }
 }

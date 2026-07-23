@@ -1,11 +1,11 @@
 //! ArcaneManager (IN-01) — central coordinator.
 
-use arcane_core::{types::Vec3, IServerPool, ServerHandle};
 #[cfg(feature = "migration")]
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
     types::Vec2,
 };
+use arcane_core::{types::Vec3, IServerPool, ServerHandle};
 use arcane_pool::LocalPool;
 use arcane_spatial::SpatialIndex;
 use std::collections::HashMap;
