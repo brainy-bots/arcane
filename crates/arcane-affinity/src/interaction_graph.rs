@@ -143,16 +143,19 @@ impl InteractionGraph {
     /// Iterate all entities with non-zero interaction weight with the given entity.
     /// O(degree) via the adjacency index (not a full O(total pairs) scan).
     pub fn neighbors(&self, entity: Uuid) -> impl Iterator<Item = (Uuid, f64)> + '_ {
-        self.adjacency.get(&entity).into_iter().flat_map(move |set| {
-            set.iter().map(move |&other| {
-                let w = self
-                    .weights
-                    .get(&EntityPair::new(entity, other))
-                    .map(|e| e.weight)
-                    .unwrap_or(0.0);
-                (other, w)
+        self.adjacency
+            .get(&entity)
+            .into_iter()
+            .flat_map(move |set| {
+                set.iter().map(move |&other| {
+                    let w = self
+                        .weights
+                        .get(&EntityPair::new(entity, other))
+                        .map(|e| e.weight)
+                        .unwrap_or(0.0);
+                    (other, w)
+                })
             })
-        })
     }
 
     /// Returns true if the pair has any Hard (Joint) edge.
@@ -363,7 +366,7 @@ mod tests {
     fn assert_neighbors_match_bruteforce(g: &InteractionGraph, entities: &[Uuid]) {
         for &e in entities {
             let mut indexed: Vec<(Uuid, f64)> = g.neighbors(e).collect();
-            indexed.sort_by(|a, b| a.0.cmp(&b.0));
+            indexed.sort_by_key(|a| a.0);
             let mut brute: Vec<(Uuid, f64)> = g
                 .pairs()
                 .filter_map(|(a, b, w)| {
@@ -376,7 +379,7 @@ mod tests {
                     }
                 })
                 .collect();
-            brute.sort_by(|a, b| a.0.cmp(&b.0));
+            brute.sort_by_key(|a| a.0);
             assert_eq!(indexed, brute, "neighbors index/bruteforce mismatch");
         }
     }

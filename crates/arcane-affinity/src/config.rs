@@ -1,3 +1,5 @@
+use crate::objective::ObjectiveWeights;
+
 /// Edge rule: entities with equal values for a feature get a dynamic edge.
 #[derive(Debug, Clone)]
 pub struct EdgeRule {
@@ -13,6 +15,9 @@ pub struct EdgeRule {
 /// fields were removed with that engine.
 #[derive(Debug, Clone)]
 pub struct AffinityConfig {
+    // Partition objective (epic #293).
+    pub objective: ObjectiveWeights,
+
     // Interaction Graph
     pub decay_factor: f64,
     pub gc_threshold: f64,
@@ -61,6 +66,8 @@ pub struct AffinityConfig {
 impl Default for AffinityConfig {
     fn default() -> Self {
         Self {
+            objective: ObjectiveWeights::default(),
+
             decay_factor: 0.97,
             gc_threshold: 0.001,
             gc_interval: 100,

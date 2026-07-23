@@ -281,7 +281,10 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
             .filter(|f| f.from_cluster == cluster_id || f.to_cluster == cluster_id)
             .collect();
 
-        let owned: Vec<Uuid> = owned_by_cluster.get(&cluster_id).cloned().unwrap_or_default();
+        let owned: Vec<Uuid> = owned_by_cluster
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_default();
 
         // Interest candidates: foreign neighbors of owned entities, dedup by
         // max p. p only — tier assignment is the worker's rate-law job.
