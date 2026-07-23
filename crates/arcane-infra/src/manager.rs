@@ -381,6 +381,77 @@ fn build_partition_decisions(
     desired
 }
 
+/// Place a new entity based on cluster sizes, affinity, and the partition objective.
+/// Returns the best cluster ID, or None if no clusters are available.
+/// Stale clusters are excluded from placement.
+#[cfg(feature = "migration")]
+pub fn place_for_join(
+    entity_data: &[(Uuid, Uuid, Vec3)],
+    known_clusters: &[Uuid],
+    stale_clusters: &std::collections::HashSet<Uuid>,
+    spawn_pos: Option<Vec3>,
+    config: &arcane_affinity::config::AffinityConfig,
+) -> Option<Uuid> {
+    if known_clusters.is_empty() {
+        return None;
+    }
+
+    // Build a map of cluster_id -> entity count.
+    let mut cluster_sizes: HashMap<Uuid, usize> = HashMap::new();
+    for (_, cluster_id, _) in entity_data {
+        *cluster_sizes.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    // Ensure all known clusters are present (even empty ones).
+    for &cluster_id in known_clusters {
+        cluster_sizes.entry(cluster_id).or_insert(0);
+    }
+
+    // Compute affinity: proximity-weighted sum of nearby players per cluster.
+    let mut affinities: HashMap<Uuid, f64> = HashMap::new();
+
+    if let Some(spawn) = spawn_pos {
+        let radius = config.proximity_radius;
+        let radius_sq = radius * radius;
+
+        for (_entity_id, cluster_id, pos) in entity_data {
+            let dx = pos.x - spawn.x;
+            let dz = pos.z - spawn.z;
+            if dx * dx + dz * dz <= radius_sq {
+                *affinities.entry(*cluster_id).or_insert(0.0) += config.proximity_weight;
+            }
+        }
+    }
+
+    // Score each cluster: -affinity + crowding_marginal + open_cost_if_empty.
+    // Ties broken by lowest cluster Uuid. Exclude stale clusters.
+    let mut best_cluster: Option<Uuid> = None;
+    let mut best_score = f64::INFINITY;
+
+    let mut clusters_sorted = known_clusters.to_vec();
+    clusters_sorted.sort();
+
+    for &cluster_id in &clusters_sorted {
+        if stale_clusters.contains(&cluster_id) {
+            continue;
+        }
+
+        let size = *cluster_sizes.get(&cluster_id).unwrap_or(&0);
+        let affinity = *affinities.get(&cluster_id).unwrap_or(&0.0);
+
+        let crowding = crowding_marginal(size, &config.objective);
+        let open_cost = open_cost_if_empty(size, &config.objective);
+        let score = -affinity + crowding + open_cost;
+
+        if score < best_score {
+            best_score = score;
+            best_cluster = Some(cluster_id);
+        }
+    }
+
+    best_cluster
+}
+
 impl ArcaneManager {
     pub fn new(pool: Arc<dyn IServerPool>, spatial_index: SpatialIndex) -> Self {
         Self {
@@ -1053,61 +1124,14 @@ impl ArcaneManager {
     /// Returns `None` when no clusters are known.
     #[cfg(feature = "migration")]
     pub fn place_new_entity(&self, spawn_pos: Option<arcane_core::Vec3>) -> Option<Uuid> {
-        if self.known_clusters.is_empty() {
-            return None;
-        }
-
-        // Build a map of cluster_id -> entity count.
         let entity_data = self.spatial_index.snapshot_entities();
-        let mut cluster_sizes: HashMap<Uuid, usize> = HashMap::new();
-        for (_, cluster_id, _) in &entity_data {
-            *cluster_sizes.entry(*cluster_id).or_insert(0) += 1;
-        }
-
-        // Ensure all known clusters are present (even empty ones).
-        for &cluster_id in &self.known_clusters {
-            cluster_sizes.entry(cluster_id).or_insert(0);
-        }
-
-        // Compute affinity: proximity-weighted sum of nearby players per cluster.
-        let mut affinities: HashMap<Uuid, f64> = HashMap::new();
-
-        if let Some(spawn) = spawn_pos {
-            let radius = self.config.proximity_radius;
-            let radius_sq = radius * radius;
-
-            for (_entity_id, cluster_id, pos) in entity_data {
-                let dx = pos.x - spawn.x;
-                let dz = pos.z - spawn.z;
-                if dx * dx + dz * dz <= radius_sq {
-                    *affinities.entry(cluster_id).or_insert(0.0) += self.config.proximity_weight;
-                }
-            }
-        }
-
-        // Score each cluster: -affinity + crowding_marginal + open_cost_if_empty.
-        // Ties broken by lowest cluster Uuid.
-        let mut best_cluster: Option<Uuid> = None;
-        let mut best_score = f64::INFINITY;
-
-        let mut clusters_sorted = self.known_clusters.clone();
-        clusters_sorted.sort();
-
-        for &cluster_id in &clusters_sorted {
-            let size = *cluster_sizes.get(&cluster_id).unwrap_or(&0);
-            let affinity = *affinities.get(&cluster_id).unwrap_or(&0.0);
-
-            let crowding = crowding_marginal(size, &self.config.objective);
-            let open_cost = open_cost_if_empty(size, &self.config.objective);
-            let score = -affinity + crowding + open_cost;
-
-            if score < best_score {
-                best_score = score;
-                best_cluster = Some(cluster_id);
-            }
-        }
-
-        best_cluster
+        place_for_join(
+            &entity_data,
+            &self.known_clusters,
+            &std::collections::HashSet::new(),
+            spawn_pos,
+            &self.config,
+        )
     }
 }
 
