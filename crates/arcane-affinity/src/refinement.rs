@@ -1,14 +1,22 @@
 use crate::interaction_graph::Colocation;
+use crate::objective::{crowding_marginal, ObjectiveWeights};
 use crate::partition::{Partition, WeightedEdge};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Configuration for KL/FM-style local refinement.
-#[derive(Clone, Copy, Debug)]
+/// Configuration for KL/FM-style local refinement (epic #293).
+#[derive(Clone, Debug)]
 pub struct RefineConfig {
     pub max_passes: usize,
+    /// Deprecated: capacity is now managed by the objective (alpha crowding cost).
+    /// Kept for compatibility but ignored in objective-driven mode.
     pub capacity: usize,
     pub min_gain: f64,
+    /// Objective weights: balance cut, crowding, instance cost, and churn.
+    pub weights: ObjectiveWeights,
+    /// Entities that were moved from their standing assignment during seed phase.
+    /// Refinement applies μ (move cost) only to entities not in this set.
+    pub moved_in_seed: std::collections::HashSet<Uuid>,
 }
 
 impl Default for RefineConfig {
@@ -17,6 +25,8 @@ impl Default for RefineConfig {
             max_passes: 4,
             capacity: 0,
             min_gain: 0.0,
+            weights: ObjectiveWeights::default(),
+            moved_in_seed: std::collections::HashSet::new(),
         }
     }
 }
@@ -258,7 +268,36 @@ pub fn refine(
                         continue;
                     }
 
-                    let gain = external[target_part] - internal;
+                    // Objective-driven gain: ΔJ = Δcut + Δcrowding + Δopen + Δmove
+                    // Cut gain: positive if reducing cut cost
+                    let cut_gain = external[target_part] - internal;
+
+                    // Crowding gain: cost of adding to target + cost of removing from current
+                    let crowding_gain =
+                        crowding_marginal(partition_sizes[entity_part], &config.weights)
+                            - crowding_marginal(partition_sizes[target_part], &config.weights);
+
+                    // Open cost deltas: β·(change in #non-empty clusters)
+                    let open_delta = if partition_sizes[entity_part] == 1 {
+                        // Current partition becomes empty; save its open cost
+                        config.weights.beta
+                    } else {
+                        0.0
+                    } - if partition_sizes[target_part] == 0 {
+                        // Target partition becomes non-empty; incur its open cost
+                        config.weights.beta
+                    } else {
+                        0.0
+                    };
+
+                    // Move cost: μ if entity has not moved yet in seed phase
+                    let move_cost = if config.moved_in_seed.contains(entity) {
+                        0.0
+                    } else {
+                        config.weights.mu
+                    };
+
+                    let gain = cut_gain + crowding_gain + open_delta - move_cost;
                     if gain <= config.min_gain {
                         continue;
                     }
@@ -662,6 +701,7 @@ mod tests {
             max_passes: 8,
             capacity: 2,
             min_gain: 0.0,
+            ..RefineConfig::default()
         };
         let refined = refine(&start, &edges, 2, &cfg);
         assert_eq!(
