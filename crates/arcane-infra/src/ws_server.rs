@@ -1442,7 +1442,11 @@ mod tests {
 
         assert_eq!(
             assembled,
-            pre_tick.shared_full_frame.as_ref().expect("full frame built when AOI off").as_slice(),
+            pre_tick
+                .shared_full_frame
+                .as_ref()
+                .expect("full frame built when AOI off")
+                .as_slice(),
             "shared_full_frame must be byte-identical to assemble_outbound_frame(tick, None)"
         );
     }

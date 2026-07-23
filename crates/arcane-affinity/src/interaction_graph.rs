@@ -143,16 +143,19 @@ impl InteractionGraph {
     /// Iterate all entities with non-zero interaction weight with the given entity.
     /// O(degree) via the adjacency index (not a full O(total pairs) scan).
     pub fn neighbors(&self, entity: Uuid) -> impl Iterator<Item = (Uuid, f64)> + '_ {
-        self.adjacency.get(&entity).into_iter().flat_map(move |set| {
-            set.iter().map(move |&other| {
-                let w = self
-                    .weights
-                    .get(&EntityPair::new(entity, other))
-                    .map(|e| e.weight)
-                    .unwrap_or(0.0);
-                (other, w)
+        self.adjacency
+            .get(&entity)
+            .into_iter()
+            .flat_map(move |set| {
+                set.iter().map(move |&other| {
+                    let w = self
+                        .weights
+                        .get(&EntityPair::new(entity, other))
+                        .map(|e| e.weight)
+                        .unwrap_or(0.0);
+                    (other, w)
+                })
             })
-        })
     }
 
     /// Returns true if the pair has any Hard (Joint) edge.
