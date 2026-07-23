@@ -2,7 +2,7 @@
 //!
 //! The Manager runs the full control loop: fetches entity state from Redis, evaluates
 //! the affinity model, routes flips to clusters via RedisInboxBus, and serves /join
-//! requests with configurable assignment policies.
+//! requests using the partition objective.
 //!
 //! Env contract (documented at startup):
 //!   MANAGER_CLUSTERS — REQUIRED: comma-separated `cluster_id:host:port` entries
@@ -10,30 +10,30 @@
 //!   MANAGER_HTTP_PORT — optional; default 8081.
 //!   REDIS_URL — optional; default "redis://127.0.0.1:6379".
 //!   MANAGER_CADENCE_MS — optional; default 1000. Control loop cycle interval.
-//!   MANAGER_JOIN_POLICY — optional; default "least-loaded". Join policy:
-//!     "least-loaded" (default): cluster with fewest owned entities; tie → registration order.
-//!     "first-cluster": always first registered cluster.
-//!     "round-robin": legacy counter-based round-robin.
-//!   MANAGER_TARGET_CLUSTERS — optional; partition into at most N clusters. Parsed but NOT
-//!     wired in v1 (TODO: integrate with partitioner; currently no-op).
 //!   MANAGER_CAPACITY_FACTOR — optional float; default uses AffinityConfig default (~1.5).
 //!   MANAGER_STALE_LIMIT_MS — optional; default 3 * cadence. Staleness window for clusters.
+//!   /join endpoint: accepts optional `?x=&y=&z=` spawn position hint query params.
+//!     Joins are placed by the partition objective (epic #293).
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use arcane_core::Vec3;
-use arcane_infra::manager::ArcaneManager;
+use arcane_infra::manager::{place_for_join, ArcaneManager};
 use arcane_infra::manager_runtime::ManagerRuntime;
 use arcane_infra::node_inbox::RedisInboxBus;
 use arcane_infra::router_core::RouterConfig;
 use arcane_infra::state_keys::RedisStateSource;
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
+use serde::Deserialize;
 use serde::Serialize;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -53,30 +53,30 @@ struct ClusterReg {
     port: u16,
 }
 
-/// Join policy selection.
-#[derive(Clone, Debug, PartialEq)]
-enum JoinPolicy {
-    LeastLoaded,
-    FirstCluster,
-    RoundRobin,
-}
-
-/// Shared state: assignments, stale clusters, registered order.
+/// Shared state: assignments, stale clusters, registered order, entity positions, affinity config.
 /// Refreshed each control cycle; accessed by /join handler.
 #[derive(Clone, Debug)]
 struct JoinState {
     assignments: HashMap<Uuid, Uuid>,
     stale_clusters: HashSet<Uuid>,
     registration_order: Vec<Uuid>,
+    entity_data: Vec<(Uuid, Uuid, Vec3)>,
+    affinity_config: arcane_affinity::config::AffinityConfig,
 }
 
-/// Handler state: clusters, policy, join state, round-robin counter.
+/// Handler state: clusters, join state.
 #[derive(Clone)]
 struct ManagerState {
     clusters: Vec<ClusterReg>,
-    policy: JoinPolicy,
     join_state: Arc<Mutex<JoinState>>,
-    rr_counter: Arc<AtomicUsize>,
+}
+
+/// Query parameters for /join endpoint.
+#[derive(Debug, Deserialize)]
+struct JoinParams {
+    x: Option<f32>,
+    y: Option<f32>,
+    z: Option<f32>,
 }
 
 fn parse_clusters(s: &str) -> Result<Vec<ClusterReg>, String> {
@@ -109,73 +109,27 @@ fn parse_clusters(s: &str) -> Result<Vec<ClusterReg>, String> {
     Ok(clusters)
 }
 
-fn parse_join_policy(s: &str) -> JoinPolicy {
-    match s.to_lowercase().as_str() {
-        "first-cluster" => JoinPolicy::FirstCluster,
-        "round-robin" => JoinPolicy::RoundRobin,
-        _ => JoinPolicy::LeastLoaded, // default
-    }
-}
-
-/// Select join cluster based on policy.
-fn select_join_cluster(
-    policy: &JoinPolicy,
-    join_state: &JoinState,
-    _clusters: &[ClusterReg],
-    rr_counter: &AtomicUsize,
-) -> Option<Uuid> {
-    match policy {
-        JoinPolicy::FirstCluster => join_state.registration_order.first().and_then(|&id| {
-            if join_state.stale_clusters.contains(&id) {
-                None
-            } else {
-                Some(id)
-            }
-        }),
-        JoinPolicy::RoundRobin => {
-            let live_clusters: Vec<Uuid> = join_state
-                .registration_order
-                .iter()
-                .filter(|id| !join_state.stale_clusters.contains(id))
-                .copied()
-                .collect();
-            if live_clusters.is_empty() {
-                None
-            } else {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) % live_clusters.len();
-                Some(live_clusters[idx])
-            }
-        }
-        JoinPolicy::LeastLoaded => {
-            let mut best_cluster: Option<(Uuid, usize)> = None;
-            for &cluster_id in &join_state.registration_order {
-                if join_state.stale_clusters.contains(&cluster_id) {
-                    continue;
-                }
-                let count = join_state
-                    .assignments
-                    .values()
-                    .filter(|&&c| c == cluster_id)
-                    .count();
-                match best_cluster {
-                    None => best_cluster = Some((cluster_id, count)),
-                    Some((_, best_count)) => {
-                        if count < best_count {
-                            best_cluster = Some((cluster_id, count));
-                        }
-                    }
-                }
-            }
-            best_cluster.map(|(id, _)| id)
-        }
-    }
-}
-
-async fn join_handler(State(s): State<ManagerState>) -> Json<JoinResponse> {
+async fn join_handler(
+    State(s): State<ManagerState>,
+    Query(params): Query<JoinParams>,
+) -> Json<JoinResponse> {
     let join_state = s.join_state.lock().unwrap();
-    let cluster_id = select_join_cluster(&s.policy, &join_state, &s.clusters, &s.rr_counter)
-        .and_then(|id| s.clusters.iter().find(|c| c.id == id).cloned())
-        .unwrap_or_else(|| s.clusters[0].clone());
+
+    let spawn_pos = if let (Some(x), Some(y), Some(z)) = (params.x, params.y, params.z) {
+        Some(Vec3::new(x as f64, y as f64, z as f64))
+    } else {
+        None
+    };
+
+    let cluster_id = place_for_join(
+        &join_state.entity_data,
+        &join_state.registration_order,
+        &join_state.stale_clusters,
+        spawn_pos,
+        &join_state.affinity_config,
+    )
+    .and_then(|id| s.clusters.iter().find(|c| c.id == id).cloned())
+    .unwrap_or_else(|| s.clusters[0].clone());
     drop(join_state);
 
     Json(JoinResponse {
@@ -237,6 +191,7 @@ async fn control_loop(
     capacity_factor: Option<f64>,
     stale_limit_ms: u64,
     join_state: Arc<Mutex<JoinState>>,
+    affinity_config: arcane_affinity::config::AffinityConfig,
 ) {
     let cluster_ids: Vec<Uuid> = clusters.iter().map(|c| c.id).collect();
     let mut cycle_count = 0u64;
@@ -360,14 +315,26 @@ async fn control_loop(
             runtime.set_blocked_destinations(stale_clusters.clone());
             let cycle_result = runtime.run_cycle();
 
-            // e. Update join state with current assignments.
+            // e. Update join state with current assignments and entity data.
             let assignments = runtime.assignments().clone();
             let registration_order: Vec<Uuid> = cluster_ids.clone();
+            let entity_data: Vec<(Uuid, Uuid, Vec3)> = records
+                .iter()
+                .map(|r| {
+                    (
+                        r.entity_id,
+                        r.cluster_id,
+                        Vec3::new(r.position.x, 0.0, r.position.y),
+                    )
+                })
+                .collect();
             {
                 let mut js = join_state.lock().unwrap();
                 js.assignments = assignments;
                 js.stale_clusters = stale_clusters;
                 js.registration_order = registration_order;
+                js.entity_data = entity_data;
+                js.affinity_config = affinity_config.clone();
             }
 
             // f. Log cycle summary every N cycles.
@@ -417,10 +384,6 @@ async fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    let policy = env::var("MANAGER_JOIN_POLICY")
-        .map(|s| parse_join_policy(&s))
-        .unwrap_or(JoinPolicy::LeastLoaded);
-
     let capacity_factor = env::var("MANAGER_CAPACITY_FACTOR")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -430,32 +393,39 @@ async fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3 * cadence_ms);
 
-    // MANAGER_TARGET_CLUSTERS: parsed but NOT wired in v1.
-    let _target_clusters = env::var("MANAGER_TARGET_CLUSTERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok());
-    if _target_clusters.is_some() {
-        eprintln!("arcane-manager: MANAGER_TARGET_CLUSTERS parsed but not yet wired (TODO)");
-    }
-
     eprintln!(
-        "arcane-manager: started — {} cluster(s), policy={:?}, cadence={}ms, redis={}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}",
         clusters.len(),
-        policy,
         cadence_ms,
         redis_url
     );
+
+    // Build affinity config (same as in control loop).
+    let affinity_config = if capacity_factor.is_some() {
+        let mut config = arcane_affinity::config::AffinityConfig {
+            ..Default::default()
+        };
+        if let Some(factor) = capacity_factor {
+            config.capacity_factor = factor;
+        }
+        config
+    } else {
+        arcane_affinity::config::AffinityConfig::default()
+    };
 
     // Initialize join state.
     let join_state = Arc::new(Mutex::new(JoinState {
         assignments: HashMap::new(),
         stale_clusters: HashSet::new(),
         registration_order: clusters.iter().map(|c| c.id).collect(),
+        entity_data: Vec::new(),
+        affinity_config: affinity_config.clone(),
     }));
 
     // Spawn control loop in background.
     let loop_join_state = join_state.clone();
     let loop_clusters = clusters.clone();
+    let loop_affinity_config = affinity_config.clone();
     tokio::spawn(async move {
         control_loop(
             loop_clusters,
@@ -464,6 +434,7 @@ async fn main() -> Result<(), String> {
             capacity_factor,
             stale_limit_ms,
             loop_join_state,
+            loop_affinity_config,
         )
         .await
     });
@@ -471,9 +442,7 @@ async fn main() -> Result<(), String> {
     // Set up HTTP server.
     let state = ManagerState {
         clusters: clusters.clone(),
-        policy,
         join_state,
-        rr_counter: Arc::new(AtomicUsize::new(0)),
     };
 
     let app = Router::new()
@@ -572,221 +541,90 @@ mod tests {
     }
 
     #[test]
-    fn parse_join_policy_least_loaded() {
-        assert_eq!(parse_join_policy("least-loaded"), JoinPolicy::LeastLoaded);
-        assert_eq!(parse_join_policy("LEAST-LOADED"), JoinPolicy::LeastLoaded);
-    }
-
-    #[test]
-    fn parse_join_policy_first_cluster() {
-        assert_eq!(parse_join_policy("first-cluster"), JoinPolicy::FirstCluster);
-    }
-
-    #[test]
-    fn parse_join_policy_round_robin() {
-        assert_eq!(parse_join_policy("round-robin"), JoinPolicy::RoundRobin);
-    }
-
-    #[test]
-    fn parse_join_policy_default() {
-        assert_eq!(parse_join_policy("unknown"), JoinPolicy::LeastLoaded);
-    }
-
-    #[test]
-    fn select_join_cluster_least_loaded() {
-        let mut assignments = HashMap::new();
-        assignments.insert(Uuid::from_u128(1), Uuid::from_u128(10));
-        assignments.insert(Uuid::from_u128(2), Uuid::from_u128(10));
-        assignments.insert(Uuid::from_u128(3), Uuid::from_u128(20));
-
+    fn join_placement_empty_world() {
         let c1 = Uuid::from_u128(10);
         let c2 = Uuid::from_u128(20);
+        let known_clusters = vec![c1, c2];
+        let entity_data = vec![];
+        let stale_clusters = std::collections::HashSet::new();
+        let spawn_pos = None;
+        let config = arcane_affinity::config::AffinityConfig::default();
 
-        let join_state = JoinState {
-            assignments,
-            stale_clusters: HashSet::new(),
-            registration_order: vec![c1, c2],
-        };
-
-        let clusters = vec![
-            ClusterReg {
-                id: c1,
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            ClusterReg {
-                id: c2,
-                host: "127.0.0.1".to_string(),
-                port: 8081,
-            },
-        ];
-
-        let rr_counter = Arc::new(AtomicUsize::new(0));
-        let selected = select_join_cluster(
-            &JoinPolicy::LeastLoaded,
-            &join_state,
-            &clusters,
-            &rr_counter,
+        use arcane_infra::manager::place_for_join;
+        let selected = place_for_join(
+            &entity_data,
+            &known_clusters,
+            &stale_clusters,
+            spawn_pos,
+            &config,
         )
-        .expect("select failed");
+        .expect("place should succeed");
 
-        assert_eq!(
-            selected, c2,
-            "least-loaded should pick cluster with fewest entities"
+        assert!(
+            known_clusters.contains(&selected),
+            "should pick a known cluster"
         );
     }
 
     #[test]
-    fn select_join_cluster_least_loaded_tie() {
-        let mut assignments = HashMap::new();
-        assignments.insert(Uuid::from_u128(1), Uuid::from_u128(10));
-        assignments.insert(Uuid::from_u128(2), Uuid::from_u128(20));
-
+    fn join_placement_with_spawn_proximity() {
         let c1 = Uuid::from_u128(10);
         let c2 = Uuid::from_u128(20);
+        let known_clusters = vec![c1, c2];
 
-        let join_state = JoinState {
-            assignments,
-            stale_clusters: HashSet::new(),
-            registration_order: vec![c1, c2],
-        };
+        let e1 = Uuid::from_u128(1);
+        let e2 = Uuid::from_u128(2);
+        let e3 = Uuid::from_u128(3);
 
-        let clusters = vec![
-            ClusterReg {
-                id: c1,
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            ClusterReg {
-                id: c2,
-                host: "127.0.0.1".to_string(),
-                port: 8081,
-            },
+        let entity_data = vec![
+            (e1, c1, Vec3::new(0.0, 0.0, 0.0)),
+            (e2, c1, Vec3::new(1.0, 0.0, 1.0)),
+            (e3, c2, Vec3::new(100.0, 0.0, 100.0)),
         ];
 
-        let rr_counter = Arc::new(AtomicUsize::new(0));
-        let selected = select_join_cluster(
-            &JoinPolicy::LeastLoaded,
-            &join_state,
-            &clusters,
-            &rr_counter,
+        let stale_clusters = std::collections::HashSet::new();
+        let spawn_pos = Some(Vec3::new(0.5, 0.0, 0.5));
+        let config = arcane_affinity::config::AffinityConfig::default();
+
+        use arcane_infra::manager::place_for_join;
+        let selected = place_for_join(
+            &entity_data,
+            &known_clusters,
+            &stale_clusters,
+            spawn_pos,
+            &config,
         )
-        .expect("select failed");
+        .expect("place should succeed");
 
         assert_eq!(
             selected, c1,
-            "least-loaded tie should pick registration order"
+            "should prefer cluster with nearby entities (c1 has proximity affinity)"
         );
     }
 
     #[test]
-    fn select_join_cluster_first_cluster() {
+    fn join_placement_excludes_stale() {
         let c1 = Uuid::from_u128(10);
         let c2 = Uuid::from_u128(20);
+        let known_clusters = vec![c1, c2];
+        let entity_data = vec![];
 
-        let join_state = JoinState {
-            assignments: HashMap::new(),
-            stale_clusters: HashSet::new(),
-            registration_order: vec![c1, c2],
-        };
+        let mut stale_clusters = std::collections::HashSet::new();
+        stale_clusters.insert(c1);
 
-        let clusters = vec![
-            ClusterReg {
-                id: c1,
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            ClusterReg {
-                id: c2,
-                host: "127.0.0.1".to_string(),
-                port: 8081,
-            },
-        ];
+        let spawn_pos = None;
+        let config = arcane_affinity::config::AffinityConfig::default();
 
-        let rr_counter = Arc::new(AtomicUsize::new(0));
-        let selected = select_join_cluster(
-            &JoinPolicy::FirstCluster,
-            &join_state,
-            &clusters,
-            &rr_counter,
+        use arcane_infra::manager::place_for_join;
+        let selected = place_for_join(
+            &entity_data,
+            &known_clusters,
+            &stale_clusters,
+            spawn_pos,
+            &config,
         )
-        .expect("select failed");
+        .expect("place should succeed");
 
-        assert_eq!(selected, c1);
-    }
-
-    #[test]
-    fn select_join_cluster_round_robin() {
-        let c1 = Uuid::from_u128(10);
-        let c2 = Uuid::from_u128(20);
-
-        let join_state = JoinState {
-            assignments: HashMap::new(),
-            stale_clusters: HashSet::new(),
-            registration_order: vec![c1, c2],
-        };
-
-        let clusters = vec![
-            ClusterReg {
-                id: c1,
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            ClusterReg {
-                id: c2,
-                host: "127.0.0.1".to_string(),
-                port: 8081,
-            },
-        ];
-
-        let rr_counter = Arc::new(AtomicUsize::new(0));
-
-        let s1 = select_join_cluster(&JoinPolicy::RoundRobin, &join_state, &clusters, &rr_counter)
-            .expect("select failed");
-        let s2 = select_join_cluster(&JoinPolicy::RoundRobin, &join_state, &clusters, &rr_counter)
-            .expect("select failed");
-
-        assert_eq!(s1, c1);
-        assert_eq!(s2, c2);
-    }
-
-    #[test]
-    fn select_join_cluster_excludes_stale() {
-        let c1 = Uuid::from_u128(10);
-        let c2 = Uuid::from_u128(20);
-
-        let mut stale = HashSet::new();
-        stale.insert(c1);
-
-        let join_state = JoinState {
-            assignments: HashMap::new(),
-            stale_clusters: stale,
-            registration_order: vec![c1, c2],
-        };
-
-        let clusters = vec![
-            ClusterReg {
-                id: c1,
-                host: "127.0.0.1".to_string(),
-                port: 8080,
-            },
-            ClusterReg {
-                id: c2,
-                host: "127.0.0.1".to_string(),
-                port: 8081,
-            },
-        ];
-
-        let rr_counter = Arc::new(AtomicUsize::new(0));
-
-        let selected = select_join_cluster(
-            &JoinPolicy::LeastLoaded,
-            &join_state,
-            &clusters,
-            &rr_counter,
-        )
-        .expect("select failed");
-
-        assert_eq!(selected, c2, "stale clusters should be excluded");
+        assert_eq!(selected, c2, "should exclude stale cluster c1 and pick c2");
     }
 }
