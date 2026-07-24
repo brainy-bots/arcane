@@ -45,7 +45,8 @@ These are first-pass estimates and will be revised as more genres are analyzed a
 | 14 | [Linear persistent entities](#14-linear-persistent-entities) | Anti-duplication guarantee for valuable transferable items | ARPGs, MMORPGs, Survival, Trading-card, Economy-heavy games | Medium | Important |
 | 15 | [Activity-based world simulation hooks](#15-activity-based-world-simulation-hooks) | On-reactivation fast-forward for dormant regions | Survival, Factory/automation, Life sims, Persistent worlds | Low | Niche |
 | 16 | [Structural integrity graph](#16-structural-integrity-graph) | Support graph with placement validation and cascade queries | Survival, Sandbox, Building games, Destruction-heavy Shooters | Medium | Important |
-| 17 | [Entity session lifecycle](#17-entity-session-lifecycle) | Connect/disconnect/reconnect/leave paths with configurable persistence ladder | Universal | Low | Essential |
+| 17 | [Session relay](#17-session-relay) | Edge ingress tier: stable client connection, migration handoff, fan-out collapse | MMORPGs, Action MMOs, Persistent worlds; opt-in ops tier for session games | High | Important |
+| 18 | [Entity session lifecycle](#18-entity-session-lifecycle) | Connect/disconnect/reconnect/leave paths with configurable persistence ladder | Universal | Low | Essential |
 
 ---
 
@@ -77,7 +78,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 | **Cluster management** | #5, #15 | clustering decision (`build_partition_decisions`) / tier system: authority partitioning |
 | **Composite entities** | #10, #11, #12 | Hierarchical relationships, transforms, input routing |
 | **Validation** | #7 | Inbound path: server-side checks on client claims |
-| **Infrastructure** | #9, #16 | Self-contained subsystems with own transport or data structures |
+| **Infrastructure** | #9, #16, #17 | Self-contained subsystems with own transport or data structures |
 
 <details>
 <summary>Detailed group breakdown</summary>
@@ -104,7 +105,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 
 **Validation layer** — #7 (server-side input validation) runs on the inbound path (client → server). Other primitives (#3, #12, #13) contribute validation inputs but don't compete for the same hook.
 
-**Infrastructure services** — #9 (spatial voice) has its own transport stack. #16 (structural integrity graph) is a data structure queried by #5 during destruction events but doesn't participate in the tick loop or outbound pipeline. Both are self-contained.
+**Infrastructure services** — #9 (spatial voice) has its own transport stack. #16 (structural integrity graph) is a data structure queried by #5 during destruction events but doesn't participate in the tick loop or outbound pipeline. #17 (session relay) sits entirely outside the node process — it terminates client connections and speaks the existing wire protocol upstream, so nodes cannot distinguish a relay from a direct client. All three are self-contained.
 
 </details>
 
@@ -593,7 +594,45 @@ A third watchpoint: graph staleness during merges. If a merge region forms for d
 
 ---
 
-### 17. Entity session lifecycle
+### 17. Session relay
+
+**What:** An edge ingress tier that terminates client connections and speaks the existing wire protocol upstream to nodes, so the node-facing protocol is identical whether a client or a relay is on the other end — nodes never know the difference. A client's session is assigned to a relay by **real-life network geography** (lowest ping to the client), and that assignment is sticky: relays never migrate a session because of in-game position. In-game locality (which cluster owns the player's entity) and real-life locality (which relay terminates the connection) are two orthogonal localities, and the relay is the component that bridges them. The relay maintains a session table mapping each session to the node currently owning its entity, redirects upstream traffic when ownership migrates, and can subscribe once per cluster and fan out locally to its attached clients.
+
+The primitive is a strict-superset ladder of capabilities in one binary, enabled by configuration:
+
+| Tier | Capability | Who needs it |
+|------|-----------|--------------|
+| **Direct connect** (no relay) | Client ↔ node, existing protocol | Fighting games, co-op, self-hosted — the majority of titles |
+| **Passthrough** | 1:1 proxy: TLS termination, IP masking / DDoS absorption, stable address across server restarts, connection metrics | Session games wanting ops hygiene |
+| **Session relay** | Session table + migration-aware upstream redirect (invisible to the client) | Multi-cluster games with player migration |
+| **Subscribing relay** | Per-cluster subscriptions + local fan-out + slow relay-shard optimizer (interest-overlap, make-before-break session moves) | MMO-scale regional fleets |
+
+Deployment model: platform-operated **shared regional hosts** running **per-game relay containers**. Container isolation keeps games separate; host-level aggregation restores the economics for small games that could never justify a dedicated regional fleet.
+
+The client contract is deliberately tiny and tier-agnostic — three verbs total: (1) `/join` returns an address (node or relay; the client can't tell and doesn't care), (2) stream on the connection it has, (3) on a `RECONNECT{addr, token}` control frame, make-before-break to the new address and resume with the token. Who sends RECONNECT and why differs per tier; the client implementation is the same everywhere.
+
+**Why it matters:** Without a relay, a migrating player's connection stays anchored to the node it first joined — the **forwarding invariant** (non-owner forwards inputs to the current owner; an open-core node-level correctness property, not part of this primitive) keeps that correct, but the traffic path grows a permanent extra hop per migration. At MMO scale the relay collapses this: the client's connection never moves, ownership migrations become an invisible upstream redirect, and per-cluster subscription fan-out replaces N duplicate per-client streams out of the node. It also gives every fronted game IP masking, DDoS absorption, and stable addresses as a side effect. Bandwidth break-even for fan-out collapse is the baseline case, not the optimistic one, because relay assignment follows real-life geography where interest overlap among nearby players is the norm.
+
+**Genres benefiting:** MMORPGs and Action MMOs (the central use case — regional fleets, migration-heavy worlds, massive fan-out), Persistent worlds / Survival at scale, Battle Royale (large maps with migration), Social sandboxes. As an ops-only passthrough: competitive session shooters (DDoS/IP privacy). Explicitly *not* for: fighting games and small-session games (every relay hop costs latency for zero benefit — direct connect is the default, not a fallback), self-hosted/AGPL deployments (a node accepts direct clients forever; the architecture never requires a relay), LAN/edge contexts.
+
+**Progressive-API sketch:**
+- **L0** — No relay. Direct client ↔ node connection, existing protocol, plus the RECONNECT client primitive (usable at L0 for node-to-node handoff hints; safe because forwarding makes the timing uncritical). Ships in the open core. Fully functional for every game.
+- **L1** — Dumb passthrough relay: 1:1 proxying, TLS, IP masking, stable addressing, connection metrics. No session-table logic beyond one upstream per client.
+- **L2** — Session relay: session table, migration-aware upstream redirect driven by ownership-change events, forwarding-aware routing during the transition window.
+- **L3** — Subscribing relay: per-cluster subscription with local fan-out, plus the slow relay-assignment optimizer (interest-overlap clustering across relay shards, make-before-break RECONNECT moves at minutes-scale cadence).
+- **L4** — Custom relay policies: game-provided assignment predicates, custom fan-out filtering at the edge, direct access to the session table for novel topologies.
+
+**Watchpoints:** The node protocol must remain relay-agnostic forever — nothing in the open core may assume a relay exists, or the self-hosted path breaks and L0 stops being first-class. The forwarding invariant is a prerequisite, not a component: it lives in the open-core node, makes L2's redirect race-free (inputs arriving at a stale upstream still reach the owner during the handoff window), and must land before any relay tier is built. Split-brain is the failure mode it prevents — a migrated-but-still-connected player being simulated by two nodes at once, observed directly in the migration harness.
+
+Testing is the second watchpoint: relay tiers must not ship before a real consumer exists, because L2/L3 can only be honestly tested against a multi-cluster game with live migration under load. The existing headless migration-observer harness is the acceptance test — the identical unpinned-converge scenario must pass unchanged when run relay-fronted (and L1 must be *invisible*: same harness through a passthrough, identical verdict). Build order is therefore: forwarding + RECONNECT in the open core now; L1–L3 only when a game needs them.
+
+Cost is the third: a relay doubles egress for traffic that transits it and adds instances. This is only paid by games at tiers that benefit (fan-out collapse at L3, ops value at L1); the per-game-container-on-shared-hosts model amortizes the fixed cost across titles. No game pays for machinery it doesn't opt into.
+
+**Related to:** #13 (per-client visibility filtering — at L3 the relay fans out a per-cluster stream, so per-client filtering either moves to the edge or constrains what the relay can collapse; the interaction needs explicit design when L3 is built), #4 (reliability annotations — relay must preserve per-field transport semantics end-to-end), #6 (per-cluster tick rates shape relay subscription cadence), #9 (spatial voice could share the same edge tier and regional host fleet).
+
+---
+
+### 18. Entity session lifecycle
 
 **What:** A first-class entity lifecycle model that defines the full path an entity takes: connect (materialize in a cluster), disconnect (leave a cluster), reconnect (re-enter within a configurable TTL window), and leave (session ends, entity released). The platform provides configurable persistence levels: L0 (ephemeral, no SpacetimeDB), L1 (short-term reconnection window with Redis TTL), L2 (durable SpacetimeDB recovery), L3 (game-defined custom bucket-4 logic).
 
@@ -611,7 +650,7 @@ A third watchpoint: graph staleness during merges. If a merge region forms for d
 
 A second watchpoint: SpacetimeDB cold-restart role. In L2+, SpacetimeDB acts as the authoritative durable backing for entity state on a full cluster restart. It is *not* read on every tick (that would defeat the performance model). It is read only once: when a cluster restarts from cold, SpacetimeDB is the source of truth for what entities existed. Bucket 1/2 state is replicated live from other clusters or recomputed; bucket 4 is loaded from SpacetimeDB. This role is formalized by the `IPersistence` interface — the platform asks "give me entities that belong in this cluster" and the implementation (L0: empty; L1: Redis TTL buckets; L2+: SpacetimeDB query) answers.
 
-**Status:** Epic #305 (entity session lifecycle design); L0/L1/L2 implementation in progress as of 2026-07. Note: #321 (L1 reconnect rehydration TTL gating) is still open with a fix in progress — reconnection behavior may require tuning as that issue resolves.
+**Status:** IMPLEMENTED — epic #305 merged 2026-07-24 (L0/L1/L2 + docs + demo proof). #321 (L1 reconnect rehydration TTL gating) is FIXED: rehydration is gated on first contact and bounded by the parked key's own Redis TTL, decoupled from the anti-resurrection tombstone; the cross-node reconnect path (returning session routed through a node holding stale records) revives and rehydrates via the forwarding path.
 
 **Related to:** [`four-bucket-state-model.md`](four-bucket-state-model.md) (defines bucket 4 and the lifecycle invariant); [`progressive-api.md`](progressive-api.md) (the persistence ladder and environment surface); [`meta-control-layer.md`](meta-control-layer.md) (SpacetimeDB's durable role as L2 backend).
 
