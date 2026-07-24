@@ -7,6 +7,7 @@
 //! - `clustering_model`: world-state view types consumed by the manager decision path.
 //! - `server_pool`: allocation/release contract for cluster server capacity.
 //! - `replication_channel`: neighbor-delta contract, [`EntityStateEntry`](replication_channel::EntityStateEntry) (four-bucket spine + JSON fields), [`IReplicationChannel`](replication_channel::IReplicationChannel).
+//! - `persistence`: durable entity state seam (L2, epic #305), [`IPersistence`](persistence::IPersistence).
 //! - `visibility`: per-client visibility filtering in the outbound pipeline, [`IVisibilityFilter`](visibility::IVisibilityFilter).
 //!
 //! ## Interaction model
@@ -16,6 +17,7 @@
 
 pub mod cluster_simulation;
 pub mod clustering_model;
+pub mod persistence;
 pub mod physics_events;
 pub mod replication_channel;
 pub mod server_pool;
@@ -24,6 +26,7 @@ pub mod visibility;
 
 pub use cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
 pub use clustering_model::{ClusterInfo, PlayerInfo, WorldStateView};
+pub use persistence::IPersistence;
 pub use physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp};
 pub use replication_channel::{
     CloseReason, EntityStateDelta, EntityStateEntry, IReplicationChannel,

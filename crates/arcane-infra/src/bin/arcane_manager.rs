@@ -36,8 +36,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -46,6 +45,12 @@ struct JoinResponse {
     cluster_id: String,
     server_host: String,
     server_port: u16,
+    #[serde(skip_serializing_if = "is_false")]
+    parked: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Parsed cluster registration.
@@ -72,6 +77,7 @@ struct JoinState {
 struct ManagerState {
     clusters: Vec<ClusterReg>,
     join_state: Arc<Mutex<JoinState>>,
+    redis_url: String,
 }
 
 /// Query parameters for /join endpoint.
@@ -80,6 +86,10 @@ struct JoinParams {
     x: Option<f32>,
     y: Option<f32>,
     z: Option<f32>,
+    /// L1 reconnect (epic #305): entity id of a returning session; used to
+    /// report `parked` so clients know a snapshot is waiting.
+    #[serde(default)]
+    entity_id: Option<String>,
 }
 
 fn parse_clusters(s: &str) -> Result<Vec<ClusterReg>, String> {
@@ -135,10 +145,22 @@ async fn join_handler(
     .unwrap_or_else(|| s.clusters[0].clone());
     drop(join_state);
 
+    // Check if entity was parked (L1 short-term persistence, epic #305).
+    let parked = if let Some(entity_id_str) = params.entity_id {
+        if let Ok(entity_id) = Uuid::parse_str(&entity_id_str) {
+            arcane_infra::parking::is_entity_parked(&s.redis_url, entity_id)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     Json(JoinResponse {
         cluster_id: cluster_id.id.to_string(),
         server_host: cluster_id.host,
         server_port: cluster_id.port,
+        parked,
     })
 }
 
@@ -268,6 +290,10 @@ async fn control_loop(
         // Warm spares count as partitions: without this, an everyone-on-one-cluster
         // world has k=1 and can never spread.
         runtime.set_known_clusters(cluster_ids.clone());
+        // Epic #305: the binary feeds a complete snapshot every cycle, so
+        // flips for feed-absent (departed) entities are cancelled instead of
+        // actuated — the manager-side anti-resurrection guarantee.
+        runtime.enable_feed_liveness();
         let mut stale_tracker = StaleTracker::new();
         let mut last_stale: HashSet<Uuid> = HashSet::new();
 
@@ -436,10 +462,11 @@ async fn main() -> Result<(), String> {
     let loop_join_state = join_state.clone();
     let loop_clusters = clusters.clone();
     let loop_affinity_config = affinity_config.clone();
+    let loop_redis_url = redis_url.clone();
     tokio::spawn(async move {
         control_loop(
             loop_clusters,
-            redis_url,
+            loop_redis_url,
             cadence_ms,
             stale_limit_ms,
             loop_join_state,
@@ -452,6 +479,7 @@ async fn main() -> Result<(), String> {
     let state = ManagerState {
         clusters: clusters.clone(),
         join_state,
+        redis_url,
     };
 
     let app = Router::new()

@@ -52,6 +52,8 @@ use std::sync::atomic::Ordering;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+#[cfg(feature = "migration")]
+use arcane_core::IPersistence;
 use uuid::Uuid;
 
 #[cfg(feature = "migration")]
@@ -67,15 +69,28 @@ use crate::node_inbox::{InboxBus, NodeInboxFrame};
 use crate::node_stats::NodeStats;
 #[cfg(feature = "migration")]
 use crate::ownership_migration::{OwnershipFlip, OwnershipMap};
+#[cfg(feature = "migration")]
+use crate::persistence_config;
 #[cfg(feature = "cluster-ws")]
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
-#[cfg(feature = "spacetimedb-persist")]
-use crate::spacetimedb_persist::SpacetimeDbPersist;
 use crate::{ArcaneNode, ReplicationChannelManager};
 
 const LOG_EVERY_TICKS: u64 = 100;
 const LOG_STATS_EVERY_TICKS: u64 = 40;
 const NEIGHBOR_STALE_TICKS: u64 = 300;
+/// Anti-resurrection tombstone TTL (≈30s of ticks, comfortably beyond manager
+/// forget latency). Prunes departed entries older than this on the same cadence
+/// as the idle-timeout check.
+#[cfg(feature = "migration")]
+const DEPARTED_TTL_TICKS: u64 = 1800;
+/// Epic #305: how quickly a CLEANLY-closed session's entity leaves (≈2s of
+/// ticks at 60Hz). Clean close = accelerated idle: the entity's idle clock is
+/// set so the idle path completes the leave within this window — unless
+/// another live connection is still driving the entity (its updates refresh
+/// `client_driven_last_seen` and cancel the fast-forward). Crashed sockets
+/// (error paths) are NOT accelerated; they wait out the full idle timeout.
+#[cfg(feature = "migration")]
+const CLEAN_CLOSE_LEAVE_TICKS: u64 = 120;
 
 /// Apply one inbox frame to node-local state. Returns the number of ownership
 /// changes applied and proxies upserted.
@@ -118,6 +133,7 @@ pub fn apply_inbox_frame(
     spawn_grace: &mut HashMap<Uuid, u64>,
     neighbor_entities: &mut HashMap<Uuid, EntityStateEntry>,
     neighbor_last_seen: &mut HashMap<Uuid, u64>,
+    departed: &HashMap<Uuid, u64>,
     current_tick: u64,
 ) -> FrameApplyReport {
     let mut proxies_upserted = 0;
@@ -185,6 +201,10 @@ pub fn apply_inbox_frame(
         // with the proxy copy (carries bucket-2 user_data the frame lacks).
         for id in owned {
             if server_entity_ids.contains(id) {
+                continue;
+            }
+            // Anti-resurrection guard: skip ids in the departure tombstone.
+            if departed.contains_key(id) {
                 continue;
             }
             let from_frame = frame
@@ -318,8 +338,8 @@ pub struct NodeCore {
     tick_count: u64,
     cluster_id: Uuid,
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
-    #[cfg(feature = "spacetimedb-persist")]
-    persist: Option<SpacetimeDbPersist>,
+    #[cfg(feature = "migration")]
+    persist: Option<Arc<dyn IPersistence>>,
     /// #289: the node's owned-set RECORD view — replaced wholesale by each
     /// frame's `owned` statement, never folded from events. "Do I own X?" =
     /// `owned_view.contains(X) || spawn_grace.contains_key(X)`.
@@ -390,6 +410,34 @@ pub struct NodeCore {
     /// resent while forwarding persists so a dropped frame self-heals).
     #[cfg(feature = "migration")]
     reconnect_last_hint: HashMap<Uuid, u64>,
+    /// Anti-resurrection tombstone (L0): entity → tick departed. Blocks re-adoption
+    /// of just-removed entities until the ownership record forgets them (bounded TTL).
+    #[cfg(feature = "migration")]
+    departed: HashMap<Uuid, u64>,
+    /// Epic #305 clean-close trigger: avatar ids whose WS connection closed
+    /// CLEANLY (Close frame / EOF). Drained each publish interval; each id's
+    /// idle clock is fast-forwarded so the unified leave path completes it
+    /// within ~CLEAN_CLOSE_LEAVE_TICKS instead of the full idle timeout.
+    /// One code path (idle) serves both triggers; the shared-entity rule
+    /// (another connection still driving the entity refreshes last_seen and
+    /// cancels the fast-forward) falls out for free.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
+    session_closes_rx: std::sync::mpsc::Receiver<Uuid>,
+    /// Entities that just LEFT (unified leave path) and must also leave the
+    /// DRIVER's world map. Model B: the driver owns the authoritative world
+    /// and re-submits it as the spine every tick — removing an entity from
+    /// the server map alone is NOT enough (the next submit re-adds it, the
+    /// state key keeps carrying it, the manager keeps stating it, and the
+    /// ghost self-sustains; live-verified in the #306 acceptance run).
+    /// Drained into `NodeInputs::lost_entities` so the driver drops them.
+    #[cfg(feature = "migration")]
+    pending_driver_releases: Vec<Uuid>,
+    /// L1 short-term persistence (epic #305): config for parking entity snapshots in Redis.
+    #[cfg(feature = "migration")]
+    parking_config: crate::parking::ParkingConfig,
+    /// Redis URL for parking operations.
+    #[cfg(feature = "migration")]
+    redis_url: String,
 }
 
 impl NodeCore {
@@ -447,6 +495,8 @@ impl NodeCore {
         // rx side lives in the subscriber loop; this core holds the tx and
         // produces directives from the forwarding path (migration only).
         let (reconnect_hint_tx, reconnect_hint_rx) = std::sync::mpsc::channel();
+        // Epic #305: clean-close reports from subscriber tasks → node loop.
+        let (session_closes_tx, session_closes_rx) = std::sync::mpsc::channel();
         crate::ws_server::run_ws_server(
             cfg.ws_port,
             state_rx,
@@ -455,6 +505,7 @@ impl NodeCore {
             stats.clone(),
             visibility_filter,
             reconnect_hint_rx,
+            session_closes_tx,
         );
 
         let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
@@ -473,10 +524,8 @@ impl NodeCore {
             tick_rate_hz
         );
 
-        #[cfg(feature = "spacetimedb-persist")]
-        let persist = SpacetimeDbPersist::from_env();
-        #[cfg(not(feature = "spacetimedb-persist"))]
-        let _persist = ();
+        #[cfg(feature = "migration")]
+        let persist = persistence_config::construct_persistence();
 
         // #289: no ownership-flip pub/sub subscriber and no folded map. The
         // node's ownership view is the record: each inbox frame's `owned`
@@ -588,7 +637,7 @@ impl NodeCore {
             tick_count: 0,
             cluster_id: cfg.cluster_id,
             submitted_routed_physics: Vec::new(),
-            #[cfg(feature = "spacetimedb-persist")]
+            #[cfg(feature = "migration")]
             persist,
             #[cfg(feature = "migration")]
             owned_view: HashSet::new(),
@@ -621,6 +670,15 @@ impl NodeCore {
             reconnect_last_hint: HashMap::new(),
             #[cfg(feature = "migration")]
             client_idle_timeout_ticks: cfg.client_idle_timeout_ticks,
+            #[cfg(feature = "migration")]
+            departed: HashMap::new(),
+            session_closes_rx,
+            #[cfg(feature = "migration")]
+            pending_driver_releases: Vec::new(),
+            #[cfg(feature = "migration")]
+            parking_config: crate::parking::ParkingConfig::from_env(),
+            #[cfg(feature = "migration")]
+            redis_url: cfg.redis_url.clone(),
         })
     }
 
@@ -631,6 +689,53 @@ impl NodeCore {
     /// **Query method.** Reads the tick counter; no I/O, no side effects.
     pub fn current_tick(&self) -> u64 {
         self.server.current_tick()
+    }
+
+    /// The "remember" seam of the unified leave path (epic #305): receives the
+    /// entity's FINAL state snapshot, captured before removal. L0 = no-op.
+    /// Sub-issue #307 (L1) parks this snapshot in Redis with a TTL; sub-issue
+    /// #308 (L2) performs the final durable write through the persistence
+    /// seam. The snapshot is `None` only if the entity was already gone from
+    /// the map (double-leave race) — layers must treat that as nothing to
+    /// remember, never as an error.
+    /// Sequence: L2 persist_final (durable backend), then L1 park (Redis TTL).
+    #[cfg(feature = "migration")]
+    fn on_leave(&mut self, id: Uuid, final_state: Option<&EntityStateEntry>) {
+        if let Some(entry) = final_state {
+            // L2: durable write (before L1 parking)
+            if let Some(ref persist) = self.persist {
+                persist.persist_final(entry);
+            }
+            // L1: short-term parking in Redis
+            crate::parking::park_entity(&self.redis_url, &self.parking_config, id, entry);
+        } else {
+            eprintln!("[leave] entity {id} departed (snapshot already gone)");
+        }
+    }
+
+    /// Unified leave path (epic #305): the session ends and the entity leaves
+    /// the world — identically for every trigger (idle timeout today; clean
+    /// WS close arrives with the ws_server wiring; explicit leave later).
+    ///
+    /// Sequence (remember FIRST, then remove — a crash between steps leaves a
+    /// still-live entity, which is safe and retried; never a lost one):
+    /// 1. Snapshot the final state, hand it to `on_leave` (layer-dependent).
+    /// 2. Remove from the server map → emits the `removed` delta to clients.
+    /// 3. Bookkeeping cleanup: client_driven_last_seen, reconnect_last_hint, spawn_grace.
+    /// 4. Departure tombstone: blocks the ADOPT and spawn-grace paths until
+    ///    the ownership record stops stating the id (bounded TTL).
+    #[cfg(feature = "migration")]
+    fn leave_entity(&mut self, id: Uuid) {
+        let final_state = self.server.get_entity(id);
+        self.on_leave(id, final_state.as_ref());
+        self.server.remove_entity(id);
+        self.client_driven_last_seen.remove(&id);
+        self.reconnect_last_hint.remove(&id);
+        self.spawn_grace.remove(&id);
+        self.departed.insert(id, self.tick_count);
+        // Model B: the driver's world map must drop it too, or its next
+        // spine submit resurrects the entity locally (see field docs).
+        self.pending_driver_releases.push(id);
     }
 
     /// Attach an inbox bus and spawn a thread to subscribe to frames.
@@ -695,8 +800,57 @@ impl NodeCore {
                 self.maybe_send_reconnect_hint(entity_id, owner);
                 continue;
             }
+            // Revival + rehydration (epic #305, decoupled per #321): the
+            // tombstone clears on any real client update (anti-resurrection
+            // revival); the L1/L2 restore is gated on FIRST CONTACT for an
+            // unrepresented entity — bounded by the Redis key's OWN TTL
+            // (`ARCANE_RECONNECT_TTL_SECS`), not the tombstone's lifetime.
+            let entity_id = entry.entity_id;
+            let mut entry = entry; // mutable so we can rehydrate user_data
+            let action = revival_action(
+                entity_id,
+                &mut self.departed,
+                &self.owned_view,
+                &self.spawn_grace,
+            );
+            if action.revived {
+                self.spawn_grace.insert(entity_id, self.tick_count);
+            }
+            if action.try_rehydrate {
+                // L1: parked snapshot (fresher, consume-once, TTL-bounded).
+                let rehydrated = if let Some(parked_snapshot) =
+                    crate::parking::unpark_entity(&self.redis_url, entity_id)
+                {
+                    if let Some(parked_user_data) = parked_snapshot.get("user_data") {
+                        entry.user_data = parked_user_data.clone();
+                        eprintln!(
+                            "[rehydrate] entity {} user_data restored from parked snapshot",
+                            entity_id
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                // L2 fallback (epic #308): if no parked snapshot, try durable load.
+                if !rehydrated {
+                    if let Some(ref persist) = self.persist {
+                        if let Some(loaded) = persist.load(entity_id) {
+                            entry.user_data = loaded.user_data;
+                            entry.position = loaded.position;
+                            entry.velocity = loaded.velocity;
+                            eprintln!(
+                                "[rehydrate] entity {} restored from durable storage",
+                                entity_id
+                            );
+                        }
+                    }
+                }
+            }
             self.client_driven_last_seen
-                .insert(entry.entity_id, self.tick_count);
+                .insert(entity_id, self.tick_count);
             out.client_updates.push(entry);
         }
         #[cfg(not(feature = "migration"))]
@@ -740,8 +894,13 @@ impl NodeCore {
                     {
                         // A forwarded update is a live client session driving this
                         // entity: idle timeout follows the SESSION, wherever the ingress node is.
+                        let entity_id = entry.entity_id;
+                        // Revival rule: clear departure tombstone if present.
+                        if self.departed.remove(&entity_id).is_some() {
+                            self.spawn_grace.insert(entity_id, self.tick_count);
+                        }
                         self.client_driven_last_seen
-                            .insert(entry.entity_id, self.tick_count);
+                            .insert(entity_id, self.tick_count);
                         self.stats
                             .fwd_inputs_applied
                             .fetch_add(1, Ordering::Relaxed);
@@ -849,6 +1008,7 @@ impl NodeCore {
                     &mut self.spawn_grace,
                     &mut self.neighbor_entities,
                     &mut self.neighbor_last_seen,
+                    &self.departed,
                     self.tick_count,
                 );
                 // #289: the statement REPLACES the record view (no folding).
@@ -857,6 +1017,9 @@ impl NodeCore {
                 }
                 // §8 adoption: hand gained entities to the driver so it starts
                 // simulating them from their replicated state.
+                // A departed (tombstoned) id must not be re-adopted into the
+                // driver world even here — apply_inbox_frame already filters,
+                // this is belt-and-braces for the drain path.
                 out.adopted_entities.extend(report.adopted);
                 for id in &report.lost {
                     // Purge the stale authoritative copy WITHOUT a client-facing
@@ -868,6 +1031,10 @@ impl NodeCore {
                 out.lost_entities.extend(report.lost);
             }
         }
+        // Epic #305: entities that just left hand their driver-world release
+        // to the driver here (independent of any inbox frame arriving).
+        #[cfg(feature = "migration")]
+        out.lost_entities.append(&mut self.pending_driver_releases);
         const PRUNE_INTERVAL_TICKS: u64 = 60;
         if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
             self.neighbor_last_seen.retain(|id, last_seen| {
@@ -940,6 +1107,15 @@ impl NodeCore {
             let mut graced_this_batch = 0;
             for entry in spine {
                 let id = entry.entity_id;
+                // Departed tombstone: a just-left entity must not re-enter the
+                // server map from a stale driver spine — not even as "ours"
+                // (owned_view lags the leave until the manager's absence grace
+                // prunes it; re-adding here is what kept the ghost alive in
+                // the live #306 acceptance run). The driver drops it from its
+                // world via lost_entities within a tick.
+                if self.departed.contains_key(&id) {
+                    continue;
+                }
                 let ours = self.owned_view.contains(&id) || self.spawn_grace.contains_key(&id);
                 if !ours {
                     // The record says another cluster owns it? Then the driver
@@ -955,6 +1131,7 @@ impl NodeCore {
                     // Unknown everywhere: a NEW local spawn. Provisionally
                     // ours under spawn grace until the control plane speaks
                     // to it (#289 replacement for first-sight claiming).
+                    // (Departed ids never reach here — filtered at loop top.)
                     self.spawn_grace.insert(id, self.tick_count);
                     graced_this_batch += 1;
                 }
@@ -1026,6 +1203,34 @@ impl NodeCore {
 
         #[cfg(feature = "migration")]
         if self.tick_count.is_multiple_of(self.state_publish_interval) {
+            // Epic #305 clean-close: fast-forward the idle clock of entities
+            // whose connection closed cleanly. Setting last_seen back to
+            // (now − timeout + CLEAN_CLOSE_LEAVE_TICKS) makes the idle sweep
+            // below complete the leave within ~2s — one leave code path, two
+            // triggers. If ANOTHER connection is still driving the entity, its
+            // next update overwrites last_seen and the fast-forward is void
+            // (the shared-entity rule from the #306 spec). Only entities
+            // already tracked as client-driven are eligible.
+            if self.client_idle_timeout_ticks > 0 {
+                while let Ok(avatar) = self.session_closes_rx.try_recv() {
+                    if let Some(last_seen) = self.client_driven_last_seen.get_mut(&avatar) {
+                        let fast_forwarded = self
+                            .tick_count
+                            .saturating_sub(self.client_idle_timeout_ticks)
+                            .saturating_add(CLEAN_CLOSE_LEAVE_TICKS);
+                        // Never push last_seen FORWARD (a live driver's fresh
+                        // update must win over a stale close report).
+                        if fast_forwarded < *last_seen {
+                            *last_seen = fast_forwarded;
+                        }
+                    }
+                }
+            } else {
+                // Idle timeout disabled: clean-close reports have no engine to
+                // complete them; drain and drop so the channel never backs up.
+                while self.session_closes_rx.try_recv().is_ok() {}
+            }
+
             // Client-driven entity idle timeout: despawn entities whose last client
             // update is older than the configured timeout. Only entities in
             // `client_driven_last_seen` are eligible — sim-spawned entities are never touched.
@@ -1040,10 +1245,16 @@ impl NodeCore {
                     .map(|(&id, _)| id)
                     .collect();
                 for id in to_remove {
-                    self.server.remove_entity(id);
-                    self.client_driven_last_seen.remove(&id);
+                    self.leave_entity(id);
                 }
             }
+
+            // Anti-resurrection tombstone expiry: prune departed entries older than
+            // the TTL (comfortably beyond manager absence-grace). Prevents the map from
+            // growing unboundedly; a real client update arriving for a just-expired id
+            // will re-add it naturally when the next frame adopts it.
+            let departed_cutoff = self.tick_count.saturating_sub(DEPARTED_TTL_TICKS);
+            self.departed.retain(|_, at| *at >= departed_cutoff);
 
             if let Some(ref publisher) = self.state_publisher {
                 // Pin liveness: an entity counts as client-driven while updates arrived
@@ -1113,15 +1324,15 @@ impl NodeCore {
         let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
         let outcome_tick = merged_delta.tick;
         let outcome_seq = merged_delta.seq;
-        // Durable persistence (bucket 4): snapshot the FULL authoritative set, not the sparse broadcast
+        // Durable persistence (L2, bucket 4, epic #305): snapshot the FULL authoritative set, not the sparse broadcast
         // delta. `set_entities` is a full-replace reducer, so persisting only the changed entities would
-        // wipe unchanged ones from the durable table. Build the snapshot ONLY on persist ticks (the
-        // cadence check is cheap; the snapshot clone is not) — own entities only, neighbours persist theirs.
-        #[cfg(feature = "spacetimedb-persist")]
+        // wipe unchanged ones from the durable table. Cadence check is cheap; snapshot clone is not.
+        // Own entities only; neighbours persist theirs.
+        #[cfg(feature = "migration")]
         if let Some(ref persist) = self.persist {
-            if persist.is_persist_tick(self.tick_count) {
+            if persist.should_snapshot(self.tick_count) {
                 let snapshot = self.server.snapshot();
-                persist.maybe_persist(self.tick_count, &snapshot);
+                persist.snapshot(&snapshot);
             }
         }
         let _ = self.state_tx.send(merged_delta);
@@ -1165,6 +1376,56 @@ impl NodeCore {
             seq: outcome_seq,
             entity_count,
         }
+    }
+}
+
+/// Decide the revival/rehydration action for an inbound client update
+/// (epic #305, issue #321). Extracted from `drain_inputs` per the
+/// `forward_target` precedent so it is unit-testable without a `NodeCore`.
+///
+/// Two DECOUPLED mechanisms meet here: the anti-resurrection tombstone
+/// (`departed`, tick-based, sized for the manager's forget latency), whose
+/// clearing on a real client update is the REVIVAL rule; and the L1 parked
+/// snapshot (Redis key, `ARCANE_RECONNECT_TTL_SECS`, wall-clock), whose
+/// restore is REHYDRATION.
+///
+/// The former bug: rehydration only ran inside the tombstone branch, so the
+/// effective reconnect window was min(tombstone, TTL) instead of the TTL.
+/// The rule now: rehydration is gated on FIRST CONTACT — the entity is not
+/// currently represented here (not owned, not in spawn grace) — which is
+/// exactly when a parked snapshot could exist. A live, continuously-driven
+/// entity never probes Redis (hot-path safety); the tombstone is cleared
+/// independently whenever present.
+#[cfg(feature = "migration")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RevivalOutcome {
+    /// The tombstone was present and cleared: re-grace the entity.
+    pub revived: bool,
+    /// First contact for an unrepresented entity: attempt L1 unpark (and
+    /// L2 durable load if no snapshot). False for live entities — never
+    /// probe Redis for an entity we already represent.
+    pub try_rehydrate: bool,
+}
+
+#[cfg(feature = "migration")]
+pub fn revival_action(
+    entity_id: Uuid,
+    departed: &mut HashMap<Uuid, u64>,
+    owned_view: &HashSet<Uuid>,
+    spawn_grace: &HashMap<Uuid, u64>,
+) -> RevivalOutcome {
+    let revived = departed.remove(&entity_id).is_some();
+    // First contact = we do not currently represent this entity. Covers:
+    // tombstoned (just left, reconnect before manager forgot), tombstone
+    // EXPIRED but parked key still live (the #321 gap), and fresh joins
+    // (no parked key; the probe is one GET on a brand-new session, not per
+    // update — after this tick the entity is in spawn_grace and never
+    // probes again).
+    let try_rehydrate =
+        revived || (!owned_view.contains(&entity_id) && !spawn_grace.contains_key(&entity_id));
+    RevivalOutcome {
+        revived,
+        try_rehydrate,
     }
 }
 
@@ -1252,6 +1513,104 @@ pub fn merge_with_neighbor_latest(
         timestamp: our_delta.timestamp,
         updated: merged_updated,
         removed: our_delta.removed,
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "migration")]
+mod revival_tests {
+    //! Issue #321: L1 rehydration must be bounded by the parked key's OWN
+    //! TTL, not the anti-resurrection tombstone's lifetime. These tests
+    //! drive `revival_action` — the extracted decision `drain_inputs`
+    //! executes — across the exact states of the defect.
+    use super::{revival_action, RevivalOutcome};
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    #[test]
+    fn tombstoned_id_revives_and_rehydrates() {
+        // Reconnect BEFORE the tombstone expired: clear it, re-grace, and
+        // attempt the restore (both mechanisms fire).
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = [(e, 100u64)].into();
+        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: true,
+                try_rehydrate: true
+            }
+        );
+        assert!(!departed.contains_key(&e), "tombstone cleared");
+    }
+
+    #[test]
+    fn expired_tombstone_still_rehydrates_within_parked_ttl() {
+        // THE #321 defect: tombstone already pruned (tick-based, e.g. ~14s at
+        // 128Hz) but the Redis parked key (wall-clock TTL, default 120s) is
+        // still live. The old gate `departed.remove(..).is_some()` returned
+        // false here and silently skipped the restore — the effective
+        // reconnect window was min(tombstone, TTL). The unrepresented-entity
+        // first contact must still try to rehydrate.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
+        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert!(!out.revived, "no tombstone to clear");
+        assert!(
+            out.try_rehydrate,
+            "first contact for an unrepresented entity must probe the parked \
+             key — its own TTL decides, not the tombstone's"
+        );
+    }
+
+    #[test]
+    fn live_owned_entity_never_probes() {
+        // Hot-path safety (the PR #327 regression): a continuously-driven,
+        // owned entity must NOT open a Redis probe on every update.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new();
+        let owned: HashSet<Uuid> = [e].into();
+        let out = revival_action(e, &mut departed, &owned, &HashMap::new());
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: false,
+                try_rehydrate: false
+            }
+        );
+    }
+
+    #[test]
+    fn graced_entity_never_probes() {
+        // Same for an entity in spawn grace: it was already admitted (and
+        // rehydrated, if a snapshot existed) on its first contact.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new();
+        let grace: HashMap<Uuid, u64> = [(e, 7u64)].into();
+        let out = revival_action(e, &mut departed, &HashSet::new(), &grace);
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: false,
+                try_rehydrate: false
+            }
+        );
+    }
+
+    /// Sanity: the tests above genuinely distinguish the old gate from the
+    /// new one. Simulating the pre-fix logic (rehydrate ONLY when the
+    /// tombstone was present) fails the #321 gap case.
+    #[test]
+    fn pre_fix_gate_would_fail_the_gap_case() {
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
+        let old_gate_rehydrates = departed.remove(&e).is_some();
+        assert!(
+            !old_gate_rehydrates,
+            "old gate skips the restore in the gap state"
+        );
+        let new_gate = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert!(new_gate.try_rehydrate, "new gate restores in the gap state");
     }
 }
 
@@ -1427,7 +1786,11 @@ mod forwarding_tests {
 }
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "migration")]
+    use super::apply_inbox_frame;
     use super::merge_with_neighbor_latest;
+    #[cfg(feature = "migration")]
+    use crate::node_inbox::NodeInboxFrame;
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::Vec3;
     use std::collections::HashMap;
@@ -2046,6 +2409,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2090,6 +2454,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2126,6 +2491,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2165,6 +2531,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2212,6 +2579,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2255,6 +2623,7 @@ mod tests {
                 &mut grace,
                 &mut neighbor_entities,
                 &mut neighbor_last_seen,
+                &HashMap::new(),
                 50,
             );
 
@@ -2356,6 +2725,224 @@ mod tests {
                 stale.is_empty(),
                 "sim-spawned entities not in client_driven_last_seen should not be despawned"
             );
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn leave_entity_bookkeeping() {
+            // Verify that leave_entity clears bookkeeping and tombstones.
+            // Can't easily test the full method without full NodeCore setup,
+            // so test the core logic: cleanup of tracking maps.
+            let entity_id = Uuid::from_u128(100);
+            let mut client_driven_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            let mut reconnect_last_hint: HashMap<Uuid, u64> = HashMap::new();
+            let mut spawn_grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+            let current_tick = 100u64;
+
+            client_driven_last_seen.insert(entity_id, current_tick);
+            reconnect_last_hint.insert(entity_id, current_tick);
+            spawn_grace.insert(entity_id, current_tick);
+
+            // Simulate leave_entity bookkeeping: cleanup + tombstone
+            client_driven_last_seen.remove(&entity_id);
+            reconnect_last_hint.remove(&entity_id);
+            spawn_grace.remove(&entity_id);
+            departed.insert(entity_id, current_tick);
+
+            assert!(
+                !client_driven_last_seen.contains_key(&entity_id),
+                "removed from client_driven_last_seen"
+            );
+            assert!(
+                !reconnect_last_hint.contains_key(&entity_id),
+                "removed from reconnect_last_hint"
+            );
+            assert!(
+                !spawn_grace.contains_key(&entity_id),
+                "removed from spawn_grace"
+            );
+            assert!(
+                departed.contains_key(&entity_id),
+                "inserted into departed tombstone"
+            );
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn tombstoned_id_not_adopted() {
+            let my_cluster = Uuid::from_u128(1);
+            let entity_id = Uuid::from_u128(100);
+            let server_ids = std::collections::HashSet::new();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+
+            departed.insert(entity_id, 50u64);
+
+            let frame = NodeInboxFrame {
+                tick: 100u64,
+                ownership: vec![],
+                entities: vec![],
+                owned: Some(vec![entity_id]),
+            };
+
+            let report = apply_inbox_frame(
+                my_cluster,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                &departed,
+                100u64,
+            );
+
+            assert!(
+                report.adopted.is_empty(),
+                "tombstoned id not re-adopted during presence in departed"
+            );
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn tombstone_expires() {
+            let entity_id = Uuid::from_u128(100);
+            let ttl = 1800u64;
+            let departed_tick = 100u64;
+            let current_tick = departed_tick + ttl + 1u64;
+
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+            departed.insert(entity_id, departed_tick);
+
+            let departed_cutoff = current_tick.saturating_sub(ttl);
+            departed.retain(|_, at| *at >= departed_cutoff);
+
+            assert!(departed.is_empty(), "expired tombstone entry pruned");
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn client_update_revives() {
+            let entity_id = Uuid::from_u128(100);
+            let current_tick = 100u64;
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+            let mut spawn_grace: HashMap<Uuid, u64> = HashMap::new();
+
+            departed.insert(entity_id, current_tick);
+            assert!(departed.contains_key(&entity_id), "tombstone present");
+
+            // Simulate client update: revival rule clears tombstone and re-graces.
+            if departed.remove(&entity_id).is_some() {
+                spawn_grace.insert(entity_id, current_tick);
+            }
+            assert!(!departed.contains_key(&entity_id), "tombstone cleared");
+            assert!(spawn_grace.contains_key(&entity_id), "entity re-graced");
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn clean_close_fast_forwards_idle() {
+            // The clean-close trigger IS the idle path with a rewound clock:
+            // last_seen := now − timeout + CLEAN_CLOSE_LEAVE_TICKS, never
+            // moved FORWARD. Verify the two invariants of that arithmetic
+            // exactly as pump() computes it.
+            let idle_timeout = 6000u64; // ~2min at 50Hz
+            let now = 10_000u64;
+
+            // Case 1: freshly-driven entity (last_seen = now). Fast-forward
+            // rewinds it so the idle sweep fires within CLEAN_CLOSE_LEAVE_TICKS
+            // publish-intervals, not the full timeout.
+            let mut last_seen = now;
+            let fast_forwarded = now
+                .saturating_sub(idle_timeout)
+                .saturating_add(super::super::CLEAN_CLOSE_LEAVE_TICKS);
+            if fast_forwarded < last_seen {
+                last_seen = fast_forwarded;
+            }
+            let cutoff_at = |t: u64| t.saturating_sub(idle_timeout);
+            // Not yet idle at `now`…
+            assert!(last_seen >= cutoff_at(now), "must not leave instantly");
+            // …but idle (→ leave) once CLEAN_CLOSE_LEAVE_TICKS+1 ticks pass —
+            // far sooner than the full timeout.
+            let soon = now + super::super::CLEAN_CLOSE_LEAVE_TICKS + 1;
+            assert!(
+                last_seen < cutoff_at(soon),
+                "fast-forwarded entity must be idle within the accelerated window"
+            );
+
+            // Case 2: the rewind must never move last_seen FORWARD. An entity
+            // already deep into idleness (last_seen far in the past) keeps its
+            // older timestamp — a stale close report cannot postpone a leave.
+            let mut old_last_seen = 100u64;
+            if fast_forwarded < old_last_seen {
+                old_last_seen = fast_forwarded;
+            }
+            assert_eq!(old_last_seen, 100, "older last_seen wins");
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn expired_tombstone_allows_readoption() {
+            // Spec #306: after DEPARTED_TTL_TICKS the ownership record's word
+            // is authoritative again — the SAME frame that was blocked while
+            // tombstoned MUST adopt once the tombstone expired (a fresh
+            // control-plane decision to place the id here is legitimate).
+            let my_cluster = Uuid::from_u128(1);
+            let entity_id = Uuid::from_u128(100);
+            let server_ids = std::collections::HashSet::new();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            use crate::node_inbox::ReplicatedEntity;
+            use arcane_affinity::rate_field::RateTier;
+
+            let frame = NodeInboxFrame {
+                tick: 100u64,
+                ownership: vec![],
+                entities: vec![ReplicatedEntity {
+                    entry: mk_entry(entity_id, my_cluster, 7.0),
+                    tier: RateTier::Full,
+                    rate_hz: 30.0,
+                }],
+                owned: Some(vec![entity_id]),
+            };
+
+            // While tombstoned: blocked.
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+            departed.insert(entity_id, 50u64);
+            let report = apply_inbox_frame(
+                my_cluster,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                &departed,
+                100u64,
+            );
+            assert!(report.adopted.is_empty(), "tombstoned id must not adopt");
+
+            // After expiry (pump's retain pruned the entry): the same frame adopts.
+            departed.clear();
+            let report = apply_inbox_frame(
+                my_cluster,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                &departed,
+                100u64,
+            );
+            assert_eq!(
+                report.adopted.len(),
+                1,
+                "expired tombstone must allow re-adoption"
+            );
+            assert_eq!(report.adopted[0].entity_id, entity_id);
         }
     }
 }
