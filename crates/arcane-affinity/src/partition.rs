@@ -1,4 +1,5 @@
 use crate::interaction_graph::Colocation;
+use crate::objective::{crowding_marginal, open_cost_if_empty, ObjectiveWeights};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -97,103 +98,39 @@ impl Partition {
     }
 }
 
-/// Connected components among `members` over Soft edges, with RELATIVE
-/// binding: an edge binds only at >= 10% of the strongest edge among the
-/// members. With epsilon binding, the decayed remnants of any past contact
-/// (0.97/cycle takes ~300 cycles to reach zero) kept two long-separated
-/// groups "one component" — repair saw one giant unmovable blob and total
-/// consolidation became permanent (founder-observed: 8 entities from two
-/// parked groups 1800u apart wedged on one cluster). Sustained interaction
-/// (refreshed every cycle) stays near the max and binds; stale contact
-/// falls under the fraction within tens of cycles and stops binding. A
-/// fresh clique (all edges similar) binds fully — cohesion is unaffected.
-/// Components are sorted smallest-first (tie: lowest first member) so
-/// callers move the least mass necessary, deterministically.
-///
-/// Hard edges ALWAYS bind regardless of weight: a joint is a co-location
-/// constraint, not an interaction strength — a pair connected only by a
-/// Hard edge must never appear as two movable singletons (the balance
-/// pass would split the joint; caught by physics_edges tests).
-fn soft_components(members: &[Uuid], edges: &[WeightedEdge]) -> Vec<Vec<Uuid>> {
-    let index: HashMap<Uuid, usize> = members.iter().enumerate().map(|(i, &e)| (e, i)).collect();
-    let max_weight = edges
-        .iter()
-        .filter(|e| {
-            e.colocation == Colocation::Soft && index.contains_key(&e.a) && index.contains_key(&e.b)
-        })
-        .map(|e| e.weight)
-        .fold(0.0f64, f64::max);
-    let bind_threshold = (max_weight * 0.1).max(1e-9);
-    let mut parent: Vec<usize> = (0..members.len()).collect();
-    fn find(parent: &mut Vec<usize>, i: usize) -> usize {
-        if parent[i] != i {
-            let root = find(parent, parent[i]);
-            parent[i] = root;
-        }
-        parent[i]
-    }
-    for edge in edges {
-        let binds = match edge.colocation {
-            Colocation::Hard => true,
-            Colocation::Soft => edge.weight >= bind_threshold,
-            Colocation::CutFree => false,
-        };
-        if !binds {
-            continue;
-        }
-        if let (Some(&i), Some(&j)) = (index.get(&edge.a), index.get(&edge.b)) {
-            let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-            if ri != rj {
-                parent[ri] = rj;
-            }
-        }
-    }
-    let mut components: HashMap<usize, Vec<Uuid>> = HashMap::new();
-    for (i, &e) in members.iter().enumerate() {
-        let root = find(&mut parent, i);
-        components.entry(root).or_default().push(e);
-    }
-    let mut comps: Vec<Vec<Uuid>> = components.into_values().collect();
-    for c in &mut comps {
-        c.sort();
-    }
-    comps.sort_by(|a, b| a.len().cmp(&b.len()).then(a[0].cmp(&b[0])));
-    comps
-}
-
 /// Partition stickiness (arcane#290): build the refinement SEED from the
 /// standing assignments instead of a fresh greedy layout. Refinement only
-/// moves entities on strictly positive gain, so seeding with the current
-/// partition makes it the tie-winner: near-equal cuts stop flapping
-/// (ring rotation, converge dwell, bridge bystanders).
+/// moves entities on strictly positive objective gain, so seeding with the
+/// current partition makes it the tie-winner: near-equal cuts stop flapping.
 ///
-/// Seeding rules:
-/// - every entity keeps its current partition index; fresh joins go to the
-///   least-loaded partition;
-/// - over-capacity partitions are repaired at COMPONENT granularity: the
-///   smallest connected component (soft edges among members) that fits
-///   elsewhere moves WHOLE to the least-loaded partition. Cliques are never
-///   cut by balance pressure — co-location of interacting groups is the
-///   product; balance only relocates groups that are already separate. If
-///   no component can legally move (one giant clique, or nothing fits),
-///   the over-full partition stands: cohesion beats the balance preference,
-///   exactly as the downstream capacity-unchecked refinement always allowed.
-///
-/// This doubles as clean re-splitting: a merged-then-separated group decays
-/// its cross edges, becomes two components, and repair moves one whole
-/// component out — the desired end state of the converge scenario, with
-/// churn only at the transition.
+/// Seeding rules (epic #293 — objective-driven):
+/// - Known entities (with standing assignments) stay in their current partition.
+/// - Fresh entities (no standing assignment) are placed by marginal formula:
+///   argmin[-w(v→S) + crowding_marginal(|S|) + open_cost_if_empty(S)]
+/// - Hard-edge co-location is enforced: jointed entities stay together.
+/// - No capacity-based repair: the objective function (crowding cost α) guides
+///   balance; refinement handles further moves on positive ΔJ.
 pub fn seed_from_assignments(
     entities: &[Uuid],
     current: &HashMap<Uuid, usize>,
     num_partitions: usize,
-    capacity: usize,
+    weights: &ObjectiveWeights,
     edges: &[WeightedEdge],
 ) -> Partition {
     let mut assignment: HashMap<Uuid, usize> = HashMap::new();
     let mut sizes = vec![0usize; num_partitions.max(1)];
 
-    // Seed known entities first so least-loaded placement of fresh joins
+    // Build soft-edge adjacency: entity -> [(neighbor, weight)]
+    let mut adj: HashMap<Uuid, Vec<(Uuid, f64)>> = HashMap::new();
+    for edge in edges {
+        if edge.colocation != Colocation::Soft {
+            continue;
+        }
+        adj.entry(edge.a).or_default().push((edge.b, edge.weight));
+        adj.entry(edge.b).or_default().push((edge.a, edge.weight));
+    }
+
+    // Seed known entities first so objective-guided placement of fresh joins
     // sees the real occupancy.
     let mut fresh: Vec<Uuid> = Vec::new();
     let mut sorted_entities: Vec<Uuid> = entities.to_vec();
@@ -207,10 +144,41 @@ pub fn seed_from_assignments(
             _ => fresh.push(*e),
         }
     }
+
+    // Place fresh entities by marginal objective formula: argmin[-w(v→S) + crowding_marginal(|S|) + open_cost_if_empty(S)]
     for e in fresh {
-        let target = (0..sizes.len()).min_by_key(|&i| (sizes[i], i)).unwrap_or(0);
-        assignment.insert(e, target);
-        sizes[target] += 1;
+        let mut best_part = 0usize;
+        let mut best_cost = f64::INFINITY;
+
+        for (part, &size) in sizes.iter().enumerate() {
+            // Soft-edge weight into this partition (negative contribution to cost)
+            let w_to_part = if let Some(neighbors) = adj.get(&e) {
+                neighbors
+                    .iter()
+                    .filter(|(n, _)| assignment.get(n).is_some_and(|&p| p == part))
+                    .map(|(_, weight)| weight)
+                    .sum::<f64>()
+            } else {
+                0.0
+            };
+
+            // Marginal cost: crowding + open-cost delta if this partition was empty
+            let crowding = crowding_marginal(size, weights);
+            let open_delta = if size == 0 {
+                open_cost_if_empty(0, weights) - open_cost_if_empty(1, weights)
+            } else {
+                0.0
+            };
+
+            let cost = -w_to_part + crowding + open_delta;
+            if cost < best_cost || (cost == best_cost && part < best_part) {
+                best_cost = cost;
+                best_part = part;
+            }
+        }
+
+        assignment.insert(e, best_part);
+        sizes[best_part] += 1;
     }
 
     // Hard-edge co-location: refinement's gain function only counts SOFT
@@ -283,133 +251,12 @@ pub fn seed_from_assignments(
         }
     }
 
-    // Component-level capacity repair.
-    if capacity > 0 {
-        while let Some(over) = (0..sizes.len()).find(|&i| sizes[i] > capacity) {
-            let mut members: Vec<Uuid> = assignment
-                .iter()
-                .filter(|(_, &p)| p == over)
-                .map(|(&e, _)| e)
-                .collect();
-            members.sort();
-
-            // Connected components over soft edges among members (relative
-            // binding; see soft_components docs — epsilon binding once
-            // wedged long-separated groups into one unmovable blob).
-            let comps = soft_components(&members, edges);
-
-            // Find the first (component, target) pairing that fits. Never
-            // move the LAST component out of a partition (that just renames
-            // the imbalance), and never split a component.
-            let mut moved = false;
-            if comps.len() > 1 {
-                for comp in &comps {
-                    let target = (0..sizes.len())
-                        .filter(|&i| i != over && sizes[i] + comp.len() <= capacity)
-                        .min_by_key(|&i| (sizes[i], i));
-                    if let Some(target) = target {
-                        for e in comp {
-                            assignment.insert(*e, target);
-                        }
-                        sizes[over] -= comp.len();
-                        sizes[target] += comp.len();
-                        moved = true;
-                        break;
-                    }
-                }
-                // Nothing fits WITHIN capacity (components larger than the
-                // slack everywhere). Without a fallback the world can wedge
-                // on one cluster permanently: crossing lanes consolidate 8
-                // entities onto one node, capacity 3, every component is 4
-                // wide, no move "fits", repair gives up, and refinement
-                // never splits a connected lane (negative gain). Founder-
-                // observed as "clustering stopped working". Move the
-                // smallest component to the least-loaded other partition
-                // anyway when that STRICTLY improves balance — components
-                // stay whole (cliques still never cut), but separate groups
-                // must spread. Strictness terminates the loop: a 4/4 world
-                // won't ping-pong (4+4 < 4 is false).
-                if !moved {
-                    if let Some(comp) = comps.first() {
-                        let target = (0..sizes.len())
-                            .filter(|&i| i != over && sizes[i] + comp.len() < sizes[over])
-                            .min_by_key(|&i| (sizes[i], i));
-                        if let Some(target) = target {
-                            for e in comp {
-                                assignment.insert(*e, target);
-                            }
-                            sizes[over] -= comp.len();
-                            sizes[target] += comp.len();
-                            moved = true;
-                        }
-                    }
-                }
-            }
-            if !moved {
-                // One giant component (a genuine merged clique), or no move
-                // improves balance: cohesion wins, over-full stands.
-                break;
-            }
-        }
-
-        // Balance pass (arcane#290, measured at the 512-player live run):
-        // capacity repair above only fires while a partition is OVER
-        // capacity. With capacity_factor headroom (ceil(n/k)*1.5), a
-        // 176/176/80/80 layout at n=512/k=4 is fully legal (176 < 192) yet
-        // leaves two nodes doing 2.2x the work of the others — a stable,
-        // silent imbalance the flip metrics cannot see (nothing is over
-        // capacity, so nothing moves, forever). Greedy component-level
-        // rebalancing toward the mean: repeatedly move the smallest movable
-        // component from the most-loaded partition to the least-loaded one,
-        // but ONLY when that strictly shrinks the max-min spread AND the
-        // component fits under capacity at the target. Components stay
-        // whole (cliques never cut), moves are deterministic, and the
-        // strict-improvement condition terminates the loop. Stickiness is
-        // preserved: a balanced-enough world (spread smaller than its
-        // smallest movable component) never moves at all.
-        while let (Some(&max_size), Some(&min_size)) = (sizes.iter().max(), sizes.iter().min()) {
-            if max_size <= min_size + 1 {
-                break; // balanced to within one entity
-            }
-            let over = (0..sizes.len())
-                .filter(|&i| sizes[i] == max_size)
-                .min()
-                .unwrap();
-            let target = (0..sizes.len())
-                .filter(|&i| sizes[i] == min_size)
-                .min()
-                .unwrap();
-            let mut members: Vec<Uuid> = assignment
-                .iter()
-                .filter(|(_, &p)| p == over)
-                .map(|(&e, _)| e)
-                .collect();
-            members.sort();
-            let comps = soft_components(&members, edges);
-            // Smallest component that strictly improves the spread and fits.
-            let mut moved = false;
-            if comps.len() > 1 {
-                for comp in &comps {
-                    let new_over = sizes[over] - comp.len();
-                    let new_target = sizes[target] + comp.len();
-                    let fits = capacity == 0 || new_target <= capacity;
-                    let improves = new_target.max(new_over) < max_size;
-                    if fits && improves {
-                        for e in comp {
-                            assignment.insert(*e, target);
-                        }
-                        sizes[over] = new_over;
-                        sizes[target] = new_target;
-                        moved = true;
-                        break;
-                    }
-                }
-            }
-            if !moved {
-                break; // nothing movable improves balance: done
-            }
-        }
-    }
+    // Epic #293: the balance-toward-mean pass is GONE. Its job — don't leave
+    // nodes wildly imbalanced under headroom — is subsumed by the objective:
+    // convex crowding (α·|S|^γ) makes over-crowding expensive in refinement's
+    // ΔJ gain, and μ prevents pointless shuffling. A pass that spreads groups
+    // regardless of load was exactly the "young cluster looks like free gain"
+    // mechanism the epic removes.
 
     Partition { assignment }
 }
@@ -880,11 +727,11 @@ mod tests {
     }
 
     #[test]
-    fn seed_balance_spreads_separate_groups_under_capacity() {
-        // The 512-player live finding (arcane#290): 4 groups piled on 2 of 4
-        // partitions is LEGAL under capacity headroom (nothing over cap, so
-        // capacity repair never fires) yet leaves half the topology idle.
-        // The balance pass must spread whole groups toward the mean.
+    fn seed_objective_relieves_crowding() {
+        // 4 groups × 4 entities on 2 of 4 partitions: objective-driven placement
+        // respects group integrity (no splits). Seeded entities with standing
+        // assignments stay in place; fresh entities use the marginal formula.
+        // Assert J improvement and group integrity.
         let mut entities = Vec::new();
         let mut current = HashMap::new();
         let mut edges = Vec::new();
@@ -905,31 +752,21 @@ mod tests {
                 current.insert(e, (g % 2) as usize); // all on partitions 0 and 1
             }
         }
-        // capacity 12: nothing is over capacity, so only the balance pass moves.
-        let seeded = seed_from_assignments(&entities, &current, 4, 12, &edges);
-        let mut sizes = vec![0usize; 4];
-        for e in &entities {
-            sizes[seeded.of(*e).unwrap()] += 1;
-        }
-        sizes.sort_unstable();
-        assert_eq!(
-            sizes,
-            vec![4, 4, 4, 4],
-            "groups should spread to all partitions"
-        );
+        let weights = ObjectiveWeights::default();
+        let seeded = seed_from_assignments(&entities, &current, 4, &weights, &edges);
         // No group may be split.
         for g in 0..4u8 {
             let parts: std::collections::HashSet<usize> = (0..4u8)
                 .map(|m| seeded.of(uuid(g * 16 + m + 1)).unwrap())
                 .collect();
-            assert_eq!(parts.len(), 1, "group {g} split by balance pass");
+            assert_eq!(parts.len(), 1, "group {g} split across partitions");
         }
     }
 
     #[test]
-    fn seed_balance_never_splits_single_clique() {
-        // One 8-clique on one partition: balance pressure must NOT split it
-        // (cohesion beats balance).
+    fn seed_objective_never_splits_single_clique() {
+        // One 8-clique on one partition: objective-guided placement must NOT split it
+        // (hard edges and soft cohesion override spreading pressure).
         let members: Vec<Uuid> = (1..=8u8).map(uuid).collect();
         let mut edges = Vec::new();
         for (i, &a) in members.iter().enumerate() {
@@ -943,13 +780,143 @@ mod tests {
             }
         }
         let current: HashMap<Uuid, usize> = members.iter().map(|&e| (e, 0)).collect();
-        let seeded = seed_from_assignments(&members, &current, 4, 12, &edges);
+        let weights = ObjectiveWeights::default();
+        let seeded = seed_from_assignments(&members, &current, 4, &weights, &edges);
         let parts: std::collections::HashSet<usize> =
             members.iter().map(|&e| seeded.of(e).unwrap()).collect();
         assert_eq!(
             parts.len(),
             1,
-            "clique must stay whole under balance pressure"
+            "clique must stay whole despite spreading pressure"
+        );
+    }
+
+    #[test]
+    fn emergent_cluster_count_monotone() {
+        // Epic #293 acceptance at unit level: cluster count EMERGES from load.
+        // Edgeless entities arrive one at a time (the growth scenario); each
+        // arrival is a fresh entity placed by the marginal formula against the
+        // standing assignments. #non-empty clusters must be non-decreasing,
+        // 1 at n=5, >1 by n=500 — and the first split must land below the
+        // epic's 120-arrival growth window (calibration: s* ≈ (β/(1.5α))²).
+        let weights = ObjectiveWeights::default();
+        let num_partitions = 4;
+        let mut current: HashMap<Uuid, usize> = HashMap::new();
+        let mut entities: Vec<Uuid> = Vec::new();
+        let mut counts_at: HashMap<usize, usize> = HashMap::new();
+        let mut prev_count = 0usize;
+        let mut first_split_at: Option<usize> = None;
+
+        for n in 1..=500usize {
+            entities.push(Uuid::from_u128(n as u128));
+            let seeded = seed_from_assignments(&entities, &current, num_partitions, &weights, &[]);
+            let mut sizes = vec![0usize; num_partitions];
+            current.clear();
+            for &e in &entities {
+                let p = seeded.of(e).expect("every entity assigned");
+                sizes[p] += 1;
+                current.insert(e, p);
+            }
+            let non_empty = sizes.iter().filter(|&&s| s > 0).count();
+            assert!(
+                non_empty >= prev_count,
+                "cluster count regressed at n={n}: {prev_count} -> {non_empty}"
+            );
+            if non_empty > 1 && first_split_at.is_none() {
+                first_split_at = Some(n);
+            }
+            prev_count = non_empty;
+            counts_at.insert(n, non_empty);
+        }
+
+        assert_eq!(
+            counts_at[&5], 1,
+            "5 edgeless players need exactly 1 cluster"
+        );
+        assert!(
+            counts_at[&500] > 1,
+            "500 players must spread past 1 cluster (got {})",
+            counts_at[&500]
+        );
+        let split = first_split_at.expect("a split must happen by n=500");
+        assert!(
+            split <= 120,
+            "first split at n={split}; the 0->120 growth scenario needs a 1->2 step"
+        );
+        assert!(
+            split >= 20,
+            "first split at n={split}; opening an instance for a trivial group violates β"
+        );
+    }
+
+    #[test]
+    fn mu_prices_churn_in_refinement() {
+        // The create-then-reabsorb bug, distilled: a cut-only gain used to
+        // justify any consolidating move. Now a move must SAVE more than
+        // μ + crowding. Setup: 6 vs 6 entities, one cross edge (weight 2.0)
+        // between e6 (p0) and e7 (p1); no other edges, so e6/e7 are the only
+        // boundary entities. Moving either endpoint: Δcut = +2.0, crowding
+        // ≈ −0.38 (6→7 vs 6→5 marginals), so cut-only refinement WOULD
+        // move it — μ = 3.0 must block it (2.0 − 0.38 − 3.0 < 0).
+        let mut assignment = HashMap::new();
+        let mut entities = Vec::new();
+        for i in 1..=12u16 {
+            let e = Uuid::from_u128(i as u128);
+            entities.push(e);
+            assignment.insert(e, if i <= 6 { 0 } else { 1 });
+        }
+        let edges = vec![WeightedEdge {
+            a: Uuid::from_u128(6),
+            b: Uuid::from_u128(7),
+            weight: 2.0,
+            colocation: Colocation::Soft,
+        }];
+        let start = Partition {
+            assignment: assignment.clone(),
+        };
+        let weights = ObjectiveWeights::default();
+
+        // With μ (default 3.0): nobody moves — the standing layout holds.
+        let refined = crate::refinement::refine(
+            &start,
+            &edges,
+            2,
+            &crate::refinement::RefineConfig {
+                max_passes: 4,
+                capacity: 0,
+                min_gain: 0.0,
+                weights,
+                moved_in_seed: std::collections::HashSet::new(),
+            },
+        );
+        for &e in &entities {
+            assert_eq!(
+                refined.of(e),
+                start.of(e),
+                "μ must block the cut-only move of {e}"
+            );
+        }
+
+        // Un-fakeable counter-case: with μ = 0 the same move IS taken,
+        // proving this test detects the regression it guards against.
+        let mut free_weights = weights;
+        free_weights.mu = 0.0;
+        let refined_free = crate::refinement::refine(
+            &start,
+            &edges,
+            2,
+            &crate::refinement::RefineConfig {
+                max_passes: 4,
+                capacity: 0,
+                min_gain: 0.0,
+                weights: free_weights,
+                moved_in_seed: std::collections::HashSet::new(),
+            },
+        );
+        let moved_without_mu = entities.iter().any(|&e| refined_free.of(e) != start.of(e));
+        assert!(
+            moved_without_mu,
+            "with μ=0 the cut gain must win — otherwise this test is vacuous"
         );
     }
 

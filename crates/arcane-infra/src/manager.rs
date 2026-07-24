@@ -270,26 +270,12 @@ fn build_partition_decisions(
     };
     let num_partitions = std::cmp::max(1, sorted_clusters.len());
 
-    // Capacity = ceil(ceil(n/k) * capacity_factor). The multiply must CEIL:
-    // truncation made a 2-entity/2-cluster world compute capacity 1
-    // (1 * 1.5 -> 1), under which co-locating any pair is illegal. That was
-    // masked for years by refinement running capacity-UNCHECKED (RefineConfig
-    // capacity 0) — the partitioner obeyed a limit refinement then violated.
-    // Now refinement enforces capacity (seeded stickiness requires it, else
-    // eviction repair and refine undo each other), so the formula must
-    // genuinely allow the headroom the factor promises.
-    let base_capacity = entities.len().div_ceil(num_partitions);
-    let capacity = std::cmp::max(
-        1,
-        (base_capacity as f64 * config.capacity_factor).ceil() as usize,
-    );
-
-    // Build partition input
+    // Build partition input: capacity = 0 (no hard cap); the objective replaces it.
     let input = PartitionInput {
         entities: entities.clone(),
         edges,
         num_partitions,
-        capacity,
+        capacity: 0,
     };
 
     // Partition stickiness (arcane#290): seed refinement from the STANDING
@@ -304,32 +290,52 @@ fn build_partition_decisions(
         .enumerate()
         .map(|(i, &c)| (c, i))
         .collect();
+    let current_idx: HashMap<Uuid, usize> = current_assignments
+        .iter()
+        .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
+        .collect();
     let partition = if config.seed_from_current && !current_assignments.is_empty() {
-        let current_idx: HashMap<Uuid, usize> = current_assignments
-            .iter()
-            .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
-            .collect();
         arcane_affinity::partition::seed_from_assignments(
             &input.entities,
             &current_idx,
             num_partitions,
-            capacity,
+            &config.objective,
             &input.edges,
         )
     } else {
         GreedyGrowthPartitioner::new().partition(&input)
     };
 
-    // Run refinement, capacity-UNCHECKED (as always): cohesion beats the
+    // Run refinement with objective-driven gain (epic #293): cohesion beats the
     // balance preference — a clique larger than ceil(n/k)*factor may still
-    // co-locate. Balance acts at component granularity in the seed repair
-    // (whole groups relocate; cliques are never cut), and at bootstrap via
-    // the greedy layout.
+    // co-locate. Refinement evaluates moves on full ΔJ (cut + crowding + instance + move cost).
+    let moved_in_seed: std::collections::HashSet<Uuid> = if config.seed_from_current {
+        partition
+            .assignment()
+            .iter()
+            .filter(|(&e, &p)| {
+                if let Some(&standing_p) = current_idx.get(&e) {
+                    standing_p != p
+                } else {
+                    true // Fresh entities count as moved
+                }
+            })
+            .map(|(&e, _)| e)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let refined_partition = refine(
         &partition,
         &input.edges,
         num_partitions,
-        &RefineConfig::default(),
+        &RefineConfig {
+            max_passes: 4,
+            capacity: 0,
+            min_gain: 0.0,
+            weights: config.objective,
+            moved_in_seed,
+        },
     );
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:
@@ -407,18 +413,28 @@ pub fn place_for_join(
         cluster_sizes.entry(cluster_id).or_insert(0);
     }
 
-    // Compute affinity: proximity-weighted sum of nearby players per cluster.
+    // Compute affinity: predicted future edge weight per cluster. A player
+    // near the spawn point will form a proximity edge that converges to the
+    // EQUILIBRIUM weight w/(1−decay) (accrual w per cycle against decay),
+    // not the single-cycle increment w — using the raw per-cycle weight
+    // under-scales affinity ~33x against the objective's crowding/β terms
+    // (which are calibrated in equilibrium units; see ObjectiveWeights).
     let mut affinities: HashMap<Uuid, f64> = HashMap::new();
 
     if let Some(spawn) = spawn_pos {
         let radius = config.proximity_radius;
         let radius_sq = radius * radius;
+        let equilibrium_edge = if config.decay_factor < 1.0 {
+            config.proximity_weight / (1.0 - config.decay_factor)
+        } else {
+            config.proximity_weight
+        };
 
         for (_entity_id, cluster_id, pos) in entity_data {
             let dx = pos.x - spawn.x;
             let dz = pos.z - spawn.z;
             if dx * dx + dz * dz <= radius_sq {
-                *affinities.entry(*cluster_id).or_insert(0.0) += config.proximity_weight;
+                *affinities.entry(*cluster_id).or_insert(0.0) += equilibrium_edge;
             }
         }
     }
