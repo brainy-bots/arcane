@@ -79,7 +79,16 @@ const NEIGHBOR_STALE_TICKS: u64 = 300;
 /// Anti-resurrection tombstone TTL (≈30s of ticks, comfortably beyond manager
 /// forget latency). Prunes departed entries older than this on the same cadence
 /// as the idle-timeout check.
+#[cfg(feature = "migration")]
 const DEPARTED_TTL_TICKS: u64 = 1800;
+/// Epic #305: how quickly a CLEANLY-closed session's entity leaves (≈2s of
+/// ticks at 60Hz). Clean close = accelerated idle: the entity's idle clock is
+/// set so the idle path completes the leave within this window — unless
+/// another live connection is still driving the entity (its updates refresh
+/// `client_driven_last_seen` and cancel the fast-forward). Crashed sockets
+/// (error paths) are NOT accelerated; they wait out the full idle timeout.
+#[cfg(feature = "migration")]
+const CLEAN_CLOSE_LEAVE_TICKS: u64 = 120;
 
 /// Apply one inbox frame to node-local state. Returns the number of ownership
 /// changes applied and proxies upserted.
@@ -403,6 +412,15 @@ pub struct NodeCore {
     /// of just-removed entities until the ownership record forgets them (bounded TTL).
     #[cfg(feature = "migration")]
     departed: HashMap<Uuid, u64>,
+    /// Epic #305 clean-close trigger: avatar ids whose WS connection closed
+    /// CLEANLY (Close frame / EOF). Drained each publish interval; each id's
+    /// idle clock is fast-forwarded so the unified leave path completes it
+    /// within ~CLEAN_CLOSE_LEAVE_TICKS instead of the full idle timeout.
+    /// One code path (idle) serves both triggers; the shared-entity rule
+    /// (another connection still driving the entity refreshes last_seen and
+    /// cancels the fast-forward) falls out for free.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
+    session_closes_rx: std::sync::mpsc::Receiver<Uuid>,
 }
 
 impl NodeCore {
@@ -460,6 +478,8 @@ impl NodeCore {
         // rx side lives in the subscriber loop; this core holds the tx and
         // produces directives from the forwarding path (migration only).
         let (reconnect_hint_tx, reconnect_hint_rx) = std::sync::mpsc::channel();
+        // Epic #305: clean-close reports from subscriber tasks → node loop.
+        let (session_closes_tx, session_closes_rx) = std::sync::mpsc::channel();
         crate::ws_server::run_ws_server(
             cfg.ws_port,
             state_rx,
@@ -468,6 +488,7 @@ impl NodeCore {
             stats.clone(),
             visibility_filter,
             reconnect_hint_rx,
+            session_closes_tx,
         );
 
         let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
@@ -636,6 +657,7 @@ impl NodeCore {
             client_idle_timeout_ticks: cfg.client_idle_timeout_ticks,
             #[cfg(feature = "migration")]
             departed: HashMap::new(),
+            session_closes_rx,
         })
     }
 
@@ -648,25 +670,41 @@ impl NodeCore {
         self.server.current_tick()
     }
 
-    /// L0 leave hook: extensible seam for layers to remember entity state on departure.
-    /// Currently a no-op debug logging stub; sub-issues 2/3 will implement L1/L2 logic here.
-    /// Layers can override this to implement persistence (L1/L2).
+    /// The "remember" seam of the unified leave path (epic #305): receives the
+    /// entity's FINAL state snapshot, captured before removal. L0 = no-op.
+    /// Sub-issue #307 (L1) parks this snapshot in Redis with a TTL; sub-issue
+    /// #308 (L2) performs the final durable write through the persistence
+    /// seam. The snapshot is `None` only if the entity was already gone from
+    /// the map (double-leave race) — layers must treat that as nothing to
+    /// remember, never as an error.
     #[cfg(feature = "migration")]
-    fn on_leave(&mut self, _id: Uuid) {
-        eprintln!("[L0 leave] Entity departed (L1/L2 persistence hooks available)");
+    fn on_leave(&mut self, id: Uuid, final_state: Option<&EntityStateEntry>) {
+        // L0: leave-and-forget. Log at debug cadence only (leaves are rare).
+        eprintln!(
+            "[leave] entity {id} departed (L0: nothing remembered; snapshot {})",
+            if final_state.is_some() {
+                "captured"
+            } else {
+                "already gone"
+            }
+        );
     }
 
-    /// Unified leave path: entity ends session and never comes back (anti-resurrection).
-    /// Called on two triggers: clean WS close and idle timeout.
+    /// Unified leave path (epic #305): the session ends and the entity leaves
+    /// the world — identically for every trigger (idle timeout today; clean
+    /// WS close arrives with the ws_server wiring; explicit leave later).
     ///
-    /// Sequence:
-    /// 1. Remember hook — layer-dependent (L0 stub, L1 parks snapshot, L2 final write)
-    /// 2. Remove from server → emits `removed` delta to clients
-    /// 3. Bookkeeping cleanup: client_driven_last_seen, reconnect_last_hint, spawn_grace
-    /// 4. Tombstone insert: block re-adoption until ownership record forgets
+    /// Sequence (remember FIRST, then remove — a crash between steps leaves a
+    /// still-live entity, which is safe and retried; never a lost one):
+    /// 1. Snapshot the final state, hand it to `on_leave` (layer-dependent).
+    /// 2. Remove from the server map → emits the `removed` delta to clients.
+    /// 3. Bookkeeping cleanup: client_driven_last_seen, reconnect_last_hint, spawn_grace.
+    /// 4. Departure tombstone: blocks the ADOPT and spawn-grace paths until
+    ///    the ownership record stops stating the id (bounded TTL).
     #[cfg(feature = "migration")]
     fn leave_entity(&mut self, id: Uuid) {
-        self.on_leave(id);
+        let final_state = self.server.get_entity(id);
+        self.on_leave(id, final_state.as_ref());
         self.server.remove_entity(id);
         self.client_driven_last_seen.remove(&id);
         self.reconnect_last_hint.remove(&id);
@@ -1082,6 +1120,34 @@ impl NodeCore {
 
         #[cfg(feature = "migration")]
         if self.tick_count.is_multiple_of(self.state_publish_interval) {
+            // Epic #305 clean-close: fast-forward the idle clock of entities
+            // whose connection closed cleanly. Setting last_seen back to
+            // (now − timeout + CLEAN_CLOSE_LEAVE_TICKS) makes the idle sweep
+            // below complete the leave within ~2s — one leave code path, two
+            // triggers. If ANOTHER connection is still driving the entity, its
+            // next update overwrites last_seen and the fast-forward is void
+            // (the shared-entity rule from the #306 spec). Only entities
+            // already tracked as client-driven are eligible.
+            if self.client_idle_timeout_ticks > 0 {
+                while let Ok(avatar) = self.session_closes_rx.try_recv() {
+                    if let Some(last_seen) = self.client_driven_last_seen.get_mut(&avatar) {
+                        let fast_forwarded = self
+                            .tick_count
+                            .saturating_sub(self.client_idle_timeout_ticks)
+                            .saturating_add(CLEAN_CLOSE_LEAVE_TICKS);
+                        // Never push last_seen FORWARD (a live driver's fresh
+                        // update must win over a stale close report).
+                        if fast_forwarded < *last_seen {
+                            *last_seen = fast_forwarded;
+                        }
+                    }
+                }
+            } else {
+                // Idle timeout disabled: clean-close reports have no engine to
+                // complete them; drain and drop so the channel never backs up.
+                while self.session_closes_rx.try_recv().is_ok() {}
+            }
+
             // Client-driven entity idle timeout: despawn entities whose last client
             // update is older than the configured timeout. Only entities in
             // `client_driven_last_seen` are eligible — sim-spawned entities are never touched.
@@ -1489,8 +1555,10 @@ mod forwarding_tests {
 }
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "migration")]
     use super::apply_inbox_frame;
     use super::merge_with_neighbor_latest;
+    #[cfg(feature = "migration")]
     use crate::node_inbox::NodeInboxFrame;
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
     use arcane_core::Vec3;
@@ -2545,20 +2613,105 @@ mod tests {
         #[test]
         #[cfg(feature = "migration")]
         fn clean_close_fast_forwards_idle() {
-            // Clean close fast-forwards idle timeout: instead of waiting full idle_timeout_ticks,
-            // the entity leaves within ~2s of ticks. This is achieved by setting
-            // client_driven_last_seen to (current_tick - idle_timeout_ticks + 2s_ticks).
-            // L0: this seam is in place for implementation in sub-issue 1; actual
-            // clean-close integration happens in ws_server integration (out of L0 scope).
-            let fast_forward_offset_ticks = 120u64;
-            // Fast-forward accelerates entity leave by setting last_seen_tick far back,
-            // reducing the wait from typical idle timeouts to roughly fast_forward_offset_ticks.
-            // The key is that fast_forward_offset (120 ticks ≈ 2s) is much shorter than
-            // typical idle timeouts (6000+ ticks ≈ 2 minutes).
+            // The clean-close trigger IS the idle path with a rewound clock:
+            // last_seen := now − timeout + CLEAN_CLOSE_LEAVE_TICKS, never
+            // moved FORWARD. Verify the two invariants of that arithmetic
+            // exactly as pump() computes it.
+            let idle_timeout = 6000u64; // ~2min at 50Hz
+            let now = 10_000u64;
+
+            // Case 1: freshly-driven entity (last_seen = now). Fast-forward
+            // rewinds it so the idle sweep fires within CLEAN_CLOSE_LEAVE_TICKS
+            // publish-intervals, not the full timeout.
+            let mut last_seen = now;
+            let fast_forwarded = now
+                .saturating_sub(idle_timeout)
+                .saturating_add(super::super::CLEAN_CLOSE_LEAVE_TICKS);
+            if fast_forwarded < last_seen {
+                last_seen = fast_forwarded;
+            }
+            let cutoff_at = |t: u64| t.saturating_sub(idle_timeout);
+            // Not yet idle at `now`…
+            assert!(last_seen >= cutoff_at(now), "must not leave instantly");
+            // …but idle (→ leave) once CLEAN_CLOSE_LEAVE_TICKS+1 ticks pass —
+            // far sooner than the full timeout.
+            let soon = now + super::super::CLEAN_CLOSE_LEAVE_TICKS + 1;
             assert!(
-                fast_forward_offset_ticks > 0,
-                "fast-forward offset is positive"
+                last_seen < cutoff_at(soon),
+                "fast-forwarded entity must be idle within the accelerated window"
             );
+
+            // Case 2: the rewind must never move last_seen FORWARD. An entity
+            // already deep into idleness (last_seen far in the past) keeps its
+            // older timestamp — a stale close report cannot postpone a leave.
+            let mut old_last_seen = 100u64;
+            if fast_forwarded < old_last_seen {
+                old_last_seen = fast_forwarded;
+            }
+            assert_eq!(old_last_seen, 100, "older last_seen wins");
+        }
+
+        #[test]
+        #[cfg(feature = "migration")]
+        fn expired_tombstone_allows_readoption() {
+            // Spec #306: after DEPARTED_TTL_TICKS the ownership record's word
+            // is authoritative again — the SAME frame that was blocked while
+            // tombstoned MUST adopt once the tombstone expired (a fresh
+            // control-plane decision to place the id here is legitimate).
+            let my_cluster = Uuid::from_u128(1);
+            let entity_id = Uuid::from_u128(100);
+            let server_ids = std::collections::HashSet::new();
+            let mut grace: HashMap<Uuid, u64> = HashMap::new();
+            let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+            let mut neighbor_last_seen: HashMap<Uuid, u64> = HashMap::new();
+
+            use crate::node_inbox::ReplicatedEntity;
+            use arcane_affinity::rate_field::RateTier;
+
+            let frame = NodeInboxFrame {
+                tick: 100u64,
+                ownership: vec![],
+                entities: vec![ReplicatedEntity {
+                    entry: mk_entry(entity_id, my_cluster, 7.0),
+                    tier: RateTier::Full,
+                    rate_hz: 30.0,
+                }],
+                owned: Some(vec![entity_id]),
+            };
+
+            // While tombstoned: blocked.
+            let mut departed: HashMap<Uuid, u64> = HashMap::new();
+            departed.insert(entity_id, 50u64);
+            let report = apply_inbox_frame(
+                my_cluster,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                &departed,
+                100u64,
+            );
+            assert!(report.adopted.is_empty(), "tombstoned id must not adopt");
+
+            // After expiry (pump's retain pruned the entry): the same frame adopts.
+            departed.clear();
+            let report = apply_inbox_frame(
+                my_cluster,
+                &frame,
+                &server_ids,
+                &mut grace,
+                &mut neighbor_entities,
+                &mut neighbor_last_seen,
+                &departed,
+                100u64,
+            );
+            assert_eq!(
+                report.adopted.len(),
+                1,
+                "expired tombstone must allow re-adoption"
+            );
+            assert_eq!(report.adopted[0].entity_id, entity_id);
         }
     }
 }
