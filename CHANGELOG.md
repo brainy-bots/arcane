@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Platform primitive #17:** Entity session lifecycle — first-class connect/disconnect/reconnect/leave paths with configurable persistence ladder. Games choose L0 (ephemeral), L1 (short-term reconnect, Redis TTL), L2 (durable, SpacetimeDB), or L3 (game-defined bucket-4 logic) via `ARCANE_PERSISTENCE` env var. See [`docs/arcane-platform-primitives.md`](docs/arcane-platform-primitives.md) #17 and epic #305.
-- **Persistence environment surface:** `ARCANE_PERSISTENCE` (ephemeral | short-term | full), `ARCANE_RECONNECT_TTL_SECS`, `NODE_CLIENT_IDLE_TIMEOUT_SECS`. See [`docs/architecture/progressive-api.md`](docs/architecture/progressive-api.md) §2.1.
+- **Platform primitive #17:** Entity session lifecycle — first-class connect/disconnect/reconnect/leave paths with configurable persistence ladder. Games choose L0 (ephemeral), L1 (short-term reconnect, Redis TTL, default), L2 (durable, SpacetimeDB), or L3 (game-defined bucket-4 logic) via `ARCANE_PERSISTENCE` env var. See [`docs/arcane-platform-primitives.md`](docs/arcane-platform-primitives.md) #17 and epic #305.
+- **Persistence environment surface:** `ARCANE_PERSISTENCE` (none | short | full, default: short), `ARCANE_RECONNECT_TTL_SECS` (default: 120 seconds), `NODE_CLIENT_IDLE_TIMEOUT_SECS`. See [`docs/architecture/progressive-api.md`](docs/architecture/progressive-api.md) §2.1.
+- **Deprecated:** `SPACETIMEDB_PERSIST=1` is still honored for backwards compatibility, equivalent to `ARCANE_PERSISTENCE=full`.
 - **Meta Control Layer §8.1:** Session end is now first-class lifecycle (leave path, anti-resurrection guarantee). SpacetimeDB's cold-restart role formalized as the `IPersistence` backend for L2+ games.
 
 ### Changed

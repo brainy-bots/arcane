@@ -9,7 +9,7 @@ This document is the **canonical reference** for where game data lives in Arcane
 **Revised 2026-07-24:** Bucket 4 (SpacetimeDB durable state) is **required iff the game opts into L2+ persistence.** Every entity in Arcane always has a defined **session lifecycle** (connect/disconnect/reconnect/leave paths; see §2.1 below and [`progressive-api.md`](progressive-api.md)), but the durable layer (bucket 4) is optional:
 
 - **L0 (ephemeral, Redis-only):** L0 games run entirely in-memory on Redis with no SpacetimeDB backend. Entities exist only while cluster processes are active. All entities satisfy the lifecycle invariant; none require bucket 4.
-- **L1 (short-term, Redis with TTL):** L1 games park entity snapshots in Redis with time-to-live, enabling reconnection within the TTL window. Again, no bucket 4 required.
+- **L1 (short-term, Redis with TTL, DEFAULT):** L1 is the default. L1 games park entity snapshots in Redis with time-to-live, enabling reconnection within the TTL window. Again, no bucket 4 required. This is the recommended default for most games.
 - **L2+ (durable, SpacetimeDB backend):** L2 games opt into SpacetimeDB persistence for durable recovery across full cluster restarts. Bucket 4 becomes required for any entity that should survive a cluster crash. L3 games define bucket 4 content custom to their genre.
 
 **The actual invariant:** Every entity has a defined session lifecycle (connect event when an entity materializes in a cluster, disconnect when it leaves, reconnect when it re-enters within a TTL window, leave when the session ends and the entity is released). This lifecycle holds whether or not the entity persists durably. Recovery is possible only for L2+ games with bucket 4; L0/L1 games accept entity loss on cluster crash.
@@ -22,14 +22,14 @@ Historical note: Pre-2026-07-24 implementations modeled all entities as requirin
 
 The progressive-API persistence ladder (L0–L3 in [`progressive-api.md`](progressive-api.md)) maps cleanly to buckets:
 
-| Level | What lives there | Buckets in use | SpacetimeDB required? |
-|-------|------------------|----------------|-----------------------|
-| **L0** | Ephemeral, no recovery | 1, 2, 3 only | No. Redis holds tick-by-tick state; no durability. |
-| **L1** | Short-term reconnection window (TTL) | 1, 2, 3 + Redis TTL buckets | No. Redis carries expiring snapshots; reconnect within TTL. |
-| **L2** | Full durable recovery | 1, 2, 3 + 4 (platform) | Yes. Bucket 4 (SpacetimeDB tables) holds authoritative state. |
-| **L3** | Game-defined bucket 4 | 1, 2, 3 + 4 (custom) | Yes. Game extends bucket 4 with domain-specific tables. |
+| Level | What lives there | Buckets in use | SpacetimeDB required? | Env value |
+|-------|------------------|----------------|-----------------------|-----------|
+| **L0** | Ephemeral, no recovery | 1, 2, 3 only | No. Redis holds tick-by-tick state; no durability. | `ARCANE_PERSISTENCE=none` |
+| **L1** | Short-term reconnection window (TTL) | 1, 2, 3 + Redis TTL buckets | No. Redis carries expiring snapshots; reconnect within TTL. | `ARCANE_PERSISTENCE=short` (default) |
+| **L2** | Full durable recovery | 1, 2, 3 + 4 (platform) | Yes. Bucket 4 (SpacetimeDB tables) holds authoritative state. | `ARCANE_PERSISTENCE=full` |
+| **L3** | Game-defined bucket 4 | 1, 2, 3 + 4 (custom) | Yes. Game extends bucket 4 with domain-specific tables. | `ARCANE_PERSISTENCE=full` + custom |
 
-All levels satisfy the session-lifecycle invariant. Games choose the level via `ARCANE_PERSISTENCE` environment variable at cluster startup.
+All levels satisfy the session-lifecycle invariant. Games choose the level via `ARCANE_PERSISTENCE` environment variable at cluster startup (default: `short` / L1).
 
 ---
 

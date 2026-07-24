@@ -602,8 +602,8 @@ A third watchpoint: graph staleness during merges. If a merge region forms for d
 **Genres benefiting:** Universal. Every multiplayer game has entities with sessions, and every game has decided whether entities survive restarts. Prototypes need L0 (free, fast). Live games need L2+ (durable). The ladder shape lets games start simple and climb only where needed, paying zero cost for levels they don't use.
 
 **Progressive-API sketch:**
-- **L0** — Ephemeral: entities exist only while the cluster runs. No durable state, no reconnection window. Fast, zero overhead.
-- **L1** — Short-term reconnection: entity snapshots park in Redis with TTL (default 5m). Clients can reconnect within the window. Session ends after TTL or explicit leave. Environment: `ARCANE_PERSISTENCE=short-term`, `ARCANE_RECONNECT_TTL_SECS=<seconds>`, `NODE_CLIENT_IDLE_TIMEOUT_SECS=<seconds>`.
+- **L0** — Ephemeral: entities exist only while the cluster runs. No durable state, no reconnection window. Fast, zero overhead. Environment: `ARCANE_PERSISTENCE=none`.
+- **L1** — Short-term reconnection (default): entity snapshots park in Redis with TTL (default 120 seconds / 2 minutes). Clients can reconnect within the window. Session ends after TTL or explicit leave. Environment: `ARCANE_PERSISTENCE=short` (default), `ARCANE_RECONNECT_TTL_SECS=120` (default), `NODE_CLIENT_IDLE_TIMEOUT_SECS=<seconds>`.
 - **L2** — Full durable recovery: entity state persists in SpacetimeDB. Survives any cluster crash or graceful restart. Reconnect semantics automatic. Environment: `ARCANE_PERSISTENCE=full`.
 - **L3** — Game-defined persistence: game extends bucket 4 with custom tables, reducers, and session-state logic. Combines L2 durability with game-specific recovery rules. Environment: `ARCANE_PERSISTENCE=full` + custom reducer registration.
 
@@ -611,7 +611,7 @@ A third watchpoint: graph staleness during merges. If a merge region forms for d
 
 A second watchpoint: SpacetimeDB cold-restart role. In L2+, SpacetimeDB acts as the authoritative durable backing for entity state on a full cluster restart. It is *not* read on every tick (that would defeat the performance model). It is read only once: when a cluster restarts from cold, SpacetimeDB is the source of truth for what entities existed. Bucket 1/2 state is replicated live from other clusters or recomputed; bucket 4 is loaded from SpacetimeDB. This role is formalized by the `IPersistence` interface — the platform asks "give me entities that belong in this cluster" and the implementation (L0: empty; L1: Redis TTL buckets; L2+: SpacetimeDB query) answers.
 
-**Status:** Epic #305 (entity session lifecycle design); implementation complete for L0/L1/L2 as of 2026-07.
+**Status:** Epic #305 (entity session lifecycle design); L0/L1/L2 implementation in progress as of 2026-07. Note: #321 (L1 reconnect rehydration TTL gating) is still open with a fix in progress — reconnection behavior may require tuning as that issue resolves.
 
 **Related to:** [`four-bucket-state-model.md`](four-bucket-state-model.md) (defines bucket 4 and the lifecycle invariant); [`progressive-api.md`](progressive-api.md) (the persistence ladder and environment surface); [`meta-control-layer.md`](meta-control-layer.md) (SpacetimeDB's durable role as L2 backend).
 
