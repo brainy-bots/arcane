@@ -131,3 +131,119 @@ fn test_parking_disabled_skips_write() {
         "Disabled parking should not write to Redis"
     );
 }
+
+#[test]
+fn test_rejoin_within_ttl_restores_user_data() {
+    // Test that reconnect within ARCANE_RECONNECT_TTL_SECS restores user_data
+    // even if the anti-resurrection tombstone has been pruned.
+    let redis_url = "redis://127.0.0.1:6379";
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("Redis not available, skipping test");
+            return;
+        }
+    };
+
+    if client.get_connection().is_err() {
+        eprintln!("Redis not available, skipping test");
+        return;
+    }
+
+    let config = ParkingConfig {
+        reconnect_ttl_secs: 120, // TTL is long
+    };
+
+    let entity_id = Uuid::new_v4();
+    let cluster_id = Uuid::new_v4();
+    let mut entry = EntityStateEntry::new(
+        entity_id,
+        cluster_id,
+        Vec3::new(1.0, 2.0, 3.0),
+        Vec3::new(0.5, 0.5, 0.5),
+    );
+    entry.user_data = serde_json::json!({
+        "player_name": "Alice",
+        "level": 99,
+        "gold": 1000
+    });
+
+    // Park the entity
+    park_entity(redis_url, &config, entity_id, &entry);
+
+    // Simulate scenario: user_data should be restored from parked snapshot
+    // even if the tombstone (DEPARTED_TTL_TICKS) has expired.
+    let restored = unpark_entity(redis_url, entity_id);
+    assert!(
+        restored.is_some(),
+        "Entity should be restorable within TTL window"
+    );
+
+    let snapshot = restored.unwrap();
+    let restored_user_data = snapshot.get("user_data").expect("user_data should exist");
+    assert_eq!(
+        restored_user_data["player_name"].as_str().unwrap(),
+        "Alice",
+        "User data should be preserved exactly"
+    );
+    assert_eq!(
+        restored_user_data["level"].as_i64().unwrap(),
+        99,
+        "Level should be preserved"
+    );
+    assert_eq!(
+        restored_user_data["gold"].as_i64().unwrap(),
+        1000,
+        "Gold should be preserved"
+    );
+}
+
+#[test]
+fn test_rejoin_after_ttl_fresh() {
+    // Test that reconnect after ARCANE_RECONNECT_TTL_SECS expires
+    // results in a fresh entity (no rehydration).
+    let redis_url = "redis://127.0.0.1:6379";
+    let client = match redis::Client::open(redis_url) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("Redis not available, skipping test");
+            return;
+        }
+    };
+
+    if client.get_connection().is_err() {
+        eprintln!("Redis not available, skipping test");
+        return;
+    }
+
+    // Use very short TTL for test (1 second)
+    let config = ParkingConfig {
+        reconnect_ttl_secs: 1,
+    };
+
+    let entity_id = Uuid::new_v4();
+    let cluster_id = Uuid::new_v4();
+    let mut entry = EntityStateEntry::new(
+        entity_id,
+        cluster_id,
+        Vec3::new(5.0, 6.0, 7.0),
+        Vec3::new(0.1, 0.1, 0.1),
+    );
+    entry.user_data = serde_json::json!({
+        "player_name": "Bob",
+        "level": 50
+    });
+
+    // Park the entity with short TTL
+    park_entity(redis_url, &config, entity_id, &entry);
+
+    // Wait for TTL to expire
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // Attempt unpark after expiry
+    let restored = unpark_entity(redis_url, entity_id);
+    assert!(
+        restored.is_none(),
+        "Entity should not be found after TTL expiry; reconnect should be fresh"
+    );
+}

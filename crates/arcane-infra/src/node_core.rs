@@ -798,20 +798,27 @@ impl NodeCore {
             // reconnected before we forgot. Clear the tombstone and treat as fresh spawn-grace.
             let entity_id = entry.entity_id;
             let mut entry = entry; // mutable so we can rehydrate user_data
-            if self.departed.remove(&entity_id).is_some() {
+            let was_departed = self.departed.remove(&entity_id).is_some();
+
+            // L1 rehydration (epic #305): restore user_data from parked snapshot.
+            // Gate on parked-key presence (independent of tombstone), not departure state.
+            // An entity that reconnects after the tombstone is pruned but while the
+            // parked key is still valid (within ARCANE_RECONNECT_TTL_SECS) should
+            // still rehydrate and enter spawn-grace.
+            if let Some(parked_snapshot) = crate::parking::unpark_entity(&self.redis_url, entity_id)
+            {
                 self.spawn_grace.insert(entity_id, self.tick_count);
-                // L1 rehydration (epic #305): restore user_data from parked snapshot.
-                if let Some(parked_snapshot) =
-                    crate::parking::unpark_entity(&self.redis_url, entity_id)
-                {
-                    if let Some(parked_user_data) = parked_snapshot.get("user_data") {
-                        entry.user_data = parked_user_data.clone();
-                        eprintln!(
-                            "[rehydrate] entity {} user_data restored from parked snapshot",
-                            entity_id
-                        );
-                    }
+                if let Some(parked_user_data) = parked_snapshot.get("user_data") {
+                    entry.user_data = parked_user_data.clone();
+                    eprintln!(
+                        "[rehydrate] entity {} user_data restored from parked snapshot",
+                        entity_id
+                    );
                 }
+            } else if was_departed {
+                // Tombstone was present but no parked snapshot (TTL expired).
+                // Treat as fresh spawn.
+                self.spawn_grace.insert(entity_id, self.tick_count);
             }
             self.client_driven_last_seen
                 .insert(entity_id, self.tick_count);
