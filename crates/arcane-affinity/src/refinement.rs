@@ -1,14 +1,16 @@
 use crate::interaction_graph::Colocation;
+use crate::objective::ObjectiveWeights;
 use crate::partition::{Partition, WeightedEdge};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Configuration for KL/FM-style local refinement.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RefineConfig {
     pub max_passes: usize,
     pub capacity: usize,
     pub min_gain: f64,
+    pub weights: ObjectiveWeights,
 }
 
 impl Default for RefineConfig {
@@ -17,6 +19,7 @@ impl Default for RefineConfig {
             max_passes: 4,
             capacity: 0,
             min_gain: 0.0,
+            weights: ObjectiveWeights::default(),
         }
     }
 }
@@ -164,6 +167,7 @@ pub fn refine(
     edges: &[WeightedEdge],
     num_partitions: usize,
     config: &RefineConfig,
+    standing: Option<&Partition>,
 ) -> Partition {
     let mut current = start.clone();
     let adj = build_adjacency(edges);
@@ -258,7 +262,32 @@ pub fn refine(
                         continue;
                     }
 
-                    let gain = external[target_part] - internal;
+                    // Gain includes: cut improvement + crowding + open cost + churn.
+                    let mut gain = external[target_part] - internal;
+
+                    // Crowding costs: removing from entity_part is good, adding to target_part is bad.
+                    let current_size_a = partition_sizes[entity_part];
+                    let current_size_b = partition_sizes[target_part];
+                    gain +=
+                        crate::objective::crowding_marginal(current_size_a - 1, &config.weights)
+                            - crate::objective::crowding_marginal(current_size_b, &config.weights);
+
+                    // Open costs: closing entity_part if it becomes empty is good, opening target_part if empty is bad.
+                    if current_size_a == 1 {
+                        gain += config.weights.beta;
+                    }
+                    if current_size_b == 0 {
+                        gain -= config.weights.beta;
+                    }
+
+                    // Churn cost: pay mu if this entity hasn't already moved (standing != seed).
+                    if let Some(stand) = standing {
+                        let already_moved = stand.of(*entity) != current.of(*entity);
+                        if !already_moved {
+                            gain -= config.weights.mu;
+                        }
+                    }
+
                     if gain <= config.min_gain {
                         continue;
                     }
@@ -302,12 +331,28 @@ pub fn refine(
                         // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
                         // so it can never violate capacity when the starting partition is valid.
                         // No capacity check is needed here (unlike single moves).
-                        let gain = match gain_pair_swap_adj(
+                        let mut gain = match gain_pair_swap_adj(
                             *entity_a, part_a, *entity_b, part_b, &current, &adj,
                         ) {
-                            Some(g) if g > config.min_gain => g,
+                            Some(g) => g,
                             _ => continue,
                         };
+
+                        // Churn cost: pay mu for each entity that hasn't already moved.
+                        if let Some(stand) = standing {
+                            let a_already_moved = stand.of(*entity_a) != current.of(*entity_a);
+                            let b_already_moved = stand.of(*entity_b) != current.of(*entity_b);
+                            if !a_already_moved {
+                                gain -= config.weights.mu;
+                            }
+                            if !b_already_moved {
+                                gain -= config.weights.mu;
+                            }
+                        }
+
+                        if gain <= config.min_gain {
+                            continue;
+                        }
 
                         if best_swap.is_none()
                             || gain > best_swap.unwrap().4
@@ -397,7 +442,7 @@ mod tests {
             colocation: Colocation::Soft,
         }];
 
-        let refined = refine(&bad_partition, &edges, 2, &RefineConfig::default());
+        let refined = refine(&bad_partition, &edges, 2, &RefineConfig::default(), None);
 
         assert_eq!(
             refined.of(a),
@@ -444,7 +489,7 @@ mod tests {
             },
         ];
 
-        let refined = refine(&bad_partition, &edges, 2, &RefineConfig::default());
+        let refined = refine(&bad_partition, &edges, 2, &RefineConfig::default(), None);
         let refined_cost = refined.cut_cost(&edges);
         let bad_cost = bad_partition.cut_cost(&edges);
 
@@ -489,7 +534,7 @@ mod tests {
         }
         let start = partition_from_map(assignment);
 
-        let refined = refine(&start, &edges, 2, &RefineConfig::default());
+        let refined = refine(&start, &edges, 2, &RefineConfig::default(), None);
 
         let start_cost = start.cut_cost(&edges);
         let refined_cost = refined.cut_cost(&edges);
@@ -519,7 +564,7 @@ mod tests {
             colocation: Colocation::Hard,
         }];
 
-        let refined = refine(&partition, &edges, 2, &RefineConfig::default());
+        let refined = refine(&partition, &edges, 2, &RefineConfig::default(), None);
 
         assert_eq!(
             refined.of(a),
@@ -553,7 +598,7 @@ mod tests {
             ..RefineConfig::default()
         };
 
-        let refined = refine(&start, &edges, 2, &config);
+        let refined = refine(&start, &edges, 2, &config, None);
 
         for part_idx in 0..2 {
             let members = refined.members(part_idx);
@@ -591,8 +636,8 @@ mod tests {
             },
         ];
 
-        let refined1 = refine(&start, &edges, 2, &RefineConfig::default());
-        let refined2 = refine(&start, &edges, 2, &RefineConfig::default());
+        let refined1 = refine(&start, &edges, 2, &RefineConfig::default(), None);
+        let refined2 = refine(&start, &edges, 2, &RefineConfig::default(), None);
 
         assert_eq!(
             refined1, refined2,
@@ -617,8 +662,8 @@ mod tests {
             colocation: Colocation::Soft,
         }];
 
-        let refined_once = refine(&start, &edges, 2, &RefineConfig::default());
-        let refined_twice = refine(&refined_once, &edges, 2, &RefineConfig::default());
+        let refined_once = refine(&start, &edges, 2, &RefineConfig::default(), None);
+        let refined_twice = refine(&refined_once, &edges, 2, &RefineConfig::default(), None);
 
         assert_eq!(
             refined_once.cut_cost(&edges),
@@ -662,8 +707,9 @@ mod tests {
             max_passes: 8,
             capacity: 2,
             min_gain: 0.0,
+            weights: ObjectiveWeights::default(),
         };
-        let refined = refine(&start, &edges, 2, &cfg);
+        let refined = refine(&start, &edges, 2, &cfg, None);
         assert_eq!(
             refined.cut_cost(&edges),
             0.0,

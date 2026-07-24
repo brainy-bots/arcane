@@ -254,7 +254,7 @@ fn build_partition_decisions(
     // Number of partitions = number of KNOWN clusters (registered topology, including
     // empty warm spares), not merely clusters that currently own entities. With the
     // old "distinct current clusters" rule, a world where everyone starts on one
-    // cluster yields k=1 forever — capacity can never force a spread because no
+    // cluster yields k=1 forever — the objective can never force a spread because no
     // second partition exists to spread INTO. Warm spares must count.
     // The sorted+deduped union of currently-assigned clusters and the known
     // topology (warm spares included). Built ONCE and reused for the partition
@@ -270,26 +270,12 @@ fn build_partition_decisions(
     };
     let num_partitions = std::cmp::max(1, sorted_clusters.len());
 
-    // Capacity = ceil(ceil(n/k) * capacity_factor). The multiply must CEIL:
-    // truncation made a 2-entity/2-cluster world compute capacity 1
-    // (1 * 1.5 -> 1), under which co-locating any pair is illegal. That was
-    // masked for years by refinement running capacity-UNCHECKED (RefineConfig
-    // capacity 0) — the partitioner obeyed a limit refinement then violated.
-    // Now refinement enforces capacity (seeded stickiness requires it, else
-    // eviction repair and refine undo each other), so the formula must
-    // genuinely allow the headroom the factor promises.
-    let base_capacity = entities.len().div_ceil(num_partitions);
-    let capacity = std::cmp::max(
-        1,
-        (base_capacity as f64 * config.capacity_factor).ceil() as usize,
-    );
-
-    // Build partition input
+    // Build partition input with no hard capacity cap (0 = objective-driven).
     let input = PartitionInput {
         entities: entities.clone(),
         edges,
         num_partitions,
-        capacity,
+        capacity: 0,
     };
 
     // Partition stickiness (arcane#290): seed refinement from the STANDING
@@ -313,23 +299,34 @@ fn build_partition_decisions(
             &input.entities,
             &current_idx,
             num_partitions,
-            capacity,
+            &config.objective,
             &input.edges,
         )
     } else {
         GreedyGrowthPartitioner::new().partition(&input)
     };
 
-    // Run refinement, capacity-UNCHECKED (as always): cohesion beats the
-    // balance preference — a clique larger than ceil(n/k)*factor may still
-    // co-locate. Balance acts at component granularity in the seed repair
-    // (whole groups relocate; cliques are never cut), and at bootstrap via
-    // the greedy layout.
+    // Run refinement: objective-driven gain (cut + crowding + open + churn).
+    // The standing assignment (current_idx mapping) tracks entities that were
+    // already moved by the seed, so they don't pay churn cost again in refinement.
+    let standing_partition = if config.seed_from_current && !current_assignments.is_empty() {
+        let current_idx: HashMap<Uuid, usize> = current_assignments
+            .iter()
+            .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
+            .collect();
+        Some(arcane_affinity::partition::Partition::new(current_idx))
+    } else {
+        None
+    };
+
+    let mut refine_config = RefineConfig::default();
+    refine_config.weights = config.objective;
     let refined_partition = refine(
         &partition,
         &input.edges,
         num_partitions,
-        &RefineConfig::default(),
+        &refine_config,
+        standing_partition.as_ref(),
     );
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:

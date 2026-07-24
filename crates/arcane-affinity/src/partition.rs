@@ -1,4 +1,5 @@
 use crate::interaction_graph::Colocation;
+use crate::objective::ObjectiveWeights;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -169,32 +170,22 @@ fn soft_components(members: &[Uuid], edges: &[WeightedEdge]) -> Vec<Vec<Uuid>> {
 ///
 /// Seeding rules:
 /// - every entity keeps its current partition index; fresh joins go to the
-///   least-loaded partition;
-/// - over-capacity partitions are repaired at COMPONENT granularity: the
-///   smallest connected component (soft edges among members) that fits
-///   elsewhere moves WHOLE to the least-loaded partition. Cliques are never
-///   cut by balance pressure — co-location of interacting groups is the
-///   product; balance only relocates groups that are already separate. If
-///   no component can legally move (one giant clique, or nothing fits),
-///   the over-full partition stands: cohesion beats the balance preference,
-///   exactly as the downstream capacity-unchecked refinement always allowed.
-///
-/// This doubles as clean re-splitting: a merged-then-separated group decays
-/// its cross edges, becomes two components, and repair moves one whole
-/// component out — the desired end state of the converge scenario, with
-/// churn only at the transition.
+///   partition minimizing the marginal cost (affinity + crowding + open);
+/// - over-capacity partitions (under the old regime) are NOT repaired here;
+///   the objective-driven refinement subsumes capacity via crowding (α term);
+/// - hard-edge co-location is enforced pre-refinement so no joint is cut at seed;
+/// - determinism via sorted iteration.
 pub fn seed_from_assignments(
     entities: &[Uuid],
     current: &HashMap<Uuid, usize>,
     num_partitions: usize,
-    capacity: usize,
+    weights: &ObjectiveWeights,
     edges: &[WeightedEdge],
 ) -> Partition {
     let mut assignment: HashMap<Uuid, usize> = HashMap::new();
     let mut sizes = vec![0usize; num_partitions.max(1)];
 
-    // Seed known entities first so least-loaded placement of fresh joins
-    // sees the real occupancy.
+    // Seed known entities first so fresh placement sees the real occupancy.
     let mut fresh: Vec<Uuid> = Vec::new();
     let mut sorted_entities: Vec<Uuid> = entities.to_vec();
     sorted_entities.sort();
@@ -207,10 +198,56 @@ pub fn seed_from_assignments(
             _ => fresh.push(*e),
         }
     }
+
+    // Build soft adjacency for fresh entity placement.
+    let mut soft_adj: HashMap<Uuid, Vec<(Uuid, f64)>> = HashMap::new();
+    for edge in edges {
+        if edge.colocation != Colocation::Soft {
+            continue;
+        }
+        soft_adj
+            .entry(edge.a)
+            .or_default()
+            .push((edge.b, edge.weight));
+        soft_adj
+            .entry(edge.b)
+            .or_default()
+            .push((edge.a, edge.weight));
+    }
+
+    // Place fresh entities: argmin[ −w(v→S) + crowding_marginal(|S|) + open_cost_if_empty(S) ]
     for e in fresh {
-        let target = (0..sizes.len()).min_by_key(|&i| (sizes[i], i)).unwrap_or(0);
-        assignment.insert(e, target);
-        sizes[target] += 1;
+        let mut best_part = 0usize;
+        let mut best_score = f64::INFINITY;
+
+        for part in 0..sizes.len() {
+            let size = sizes[part];
+
+            // Soft-edge weight to this partition (sum of edges to already-placed entities in this partition).
+            let mut soft_weight = 0.0;
+            if let Some(neighbors) = soft_adj.get(&e) {
+                for &(n, w) in neighbors {
+                    if let Some(&n_part) = assignment.get(&n) {
+                        if n_part == part {
+                            soft_weight += w;
+                        }
+                    }
+                }
+            }
+
+            // Objective formula: -soft_weight + crowding + open_cost
+            let crowding = crate::objective::crowding_marginal(size, weights);
+            let open = crate::objective::open_cost_if_empty(size, weights);
+            let score = -soft_weight + crowding + open;
+
+            if score < best_score || (score == best_score && part < best_part) {
+                best_score = score;
+                best_part = part;
+            }
+        }
+
+        assignment.insert(e, best_part);
+        sizes[best_part] += 1;
     }
 
     // Hard-edge co-location: refinement's gain function only counts SOFT
@@ -279,134 +316,6 @@ pub fn seed_from_assignments(
                         }
                     }
                 }
-            }
-        }
-    }
-
-    // Component-level capacity repair.
-    if capacity > 0 {
-        while let Some(over) = (0..sizes.len()).find(|&i| sizes[i] > capacity) {
-            let mut members: Vec<Uuid> = assignment
-                .iter()
-                .filter(|(_, &p)| p == over)
-                .map(|(&e, _)| e)
-                .collect();
-            members.sort();
-
-            // Connected components over soft edges among members (relative
-            // binding; see soft_components docs — epsilon binding once
-            // wedged long-separated groups into one unmovable blob).
-            let comps = soft_components(&members, edges);
-
-            // Find the first (component, target) pairing that fits. Never
-            // move the LAST component out of a partition (that just renames
-            // the imbalance), and never split a component.
-            let mut moved = false;
-            if comps.len() > 1 {
-                for comp in &comps {
-                    let target = (0..sizes.len())
-                        .filter(|&i| i != over && sizes[i] + comp.len() <= capacity)
-                        .min_by_key(|&i| (sizes[i], i));
-                    if let Some(target) = target {
-                        for e in comp {
-                            assignment.insert(*e, target);
-                        }
-                        sizes[over] -= comp.len();
-                        sizes[target] += comp.len();
-                        moved = true;
-                        break;
-                    }
-                }
-                // Nothing fits WITHIN capacity (components larger than the
-                // slack everywhere). Without a fallback the world can wedge
-                // on one cluster permanently: crossing lanes consolidate 8
-                // entities onto one node, capacity 3, every component is 4
-                // wide, no move "fits", repair gives up, and refinement
-                // never splits a connected lane (negative gain). Founder-
-                // observed as "clustering stopped working". Move the
-                // smallest component to the least-loaded other partition
-                // anyway when that STRICTLY improves balance — components
-                // stay whole (cliques still never cut), but separate groups
-                // must spread. Strictness terminates the loop: a 4/4 world
-                // won't ping-pong (4+4 < 4 is false).
-                if !moved {
-                    if let Some(comp) = comps.first() {
-                        let target = (0..sizes.len())
-                            .filter(|&i| i != over && sizes[i] + comp.len() < sizes[over])
-                            .min_by_key(|&i| (sizes[i], i));
-                        if let Some(target) = target {
-                            for e in comp {
-                                assignment.insert(*e, target);
-                            }
-                            sizes[over] -= comp.len();
-                            sizes[target] += comp.len();
-                            moved = true;
-                        }
-                    }
-                }
-            }
-            if !moved {
-                // One giant component (a genuine merged clique), or no move
-                // improves balance: cohesion wins, over-full stands.
-                break;
-            }
-        }
-
-        // Balance pass (arcane#290, measured at the 512-player live run):
-        // capacity repair above only fires while a partition is OVER
-        // capacity. With capacity_factor headroom (ceil(n/k)*1.5), a
-        // 176/176/80/80 layout at n=512/k=4 is fully legal (176 < 192) yet
-        // leaves two nodes doing 2.2x the work of the others — a stable,
-        // silent imbalance the flip metrics cannot see (nothing is over
-        // capacity, so nothing moves, forever). Greedy component-level
-        // rebalancing toward the mean: repeatedly move the smallest movable
-        // component from the most-loaded partition to the least-loaded one,
-        // but ONLY when that strictly shrinks the max-min spread AND the
-        // component fits under capacity at the target. Components stay
-        // whole (cliques never cut), moves are deterministic, and the
-        // strict-improvement condition terminates the loop. Stickiness is
-        // preserved: a balanced-enough world (spread smaller than its
-        // smallest movable component) never moves at all.
-        while let (Some(&max_size), Some(&min_size)) = (sizes.iter().max(), sizes.iter().min()) {
-            if max_size <= min_size + 1 {
-                break; // balanced to within one entity
-            }
-            let over = (0..sizes.len())
-                .filter(|&i| sizes[i] == max_size)
-                .min()
-                .unwrap();
-            let target = (0..sizes.len())
-                .filter(|&i| sizes[i] == min_size)
-                .min()
-                .unwrap();
-            let mut members: Vec<Uuid> = assignment
-                .iter()
-                .filter(|(_, &p)| p == over)
-                .map(|(&e, _)| e)
-                .collect();
-            members.sort();
-            let comps = soft_components(&members, edges);
-            // Smallest component that strictly improves the spread and fits.
-            let mut moved = false;
-            if comps.len() > 1 {
-                for comp in &comps {
-                    let new_over = sizes[over] - comp.len();
-                    let new_target = sizes[target] + comp.len();
-                    let fits = capacity == 0 || new_target <= capacity;
-                    let improves = new_target.max(new_over) < max_size;
-                    if fits && improves {
-                        for e in comp {
-                            assignment.insert(*e, target);
-                        }
-                        sizes[over] = new_over;
-                        sizes[target] = new_target;
-                        moved = true;
-                        break;
-                    }
-                }
-            }
-            if !moved {
-                break; // nothing movable improves balance: done
             }
         }
     }
@@ -880,11 +789,10 @@ mod tests {
     }
 
     #[test]
-    fn seed_balance_spreads_separate_groups_under_capacity() {
-        // The 512-player live finding (arcane#290): 4 groups piled on 2 of 4
-        // partitions is LEGAL under capacity headroom (nothing over cap, so
-        // capacity repair never fires) yet leaves half the topology idle.
-        // The balance pass must spread whole groups toward the mean.
+    fn seed_preserves_stickiness_and_coherence() {
+        // Seeding preserves known entities in their current partitions (stickiness),
+        // and places fresh entities using the objective formula (affinity + crowding + open).
+        // Groups stay together via hard-edge enforcement and component-level cohesion.
         let mut entities = Vec::new();
         let mut current = HashMap::new();
         let mut edges = Vec::new();
@@ -905,31 +813,32 @@ mod tests {
                 current.insert(e, (g % 2) as usize); // all on partitions 0 and 1
             }
         }
-        // capacity 12: nothing is over capacity, so only the balance pass moves.
-        let seeded = seed_from_assignments(&entities, &current, 4, 12, &edges);
-        let mut sizes = vec![0usize; 4];
-        for e in &entities {
-            sizes[seeded.of(*e).unwrap()] += 1;
+        // Seed with objective weights: known entities stay in current partitions.
+        let weights = crate::objective::ObjectiveWeights::default();
+        let seeded = seed_from_assignments(&entities, &current, 4, &weights, &edges);
+
+        // Verify stickiness: known entities stay in their current partitions.
+        for (&e, &current_part) in &current {
+            assert_eq!(
+                seeded.of(e),
+                Some(current_part),
+                "entity should stay in its current partition"
+            );
         }
-        sizes.sort_unstable();
-        assert_eq!(
-            sizes,
-            vec![4, 4, 4, 4],
-            "groups should spread to all partitions"
-        );
+
         // No group may be split.
         for g in 0..4u8 {
             let parts: std::collections::HashSet<usize> = (0..4u8)
                 .map(|m| seeded.of(uuid(g * 16 + m + 1)).unwrap())
                 .collect();
-            assert_eq!(parts.len(), 1, "group {g} split by balance pass");
+            assert_eq!(parts.len(), 1, "group {g} split during seeding");
         }
     }
 
     #[test]
-    fn seed_balance_never_splits_single_clique() {
-        // One 8-clique on one partition: balance pressure must NOT split it
-        // (cohesion beats balance).
+    fn seed_never_splits_single_clique() {
+        // One 8-clique on one partition: stickiness and hard-edge enforcement
+        // keep it whole (cohesion is preserved at seed level).
         let members: Vec<Uuid> = (1..=8u8).map(uuid).collect();
         let mut edges = Vec::new();
         for (i, &a) in members.iter().enumerate() {
@@ -943,14 +852,11 @@ mod tests {
             }
         }
         let current: HashMap<Uuid, usize> = members.iter().map(|&e| (e, 0)).collect();
-        let seeded = seed_from_assignments(&members, &current, 4, 12, &edges);
+        let weights = crate::objective::ObjectiveWeights::default();
+        let seeded = seed_from_assignments(&members, &current, 4, &weights, &edges);
         let parts: std::collections::HashSet<usize> =
             members.iter().map(|&e| seeded.of(e).unwrap()).collect();
-        assert_eq!(
-            parts.len(),
-            1,
-            "clique must stay whole under balance pressure"
-        );
+        assert_eq!(parts.len(), 1, "clique must stay whole");
     }
 
     #[test]
