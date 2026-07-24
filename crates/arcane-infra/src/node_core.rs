@@ -805,20 +805,31 @@ impl NodeCore {
             // An entity that reconnects after the tombstone is pruned but while the
             // parked key is still valid (within ARCANE_RECONNECT_TTL_SECS) should
             // still rehydrate and enter spawn-grace.
-            if let Some(parked_snapshot) = crate::parking::unpark_entity(&self.redis_url, entity_id)
-            {
-                self.spawn_grace.insert(entity_id, self.tick_count);
-                if let Some(parked_user_data) = parked_snapshot.get("user_data") {
-                    entry.user_data = parked_user_data.clone();
-                    eprintln!(
-                        "[rehydrate] entity {} user_data restored from parked snapshot",
-                        entity_id
-                    );
+            //
+            // Only probe Redis on first contact (this id absent from
+            // `client_driven_last_seen`, cleared on leave) — never on steady-state
+            // per-tick updates. `drain_inputs` is documented non-blocking/sans-IO;
+            // calling `unpark_entity` (fresh Redis connection) unconditionally here
+            // would turn every client update, every tick, into a blocking network
+            // round-trip.
+            let is_first_contact = !self.client_driven_last_seen.contains_key(&entity_id);
+            if is_first_contact {
+                if let Some(parked_snapshot) =
+                    crate::parking::unpark_entity(&self.redis_url, entity_id)
+                {
+                    self.spawn_grace.insert(entity_id, self.tick_count);
+                    if let Some(parked_user_data) = parked_snapshot.get("user_data") {
+                        entry.user_data = parked_user_data.clone();
+                        eprintln!(
+                            "[rehydrate] entity {} user_data restored from parked snapshot",
+                            entity_id
+                        );
+                    }
+                } else if was_departed {
+                    // Tombstone was present but no parked snapshot (TTL expired).
+                    // Treat as fresh spawn.
+                    self.spawn_grace.insert(entity_id, self.tick_count);
                 }
-            } else if was_departed {
-                // Tombstone was present but no parked snapshot (TTL expired).
-                // Treat as fresh spawn.
-                self.spawn_grace.insert(entity_id, self.tick_count);
             }
             self.client_driven_last_seen
                 .insert(entity_id, self.tick_count);
