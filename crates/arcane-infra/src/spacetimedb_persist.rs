@@ -80,7 +80,6 @@ pub struct SpacetimeDbPersist {
     interval_ticks: u64,
     uri: String,
     db: String,
-    max_batch_size: usize,
 }
 
 impl SpacetimeDbPersist {
@@ -147,7 +146,6 @@ impl SpacetimeDbPersist {
             interval_ticks,
             uri,
             db,
-            max_batch_size,
         })
     }
 
@@ -259,7 +257,7 @@ impl SpacetimeDbPersist {
 
         const MAX_RETRIES: usize = 3;
         for attempt in 1..=MAX_RETRIES {
-            let body = match encode_spacetimedb_entities_body(&[entry.clone()]) {
+            let body = match encode_spacetimedb_entities_body(std::slice::from_ref(entry)) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!(
@@ -502,7 +500,6 @@ mod tests {
             interval_ticks: 1,
             uri: "http://localhost:3000".to_string(),
             db: "test".to_string(),
-            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
@@ -522,7 +519,6 @@ mod tests {
             interval_ticks: 1,
             uri: "http://localhost:3000".to_string(),
             db: "test".to_string(),
-            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(101), 0.0, 0.0, 0.0);
@@ -548,7 +544,6 @@ mod tests {
             interval_ticks: 1,
             uri: "http://localhost:3000".to_string(),
             db: "test".to_string(),
-            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(102), 0.0, 0.0, 0.0);
@@ -575,7 +570,6 @@ mod tests {
             interval_ticks: 1,
             uri: "http://localhost:3000".to_string(),
             db: "test".to_string(),
-            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);

@@ -38,10 +38,10 @@ pub fn construct_persistence() -> Option<Arc<dyn IPersistence>> {
             {
                 if let Some(persist) = SpacetimeDbPersist::from_env() {
                     eprintln!("[persistence] L2: SpacetimeDB durable backend (full)");
-                    return Some(Arc::new(persist));
+                    Some(Arc::new(persist))
                 } else {
                     eprintln!("[persistence] L2 (full) requested but SpacetimeDB not configured; running without durable persistence");
-                    return None;
+                    None
                 }
             }
 
