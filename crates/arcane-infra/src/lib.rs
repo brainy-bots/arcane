@@ -53,6 +53,8 @@ pub mod node_inbox;
 #[cfg(feature = "migration")]
 pub mod ownership_migration;
 #[cfg(feature = "migration")]
+pub mod persistence_config;
+#[cfg(feature = "migration")]
 pub mod replication_gate;
 #[cfg(feature = "migration")]
 pub mod router_core;

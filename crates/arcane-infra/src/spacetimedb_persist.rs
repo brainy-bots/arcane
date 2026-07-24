@@ -1,20 +1,18 @@
 //! SpacetimeDB persistence adapter for throttled state snapshots.
 //!
+//! Implements the [`arcane_core::IPersistence`] trait (L2 durable persistence, epic #305).
+//!
 //! Responsibilities:
 //! - derive persist cadence and endpoint config from environment
 //! - encode `EntityStateEntry` batches into SpacetimeDB reducer payload shape
 //! - send chunked HTTP requests and log success/failure totals
+//! - provide final-write guarantee on `persist_final` (with retry and backoff)
+//! - restore entities from durable storage via HTTP SQL read on `load`
 //!
 //! **Four buckets:** this path mirrors **bucket 1** (pose) *and* **bucket 2** (`user_data`) into
 //! **bucket 4** (durable tables) at a throttled cadence — not a substitute for hot Redis
 //! replication between clusters. The target SpacetimeDB module's `Entity` table must include
 //! columns matching the fields this encoder emits (`entity_id`, `x`, `y`, `z`, `user_data`).
-//!
-//! **Progressive-API note (see `docs/architecture/progressive-api.md`):** this is the level-1
-//! auto-persist path. Level-0 users get positions for free; level-1 users put any additional
-//! per-entity state in `EntityStateEntry::user_data` and it rides along in the same snapshot.
-//! Level-2+ (explicit flush trigger, custom reducer, typed schemas) is deferred until a real
-//! game-driven use case demands it.
 //!
 //! This module does not own simulation timing; `node_runner` decides when to call it.
 
@@ -22,7 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use arcane_core::persistence::IPersistence;
 use arcane_core::replication_channel::EntityStateEntry;
+use uuid::Uuid;
 
 #[derive(serde::Serialize)]
 struct SpacetimeUuid {
@@ -78,6 +78,9 @@ fn should_persist_tick(tick: u64, interval_ticks: u64, entries_len: usize) -> bo
 pub struct SpacetimeDbPersist {
     sender: mpsc::SyncSender<Vec<EntityStateEntry>>,
     interval_ticks: u64,
+    uri: String,
+    db: String,
+    max_batch_size: usize,
 }
 
 impl SpacetimeDbPersist {
@@ -142,6 +145,9 @@ impl SpacetimeDbPersist {
         Some(Self {
             sender: tx,
             interval_ticks,
+            uri,
+            db,
+            max_batch_size,
         })
     }
 
@@ -227,6 +233,191 @@ impl SpacetimeDbPersist {
             }
         }
     }
+
+    /// Persist a single entity to durable storage with retry (3 attempts, backoff).
+    /// Used for the final write when an entity leaves (guarantee at session end).
+    fn persist_final_with_retry(uri: &str, db: &str, entry: &EntityStateEntry) {
+        let url = format!(
+            "{}/v1/database/{}/call/set_entities",
+            uri.trim_end_matches('/'),
+            db
+        );
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "SpacetimeDB persist_final: client build failed for {}: {}",
+                    entry.entity_id, e
+                );
+                return;
+            }
+        };
+
+        const MAX_RETRIES: usize = 3;
+        for attempt in 1..=MAX_RETRIES {
+            let body = match encode_spacetimedb_entities_body(&[entry.clone()]) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "SpacetimeDB persist_final: serialization failed for {}: {}",
+                        entry.entity_id, e
+                    );
+                    return;
+                }
+            };
+
+            match client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    eprintln!(
+                        "SpacetimeDB persist_final: {} persisted successfully",
+                        entry.entity_id
+                    );
+                    return;
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "SpacetimeDB persist_final: {} attempt {} failed with HTTP {}",
+                        entry.entity_id,
+                        attempt,
+                        resp.status()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "SpacetimeDB persist_final: {} attempt {} failed: {}",
+                        entry.entity_id, attempt, e
+                    );
+                }
+            }
+
+            if attempt < MAX_RETRIES {
+                let backoff_ms = 100 * 2_u64.saturating_pow((attempt - 1) as u32);
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            }
+        }
+
+        eprintln!(
+            "SpacetimeDB persist_final: {} FAILED after {} attempts — data loss risk",
+            entry.entity_id, MAX_RETRIES
+        );
+    }
+
+    /// Load an entity from durable storage by ID (HTTP SQL endpoint read).
+    /// Reconstructs EntityStateEntry from the stored row or returns None if not found/unavailable.
+    fn load_from_spacetimedb(uri: &str, db: &str, entity_id: Uuid) -> Option<EntityStateEntry> {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "SpacetimeDB load: client build failed for {}: {}",
+                    entity_id, e
+                );
+                return None;
+            }
+        };
+
+        let sql_endpoint = format!("{}/v1/database/{}/sql", uri.trim_end_matches('/'), db);
+
+        let entity_uuid_string = entity_id.to_string();
+        let query = format!(
+            "SELECT entity_id, cluster_id, x, y, z, user_data FROM Entity WHERE entity_id = '{}'",
+            entity_uuid_string.replace('\'', "''")
+        );
+
+        let response = match client
+            .post(&sql_endpoint)
+            .json(&serde_json::json!({
+                "sql": query
+            }))
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("SpacetimeDB load: query failed for {}: {}", entity_id, e);
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            eprintln!(
+                "SpacetimeDB load: HTTP {} for {}",
+                response.status(),
+                entity_id
+            );
+            return None;
+        }
+
+        let rows: Vec<serde_json::Value> = match response.json() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "SpacetimeDB load: response parse failed for {}: {}",
+                    entity_id, e
+                );
+                return None;
+            }
+        };
+
+        if rows.is_empty() {
+            return None;
+        }
+
+        let row = &rows[0];
+        let cluster_id = match uuid::Uuid::parse_str(row["cluster_id"].as_str()?) {
+            Ok(id) => id,
+            Err(_) => return None,
+        };
+        let x = row["x"].as_f64()?;
+        let y = row["y"].as_f64()?;
+        let z = row["z"].as_f64()?;
+
+        let mut entry = EntityStateEntry::new(
+            entity_id,
+            cluster_id,
+            arcane_core::Vec3::new(x, y, z),
+            arcane_core::Vec3::new(0.0, 0.0, 0.0),
+        );
+
+        if let Some(user_data_str) = row["user_data"].as_str() {
+            if !user_data_str.is_empty() {
+                if let Ok(user_data) = serde_json::from_str(user_data_str) {
+                    entry.user_data = user_data;
+                }
+            }
+        }
+
+        Some(entry)
+    }
+}
+
+impl IPersistence for SpacetimeDbPersist {
+    fn should_snapshot(&self, tick: u64) -> bool {
+        self.is_persist_tick(tick)
+    }
+
+    fn snapshot(&self, entries: &[EntityStateEntry]) {
+        self.maybe_persist(0, entries);
+    }
+
+    fn persist_final(&self, entry: &EntityStateEntry) {
+        Self::persist_final_with_retry(&self.uri, &self.db, entry);
+    }
+
+    fn load(&self, entity_id: Uuid) -> Option<EntityStateEntry> {
+        Self::load_from_spacetimedb(&self.uri, &self.db, entity_id)
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +500,9 @@ mod tests {
         let persist = SpacetimeDbPersist {
             sender: tx,
             interval_ticks: 1,
+            uri: "http://localhost:3000".to_string(),
+            db: "test".to_string(),
+            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
@@ -326,6 +520,9 @@ mod tests {
         let persist = SpacetimeDbPersist {
             sender: tx,
             interval_ticks: 1,
+            uri: "http://localhost:3000".to_string(),
+            db: "test".to_string(),
+            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(101), 0.0, 0.0, 0.0);
@@ -349,6 +546,9 @@ mod tests {
         let persist = SpacetimeDbPersist {
             sender: tx,
             interval_ticks: 1,
+            uri: "http://localhost:3000".to_string(),
+            db: "test".to_string(),
+            max_batch_size: 0,
         };
 
         let entry = mk_entry(Uuid::from_u128(102), 0.0, 0.0, 0.0);
@@ -363,5 +563,26 @@ mod tests {
             "maybe_persist should complete in < 10ms, took {}ms",
             elapsed
         );
+    }
+
+    #[test]
+    fn ipersistence_trait_snapshot_calls_maybe_persist() {
+        use arcane_core::persistence::IPersistence;
+
+        let (tx, rx) = mpsc::sync_channel::<Vec<EntityStateEntry>>(2);
+        let persist = SpacetimeDbPersist {
+            sender: tx,
+            interval_ticks: 1,
+            uri: "http://localhost:3000".to_string(),
+            db: "test".to_string(),
+            max_batch_size: 0,
+        };
+
+        let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
+        persist.snapshot(&[entry.clone()]);
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].entity_id, entry.entity_id);
     }
 }

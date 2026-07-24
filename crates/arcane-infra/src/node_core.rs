@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+use arcane_core::IPersistence;
 use uuid::Uuid;
 
 #[cfg(feature = "migration")]
@@ -67,10 +68,10 @@ use crate::node_inbox::{InboxBus, NodeInboxFrame};
 use crate::node_stats::NodeStats;
 #[cfg(feature = "migration")]
 use crate::ownership_migration::{OwnershipFlip, OwnershipMap};
+#[cfg(feature = "migration")]
+use crate::persistence_config;
 #[cfg(feature = "cluster-ws")]
 use crate::physics_events_channel::{spawn_physics_events_subscriber, PhysicsEventsPublisher};
-#[cfg(feature = "spacetimedb-persist")]
-use crate::spacetimedb_persist::SpacetimeDbPersist;
 use crate::{ArcaneNode, ReplicationChannelManager};
 
 const LOG_EVERY_TICKS: u64 = 100;
@@ -336,8 +337,8 @@ pub struct NodeCore {
     tick_count: u64,
     cluster_id: Uuid,
     submitted_routed_physics: Vec<(Uuid, arcane_core::physics_events::PhysicsEvent)>,
-    #[cfg(feature = "spacetimedb-persist")]
-    persist: Option<SpacetimeDbPersist>,
+    #[cfg(feature = "migration")]
+    persist: Option<Arc<dyn IPersistence>>,
     /// #289: the node's owned-set RECORD view — replaced wholesale by each
     /// frame's `owned` statement, never folded from events. "Do I own X?" =
     /// `owned_view.contains(X) || spawn_grace.contains_key(X)`.
@@ -522,10 +523,8 @@ impl NodeCore {
             tick_rate_hz
         );
 
-        #[cfg(feature = "spacetimedb-persist")]
-        let persist = SpacetimeDbPersist::from_env();
-        #[cfg(not(feature = "spacetimedb-persist"))]
-        let _persist = ();
+        #[cfg(feature = "migration")]
+        let persist = persistence_config::construct_persistence();
 
         // #289: no ownership-flip pub/sub subscriber and no folded map. The
         // node's ownership view is the record: each inbox frame's `owned`
@@ -637,7 +636,7 @@ impl NodeCore {
             tick_count: 0,
             cluster_id: cfg.cluster_id,
             submitted_routed_physics: Vec::new(),
-            #[cfg(feature = "spacetimedb-persist")]
+            #[cfg(feature = "migration")]
             persist,
             #[cfg(feature = "migration")]
             owned_view: HashSet::new(),
@@ -698,9 +697,15 @@ impl NodeCore {
     /// seam. The snapshot is `None` only if the entity was already gone from
     /// the map (double-leave race) — layers must treat that as nothing to
     /// remember, never as an error.
+    /// Sequence: L2 persist_final (durable backend), then L1 park (Redis TTL).
     #[cfg(feature = "migration")]
     fn on_leave(&mut self, id: Uuid, final_state: Option<&EntityStateEntry>) {
         if let Some(entry) = final_state {
+            // L2: durable write (before L1 parking)
+            if let Some(ref persist) = self.persist {
+                persist.persist_final(entry);
+            }
+            // L1: short-term parking in Redis
             crate::parking::park_entity(&self.redis_url, &self.parking_config, id, entry);
         } else {
             eprintln!("[leave] entity {id} departed (snapshot already gone)");
@@ -800,8 +805,8 @@ impl NodeCore {
             let mut entry = entry; // mutable so we can rehydrate user_data
             if self.departed.remove(&entity_id).is_some() {
                 self.spawn_grace.insert(entity_id, self.tick_count);
-                // L1 rehydration (epic #305): restore user_data from parked snapshot.
-                if let Some(parked_snapshot) =
+                // L1 rehydration (epic #305): restore user_data from parked snapshot (fresher, TTL-limited).
+                let rehydrated = if let Some(parked_snapshot) =
                     crate::parking::unpark_entity(&self.redis_url, entity_id)
                 {
                     if let Some(parked_user_data) = parked_snapshot.get("user_data") {
@@ -810,6 +815,25 @@ impl NodeCore {
                             "[rehydrate] entity {} user_data restored from parked snapshot",
                             entity_id
                         );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                // L2 fallback (epic #308): if no parked snapshot, try durable load.
+                if !rehydrated {
+                    if let Some(ref persist) = self.persist {
+                        if let Some(loaded) = persist.load(entity_id) {
+                            entry.user_data = loaded.user_data;
+                            entry.position = loaded.position;
+                            entry.velocity = loaded.velocity;
+                            eprintln!(
+                                "[rehydrate] entity {} restored from durable storage",
+                                entity_id
+                            );
+                        }
                     }
                 }
             }
@@ -1288,15 +1312,15 @@ impl NodeCore {
         let merged_delta = merge_with_neighbor_latest(our_delta, &self.neighbor_entities);
         let outcome_tick = merged_delta.tick;
         let outcome_seq = merged_delta.seq;
-        // Durable persistence (bucket 4): snapshot the FULL authoritative set, not the sparse broadcast
+        // Durable persistence (L2, bucket 4, epic #305): snapshot the FULL authoritative set, not the sparse broadcast
         // delta. `set_entities` is a full-replace reducer, so persisting only the changed entities would
-        // wipe unchanged ones from the durable table. Build the snapshot ONLY on persist ticks (the
-        // cadence check is cheap; the snapshot clone is not) — own entities only, neighbours persist theirs.
-        #[cfg(feature = "spacetimedb-persist")]
+        // wipe unchanged ones from the durable table. Cadence check is cheap; snapshot clone is not.
+        // Own entities only; neighbours persist theirs.
+        #[cfg(feature = "migration")]
         if let Some(ref persist) = self.persist {
-            if persist.is_persist_tick(self.tick_count) {
+            if persist.should_snapshot(self.tick_count) {
                 let snapshot = self.server.snapshot();
-                persist.maybe_persist(self.tick_count, &snapshot);
+                persist.snapshot(&snapshot);
             }
         }
         let _ = self.state_tx.send(merged_delta);
