@@ -799,41 +799,45 @@ impl NodeCore {
                 self.maybe_send_reconnect_hint(entity_id, owner);
                 continue;
             }
-            // Revival rule (L0): if this update is for a tombstoned id, the client
-            // reconnected before we forgot. Clear the tombstone and treat as fresh spawn-grace.
+            // Revival rule (L0/L1): if this update is for an entity with a parked snapshot
+            // or anti-resurrection tombstone, reconnection is within window. Restore data as available.
             let entity_id = entry.entity_id;
-            let mut entry = entry; // mutable so we can rehydrate user_data
-            if self.departed.remove(&entity_id).is_some() {
-                self.spawn_grace.insert(entity_id, self.tick_count);
-                // L1 rehydration (epic #305): restore user_data from parked snapshot (fresher, TTL-limited).
-                let rehydrated = if let Some(parked_snapshot) =
-                    crate::parking::unpark_entity(&self.redis_url, entity_id)
-                {
+            let mut entry = entry;
+            let was_departed = self.departed.contains_key(&entity_id);
+            let revival = revive_and_maybe_rehydrate(
+                entity_id,
+                &mut self.departed,
+                |id| crate::parking::is_entity_parked(&self.redis_url, id),
+                |id| crate::parking::unpark_entity(&self.redis_url, id),
+            );
+            let rehydrated = matches!(&revival, RevivalOutcome::Rehydrated(_));
+            match revival {
+                RevivalOutcome::Rehydrated(parked_snapshot) => {
+                    self.spawn_grace.insert(entity_id, self.tick_count);
                     if let Some(parked_user_data) = parked_snapshot.get("user_data") {
                         entry.user_data = parked_user_data.clone();
                         eprintln!(
                             "[rehydrate] entity {} user_data restored from parked snapshot",
                             entity_id
                         );
-                        true
-                    } else {
-                        false
                     }
-                } else {
-                    false
-                };
-                // L2 fallback (epic #308): if no parked snapshot, try durable load.
-                if !rehydrated {
-                    if let Some(ref persist) = self.persist {
-                        if let Some(loaded) = persist.load(entity_id) {
-                            entry.user_data = loaded.user_data;
-                            entry.position = loaded.position;
-                            entry.velocity = loaded.velocity;
-                            eprintln!(
-                                "[rehydrate] entity {} restored from durable storage",
-                                entity_id
-                            );
-                        }
+                }
+                RevivalOutcome::Fresh => {
+                    if was_departed {
+                        self.spawn_grace.insert(entity_id, self.tick_count);
+                    }
+                }
+            }
+            if !rehydrated {
+                if let Some(ref persist) = self.persist {
+                    if let Some(loaded) = persist.load(entity_id) {
+                        entry.user_data = loaded.user_data;
+                        entry.position = loaded.position;
+                        entry.velocity = loaded.velocity;
+                        eprintln!(
+                            "[rehydrate] entity {} restored from durable storage",
+                            entity_id
+                        );
                     }
                 }
             }
@@ -1367,6 +1371,51 @@ impl NodeCore {
     }
 }
 
+/// Revival-rule outcome for L1/L2 rehydration (epic #305).
+/// Indicates whether rehydration should proceed and what data to restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevivalOutcome {
+    /// Entity was parked; user_data should be restored from the snapshot.
+    Rehydrated(serde_json::Value),
+    /// Entity was not parked; no rehydration data.
+    Fresh,
+}
+
+/// L1/L2 rehydration gate for reconnected entities (epic #305).
+/// Gate rehydration on parked-key presence, decoupled from anti-resurrection tombstone.
+///
+/// Spec: a reconnect within `ARCANE_RECONNECT_TTL_SECS` restores the same entity,
+/// regardless of whether the anti-resurrection tombstone (`departed`) has already expired.
+/// These are two independent lifetimes — the parked key (time-based, configurable)
+/// and the tombstone (tick-based, anti-resurrection only).
+///
+/// **Inputs:**
+/// - `entity_id`: the entity being reconnected
+/// - `departed`: mutable map of tombstoned entities (entity_id -> tick_count). Cleared
+///   unconditionally if present (for anti-resurrection), but rehydration gates on
+///   `is_parked`, not on `departed` presence.
+/// - `is_parked`: closure that checks if the entity has a live parked key in Redis.
+/// - `unpark`: closure that retrieves and consumes the parked snapshot.
+///
+/// **Returns:**
+/// - `Rehydrated(snapshot)` if the entity is currently parked in Redis (regardless of tombstone state).
+/// - `Fresh` otherwise.
+#[cfg(feature = "migration")]
+pub fn revive_and_maybe_rehydrate(
+    entity_id: Uuid,
+    departed: &mut HashMap<Uuid, u64>,
+    is_parked: impl Fn(Uuid) -> bool,
+    unpark: impl Fn(Uuid) -> Option<serde_json::Value>,
+) -> RevivalOutcome {
+    departed.remove(&entity_id);
+    if is_parked(entity_id) {
+        if let Some(parked_snapshot) = unpark(entity_id) {
+            return RevivalOutcome::Rehydrated(parked_snapshot);
+        }
+    }
+    RevivalOutcome::Fresh
+}
+
 /// D1 forwarding invariant (epic #287), #289 record-based: decide where an
 /// inbound client input for `entity_id` must go — from the RECORDS this node
 /// holds, not from a folded event map.
@@ -1621,6 +1670,94 @@ mod forwarding_tests {
                 true
             ),
             Some(owner)
+        );
+    }
+}
+#[cfg(test)]
+#[cfg(feature = "migration")]
+mod revival_tests {
+    //! L1/L2 rehydration for reconnected entities (epic #305).
+    //! Tests the gate on parked-key presence, independent of anti-resurrection tombstone.
+    use super::{revive_and_maybe_rehydrate, RevivalOutcome};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    #[test]
+    fn rehydrate_when_parked_and_tombstoned() {
+        let entity_id = Uuid::from_u128(42);
+        let mut departed = [(entity_id, 100u64)].into_iter().collect::<HashMap<_, _>>();
+        let parked_snapshot = serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "user_data": {"level": 5},
+        });
+
+        let outcome = revive_and_maybe_rehydrate(
+            entity_id,
+            &mut departed,
+            |_| true,
+            |_| Some(parked_snapshot.clone()),
+        );
+
+        assert!(matches!(outcome, RevivalOutcome::Rehydrated(_)));
+        assert!(
+            !departed.contains_key(&entity_id),
+            "departed should be cleared for anti-resurrection"
+        );
+    }
+
+    #[test]
+    fn rehydrate_when_parked_but_tombstone_expired() {
+        // This is the gap this issue fixes: entity not in departed (tombstone already pruned)
+        // but still parked in Redis. Should rehydrate.
+        let entity_id = Uuid::from_u128(43);
+        let mut departed = HashMap::new();
+        let parked_snapshot = serde_json::json!({
+            "entity_id": entity_id.to_string(),
+            "user_data": {"level": 10},
+        });
+
+        let outcome = revive_and_maybe_rehydrate(
+            entity_id,
+            &mut departed,
+            |_| true,
+            |_| Some(parked_snapshot.clone()),
+        );
+
+        assert!(matches!(outcome, RevivalOutcome::Rehydrated(_)));
+    }
+
+    #[test]
+    fn fresh_when_not_parked() {
+        let entity_id = Uuid::from_u128(44);
+        let mut departed = HashMap::new();
+
+        let outcome = revive_and_maybe_rehydrate(entity_id, &mut departed, |_| false, |_| None);
+
+        assert_eq!(outcome, RevivalOutcome::Fresh);
+    }
+
+    #[test]
+    fn fresh_when_parked_but_unpark_fails() {
+        // Parked key exists but deserialization fails (corrupted snapshot).
+        let entity_id = Uuid::from_u128(45);
+        let mut departed = HashMap::new();
+
+        let outcome = revive_and_maybe_rehydrate(entity_id, &mut departed, |_| true, |_| None);
+
+        assert_eq!(outcome, RevivalOutcome::Fresh);
+    }
+
+    #[test]
+    fn departed_cleared_regardless_of_parked_state() {
+        // Even if not parked, the tombstone should be cleared (anti-resurrection).
+        let entity_id = Uuid::from_u128(46);
+        let mut departed = [(entity_id, 200u64)].into_iter().collect::<HashMap<_, _>>();
+
+        let _outcome = revive_and_maybe_rehydrate(entity_id, &mut departed, |_| false, |_| None);
+
+        assert!(
+            !departed.contains_key(&entity_id),
+            "departed must be cleared for anti-resurrection, regardless of parked state"
         );
     }
 }
