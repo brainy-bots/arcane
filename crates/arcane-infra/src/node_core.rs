@@ -803,9 +803,16 @@ impl NodeCore {
             // reconnected before we forgot. Clear the tombstone and treat as fresh spawn-grace.
             let entity_id = entry.entity_id;
             let mut entry = entry; // mutable so we can rehydrate user_data
-            if self.departed.remove(&entity_id).is_some() {
+
+            // Clear anti-resurrection tombstone if present (ADOPT-blocking protection).
+            self.departed.remove(&entity_id);
+
+            // L1 rehydration (epic #305): restore user_data from parked snapshot (fresher, TTL-limited),
+            // gated on parked-key presence in Redis, independent of departed tombstone state.
+            // This ensures that if a client reconnects after the tombstone expires but within
+            // ARCANE_RECONNECT_TTL_SECS, the user_data is still restored.
+            if crate::parking::is_entity_parked(&self.redis_url, entity_id) {
                 self.spawn_grace.insert(entity_id, self.tick_count);
-                // L1 rehydration (epic #305): restore user_data from parked snapshot (fresher, TTL-limited).
                 let rehydrated = if let Some(parked_snapshot) =
                     crate::parking::unpark_entity(&self.redis_url, entity_id)
                 {
