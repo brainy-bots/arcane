@@ -18,6 +18,19 @@
 //!     capacity in entities: past it the load barrier κ·(n−cap)² grows until
 //!     shedding load outbids ANY cut (overload forces splits).
 //!   MANAGER_OBJECTIVE_KAPPA — optional float; default 0.5. Load-barrier scale.
+//!   MANAGER_MIGRATION_MAX_INFLIGHT — optional int; default 5. Max concurrent
+//!     pending migrations. Raise for fast repartition waves (demo: 30).
+//!   MANAGER_MIGRATION_COOLDOWN_TICKS — optional int; default 10. Evaluation
+//!     cycles an entity waits between re-migrations (handoff-settle guard;
+//!     flapping is prevented economically by μ + sticky seeding, not by this).
+//!   MANAGER_DECAY_FACTOR — optional float in (0,1); default 0.97. Interaction
+//!     graph memory per cycle. Half-life = ln(0.5)/ln(d) cycles (0.97 ≈ 23
+//!     cycles ≈ 5.7s at 250ms cadence). Lower = the graph forgets old
+//!     structure faster, so regime changes re-partition sooner.
+//!   MANAGER_PROXIMITY_WEIGHT — optional float; default 0.1. Per-cycle accrual
+//!     of a proximity edge. Equilibrium weight = w/(1−decay); if you lower the
+//!     decay factor, raise this to keep equilibrium ≈ 3.3, which the
+//!     objective's α/β/μ calibration assumes.
 //!   MANAGER_STALE_LIMIT_MS — optional; default 3 * cadence. Staleness window for clusters.
 //!   /join endpoint: accepts optional `?x=&y=&z=` spawn position hint query params.
 //!     Joins are placed by the partition objective (epic #293).
@@ -266,6 +279,26 @@ async fn control_loop(
             pin_feature: pin_feature.clone(),
             ..affinity_config.clone()
         });
+        // Migration pacing: in-flight cap + per-entity cooldown, env-tunable.
+        // The defaults (5 in flight, 10-cycle cooldown) stretch a 150-entity
+        // repartition wave over minutes at any cadence; demos and fast-handoff
+        // deployments raise the cap so waves complete in seconds.
+        {
+            let max_in_flight = env::var("MANAGER_MIGRATION_MAX_INFLIGHT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5usize);
+            let cooldown_ticks = env::var("MANAGER_MIGRATION_COOLDOWN_TICKS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10u64);
+            manager.set_migration_pacing(max_in_flight, cooldown_ticks);
+            eprintln!(
+                "arcane-manager: migration pacing — max_in_flight={}, cooldown_ticks={}",
+                max_in_flight.max(1),
+                cooldown_ticks.max(1)
+            );
+        }
         if let Some(ref pf) = pin_feature {
             eprintln!("arcane-manager: pin feature '{pf}' — pinned entities never migrate");
         }
@@ -455,13 +488,37 @@ async fn main() -> Result<(), String> {
             affinity_config.objective.kappa = kappa;
         }
     }
+    if let Ok(decay_str) = env::var("MANAGER_DECAY_FACTOR") {
+        if let Ok(decay) = decay_str.parse::<f64>() {
+            if decay.is_finite() && decay > 0.0 && decay < 1.0 {
+                affinity_config.decay_factor = decay;
+            } else {
+                eprintln!(
+                    "arcane-manager: invalid MANAGER_DECAY_FACTOR={decay} (need 0 < d < 1); keeping {}",
+                    affinity_config.decay_factor
+                );
+            }
+        }
+    }
+    if let Ok(pw_str) = env::var("MANAGER_PROXIMITY_WEIGHT") {
+        if let Ok(pw) = pw_str.parse::<f64>() {
+            if pw.is_finite() && pw > 0.0 {
+                affinity_config.proximity_weight = pw;
+            } else {
+                eprintln!(
+                    "arcane-manager: invalid MANAGER_PROXIMITY_WEIGHT={pw} (need > 0); keeping {}",
+                    affinity_config.proximity_weight
+                );
+            }
+        }
+    }
     // Operator-error guard: negative/NaN weights invert the objective
     // (crowding becomes a reward, churn becomes free); γ ≤ 1 kills the
     // emergent-split property. Invalid values fall back to defaults, loudly.
     affinity_config.objective = arcane_affinity::objective::sanitize(affinity_config.objective);
 
     eprintln!(
-        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}, graph={{decay={}, prox_w={}, eq_w≈{:.2}}}",
         clusters.len(),
         cadence_ms,
         redis_url,
@@ -470,7 +527,10 @@ async fn main() -> Result<(), String> {
         affinity_config.objective.beta,
         affinity_config.objective.mu,
         affinity_config.objective.cap,
-        affinity_config.objective.kappa
+        affinity_config.objective.kappa,
+        affinity_config.decay_factor,
+        affinity_config.proximity_weight,
+        affinity_config.proximity_weight / (1.0 - affinity_config.decay_factor)
     );
 
     // Initialize join state.

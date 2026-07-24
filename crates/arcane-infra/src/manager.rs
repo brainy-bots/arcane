@@ -343,45 +343,59 @@ fn build_partition_decisions(
     // LOCAL minimum for per-entity moves (the first mover pays cut + β + μ
     // for ~√n relief); this pass bisects the crowded partition's subgraph
     // and adopts the bisection iff the REAL ΔJ (cut created + β + μ·movers
-    // − crowding saved) is strictly negative. One split per cycle; the
-    // migration guardrails pace the resulting flip wave. Live-observed
-    // failure this fixes: 100% of ~300 mingled players ratcheted onto one
-    // cluster and no per-entity move could ever leave.
-    match arcane_affinity::split::split_pass(
-        &mut refined_partition,
-        &input.edges,
-        num_partitions,
-        &config.objective,
-    ) {
-        arcane_affinity::split::SplitOutcome::Adopted(report) => {
-            eprintln!(
-                "[split] partition {} -> {}: {} movers, dJ={:.1}",
-                report.source, report.target, report.movers, report.delta_j
-            );
-        }
-        arcane_affinity::split::SplitOutcome::Rejected(r) => {
-            // A blob wanted to split but the cut priced it out. This MUST be
-            // visible live (it is exactly the consolidation-ratchet signature)
-            // but must not spam: log every 40th rejection (~10s at the default
-            // cadence), or every one with ARCANE_DEBUG_SPLIT=1.
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
-            let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
-            if nth.is_multiple_of(40) || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1") {
+    // − crowding saved) is strictly negative. Runs to a FIXED POINT within
+    // the cycle (bounded by k−1, the structural maximum): a regime change
+    // that warrants 1 → 4 clusters concludes in ONE evaluation cycle instead
+    // of dripping one split per cadence tick. Each adopted split strictly
+    // decreases J, so the loop terminates. Live-observed failure this fixes:
+    // 100% of ~300 mingled players ratcheted onto one cluster and no
+    // per-entity move could ever leave.
+    let mut splits_left = num_partitions.saturating_sub(1).max(1);
+    loop {
+        match arcane_affinity::split::split_pass(
+            &mut refined_partition,
+            &input.edges,
+            num_partitions,
+            &config.objective,
+        ) {
+            arcane_affinity::split::SplitOutcome::Adopted(report) => {
                 eprintln!(
-                    "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
-                    r.source,
-                    r.size,
-                    r.cut_created,
-                    config.objective.beta,
-                    r.movers,
-                    config.objective.mu * r.movers as f64,
-                    r.crowding_saved,
-                    r.delta_j
+                    "[split] partition {} -> {}: {} movers, dJ={:.1}",
+                    report.source, report.target, report.movers, report.delta_j
                 );
+                splits_left -= 1;
+                if splits_left == 0 {
+                    break;
+                }
             }
+            arcane_affinity::split::SplitOutcome::Rejected(r) => {
+                // A blob wanted to split but the cut priced it out. This MUST
+                // be visible live (it is exactly the consolidation-ratchet
+                // signature) but must not spam: log every 40th rejection
+                // (~10s at the default cadence), or every one with
+                // ARCANE_DEBUG_SPLIT=1.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+                let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if nth.is_multiple_of(40)
+                    || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1")
+                {
+                    eprintln!(
+                        "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
+                        r.source,
+                        r.size,
+                        r.cut_created,
+                        config.objective.beta,
+                        r.movers,
+                        config.objective.mu * r.movers as f64,
+                        r.crowding_saved,
+                        r.delta_j
+                    );
+                }
+                break;
+            }
+            arcane_affinity::split::SplitOutcome::NoCandidate => break,
         }
-        arcane_affinity::split::SplitOutcome::NoCandidate => {}
     }
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:
@@ -550,6 +564,20 @@ impl ArcaneManager {
     /// predictor lands (#292) and is currently ignored.
     pub fn with_model(_model_type: &str) -> Self {
         Self::with_defaults()
+    }
+
+    /// Configure migration pacing: how many migrations may be in flight at
+    /// once, and how many evaluation cycles an entity must wait between
+    /// re-migrations. The defaults (5, 10) are deliberately conservative —
+    /// correct for steady state, but they stretch a large repartition wave
+    /// (e.g. a movement-regime change moving 100+ entities) across minutes.
+    /// Operators with fast cadences and cheap handoffs raise them
+    /// (MANAGER_MIGRATION_MAX_INFLIGHT / MANAGER_MIGRATION_COOLDOWN_TICKS).
+    /// Values are clamped to ≥ 1 (0 would deadlock all migration).
+    #[cfg(feature = "migration")]
+    pub fn set_migration_pacing(&mut self, max_in_flight: usize, cooldown_ticks: u64) {
+        self.migration_state.max_in_flight = max_in_flight.max(1);
+        self.migration_state.cooldown_ticks = cooldown_ticks.max(1);
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
