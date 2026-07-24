@@ -10,7 +10,10 @@
 //!   MANAGER_HTTP_PORT — optional; default 8081.
 //!   REDIS_URL — optional; default "redis://127.0.0.1:6379".
 //!   MANAGER_CADENCE_MS — optional; default 1000. Control loop cycle interval.
-//!   MANAGER_CAPACITY_FACTOR — optional float; default uses AffinityConfig default (~1.5).
+//!   MANAGER_OBJECTIVE_ALPHA — optional float; default 1.25. Crowding penalty scale.
+//!   MANAGER_OBJECTIVE_GAMMA — optional float; default 1.5. Crowding exponent.
+//!   MANAGER_OBJECTIVE_BETA — optional float; default 15.0. Cost of non-empty partition.
+//!   MANAGER_OBJECTIVE_MU — optional float; default 3.0. Cost per entity moved.
 //!   MANAGER_STALE_LIMIT_MS — optional; default 3 * cadence. Staleness window for clusters.
 //!   /join endpoint: accepts optional `?x=&y=&z=` spawn position hint query params.
 //!     Joins are placed by the partition objective (epic #293).
@@ -188,7 +191,6 @@ async fn control_loop(
     clusters: Vec<ClusterReg>,
     redis_url: String,
     cadence_ms: u64,
-    capacity_factor: Option<f64>,
     stale_limit_ms: u64,
     join_state: Arc<Mutex<JoinState>>,
     affinity_config: arcane_affinity::config::AffinityConfig,
@@ -219,7 +221,7 @@ async fn control_loop(
 
         let mut manager = ArcaneManager::with_model("affinity");
 
-        // Apply operator config: capacity factor and/or pin feature.
+        // Apply operator config: pin feature.
         // MANAGER_PIN_FEATURE names the game-declared feature that anchors an
         // entity to its current cluster (nonzero value = never migrate). The
         // v1 stand-in for CLUSTER_REASSIGN: client-driven entities stay on the
@@ -227,14 +229,11 @@ async fn control_loop(
         let pin_feature = env::var("MANAGER_PIN_FEATURE")
             .ok()
             .filter(|s| !s.is_empty());
-        if capacity_factor.is_some() || pin_feature.is_some() {
-            let mut config = arcane_affinity::config::AffinityConfig {
+        if pin_feature.is_some() {
+            let config = arcane_affinity::config::AffinityConfig {
                 pin_feature: pin_feature.clone(),
-                ..Default::default()
+                ..affinity_config.clone()
             };
-            if let Some(factor) = capacity_factor {
-                config.capacity_factor = factor;
-            }
             manager.set_affinity_config(config);
         }
         if let Some(ref pf) = pin_feature {
@@ -384,34 +383,45 @@ async fn main() -> Result<(), String> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    let capacity_factor = env::var("MANAGER_CAPACITY_FACTOR")
-        .ok()
-        .and_then(|s| s.parse().ok());
-
     let stale_limit_ms = env::var("MANAGER_STALE_LIMIT_MS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3 * cadence_ms);
 
+    // Build affinity config with optional objective weights overrides.
+    let mut affinity_config = arcane_affinity::config::AffinityConfig::default();
+
+    if let Ok(alpha_str) = env::var("MANAGER_OBJECTIVE_ALPHA") {
+        if let Ok(alpha) = alpha_str.parse() {
+            affinity_config.objective.alpha = alpha;
+        }
+    }
+    if let Ok(gamma_str) = env::var("MANAGER_OBJECTIVE_GAMMA") {
+        if let Ok(gamma) = gamma_str.parse() {
+            affinity_config.objective.gamma = gamma;
+        }
+    }
+    if let Ok(beta_str) = env::var("MANAGER_OBJECTIVE_BETA") {
+        if let Ok(beta) = beta_str.parse() {
+            affinity_config.objective.beta = beta;
+        }
+    }
+    if let Ok(mu_str) = env::var("MANAGER_OBJECTIVE_MU") {
+        if let Ok(mu) = mu_str.parse() {
+            affinity_config.objective.mu = mu;
+        }
+    }
+
     eprintln!(
-        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}}}",
         clusters.len(),
         cadence_ms,
-        redis_url
+        redis_url,
+        affinity_config.objective.alpha,
+        affinity_config.objective.gamma,
+        affinity_config.objective.beta,
+        affinity_config.objective.mu
     );
-
-    // Build affinity config (same as in control loop).
-    let affinity_config = if capacity_factor.is_some() {
-        let mut config = arcane_affinity::config::AffinityConfig {
-            ..Default::default()
-        };
-        if let Some(factor) = capacity_factor {
-            config.capacity_factor = factor;
-        }
-        config
-    } else {
-        arcane_affinity::config::AffinityConfig::default()
-    };
 
     // Initialize join state.
     let join_state = Arc::new(Mutex::new(JoinState {
@@ -431,7 +441,6 @@ async fn main() -> Result<(), String> {
             loop_clusters,
             redis_url,
             cadence_ms,
-            capacity_factor,
             stale_limit_ms,
             loop_join_state,
             loop_affinity_config,
@@ -626,5 +635,98 @@ mod tests {
         .expect("place should succeed");
 
         assert_eq!(selected, c2, "should exclude stale cluster c1 and pick c2");
+    }
+
+    #[test]
+    fn parse_objective_alpha_present() {
+        std::env::set_var("MANAGER_OBJECTIVE_ALPHA", "2.5");
+        let mut config = arcane_affinity::config::AffinityConfig::default();
+        if let Ok(alpha_str) = env::var("MANAGER_OBJECTIVE_ALPHA") {
+            if let Ok(alpha) = alpha_str.parse() {
+                config.objective.alpha = alpha;
+            }
+        }
+        assert_eq!(config.objective.alpha, 2.5);
+        std::env::remove_var("MANAGER_OBJECTIVE_ALPHA");
+    }
+
+    #[test]
+    fn parse_objective_alpha_absent() {
+        std::env::remove_var("MANAGER_OBJECTIVE_ALPHA");
+        let config = arcane_affinity::config::AffinityConfig::default();
+        assert_eq!(config.objective.alpha, 1.25);
+    }
+
+    #[test]
+    fn parse_objective_gamma_present() {
+        std::env::set_var("MANAGER_OBJECTIVE_GAMMA", "2.0");
+        let mut config = arcane_affinity::config::AffinityConfig::default();
+        if let Ok(gamma_str) = env::var("MANAGER_OBJECTIVE_GAMMA") {
+            if let Ok(gamma) = gamma_str.parse() {
+                config.objective.gamma = gamma;
+            }
+        }
+        assert_eq!(config.objective.gamma, 2.0);
+        std::env::remove_var("MANAGER_OBJECTIVE_GAMMA");
+    }
+
+    #[test]
+    fn parse_objective_gamma_absent() {
+        std::env::remove_var("MANAGER_OBJECTIVE_GAMMA");
+        let config = arcane_affinity::config::AffinityConfig::default();
+        assert_eq!(config.objective.gamma, 1.5);
+    }
+
+    #[test]
+    fn parse_objective_beta_present() {
+        std::env::set_var("MANAGER_OBJECTIVE_BETA", "20.0");
+        let mut config = arcane_affinity::config::AffinityConfig::default();
+        if let Ok(beta_str) = env::var("MANAGER_OBJECTIVE_BETA") {
+            if let Ok(beta) = beta_str.parse() {
+                config.objective.beta = beta;
+            }
+        }
+        assert_eq!(config.objective.beta, 20.0);
+        std::env::remove_var("MANAGER_OBJECTIVE_BETA");
+    }
+
+    #[test]
+    fn parse_objective_beta_absent() {
+        std::env::remove_var("MANAGER_OBJECTIVE_BETA");
+        let config = arcane_affinity::config::AffinityConfig::default();
+        assert_eq!(config.objective.beta, 15.0);
+    }
+
+    #[test]
+    fn parse_objective_mu_present() {
+        std::env::set_var("MANAGER_OBJECTIVE_MU", "5.0");
+        let mut config = arcane_affinity::config::AffinityConfig::default();
+        if let Ok(mu_str) = env::var("MANAGER_OBJECTIVE_MU") {
+            if let Ok(mu) = mu_str.parse() {
+                config.objective.mu = mu;
+            }
+        }
+        assert_eq!(config.objective.mu, 5.0);
+        std::env::remove_var("MANAGER_OBJECTIVE_MU");
+    }
+
+    #[test]
+    fn parse_objective_mu_absent() {
+        std::env::remove_var("MANAGER_OBJECTIVE_MU");
+        let config = arcane_affinity::config::AffinityConfig::default();
+        assert_eq!(config.objective.mu, 3.0);
+    }
+
+    #[test]
+    fn parse_objective_garbage_alpha() {
+        std::env::set_var("MANAGER_OBJECTIVE_ALPHA", "not_a_float");
+        let mut config = arcane_affinity::config::AffinityConfig::default();
+        if let Ok(alpha_str) = env::var("MANAGER_OBJECTIVE_ALPHA") {
+            if let Ok(alpha) = alpha_str.parse::<f64>() {
+                config.objective.alpha = alpha;
+            }
+        }
+        assert_eq!(config.objective.alpha, 1.25);
+        std::env::remove_var("MANAGER_OBJECTIVE_ALPHA");
     }
 }

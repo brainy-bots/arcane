@@ -313,6 +313,10 @@ Hysteresis/cooldown (live in `arcane_infra::manager::MigrationState`) rate-limit
 not thrash; `SCALING_MODEL.md`'s K_max slack (~218 boundary entities on demo
 constants) means there is large tolerance before action is forced.
 
+### 5.1 Implementation status (epic #293)
+
+§5's policy is now implemented as the explicit objective `J = cut + α·Σ|S|^γ + β·open + μ·moves` (epic #293). The packing strategy ("pack maximally") is encoded in the `β·open` term (cost of non-empty partitions); resource-pressure splits are driven by the `α·Σ|S|^γ` crowding penalty (resource signal integration with Sigil remains future work). Cluster count emerges from the partitioner's cost minimization, not a fixed topology.
+
 ---
 
 ## 6. Manager scalability — memory and compute
