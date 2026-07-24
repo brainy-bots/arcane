@@ -430,6 +430,12 @@ pub struct NodeCore {
     /// Drained into `NodeInputs::lost_entities` so the driver drops them.
     #[cfg(feature = "migration")]
     pending_driver_releases: Vec<Uuid>,
+    /// L1 short-term persistence (epic #305): config for parking entity snapshots in Redis.
+    #[cfg(feature = "migration")]
+    parking_config: crate::parking::ParkingConfig,
+    /// Redis URL for parking operations.
+    #[cfg(feature = "migration")]
+    redis_url: String,
 }
 
 impl NodeCore {
@@ -669,6 +675,10 @@ impl NodeCore {
             session_closes_rx,
             #[cfg(feature = "migration")]
             pending_driver_releases: Vec::new(),
+            #[cfg(feature = "migration")]
+            parking_config: crate::parking::ParkingConfig::from_env(),
+            #[cfg(feature = "migration")]
+            redis_url: cfg.redis_url.clone(),
         })
     }
 
@@ -690,15 +700,11 @@ impl NodeCore {
     /// remember, never as an error.
     #[cfg(feature = "migration")]
     fn on_leave(&mut self, id: Uuid, final_state: Option<&EntityStateEntry>) {
-        // L0: leave-and-forget. Log at debug cadence only (leaves are rare).
-        eprintln!(
-            "[leave] entity {id} departed (L0: nothing remembered; snapshot {})",
-            if final_state.is_some() {
-                "captured"
-            } else {
-                "already gone"
-            }
-        );
+        if let Some(entry) = final_state {
+            crate::parking::park_entity(&self.redis_url, &self.parking_config, id, entry);
+        } else {
+            eprintln!("[leave] entity {id} departed (snapshot already gone)");
+        }
     }
 
     /// Unified leave path (epic #305): the session ends and the entity leaves
@@ -791,8 +797,21 @@ impl NodeCore {
             // Revival rule (L0): if this update is for a tombstoned id, the client
             // reconnected before we forgot. Clear the tombstone and treat as fresh spawn-grace.
             let entity_id = entry.entity_id;
+            let mut entry = entry; // mutable so we can rehydrate user_data
             if self.departed.remove(&entity_id).is_some() {
                 self.spawn_grace.insert(entity_id, self.tick_count);
+                // L1 rehydration (epic #305): restore user_data from parked snapshot.
+                if let Some(parked_snapshot) =
+                    crate::parking::unpark_entity(&self.redis_url, entity_id)
+                {
+                    if let Some(parked_user_data) = parked_snapshot.get("user_data") {
+                        entry.user_data = parked_user_data.clone();
+                        eprintln!(
+                            "[rehydrate] entity {} user_data restored from parked snapshot",
+                            entity_id
+                        );
+                    }
+                }
             }
             self.client_driven_last_seen
                 .insert(entity_id, self.tick_count);
