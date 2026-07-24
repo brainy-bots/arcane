@@ -14,6 +14,10 @@
 //!   MANAGER_OBJECTIVE_GAMMA — optional float; default 1.5. Crowding exponent.
 //!   MANAGER_OBJECTIVE_BETA — optional float; default 15.0. Cost of non-empty partition.
 //!   MANAGER_OBJECTIVE_MU — optional float; default 3.0. Cost per entity moved.
+//!   MANAGER_OBJECTIVE_CAP — optional float; default 0 (off). Soft per-cluster
+//!     capacity in entities: past it the load barrier κ·(n−cap)² grows until
+//!     shedding load outbids ANY cut (overload forces splits).
+//!   MANAGER_OBJECTIVE_KAPPA — optional float; default 0.5. Load-barrier scale.
 //!   MANAGER_STALE_LIMIT_MS — optional; default 3 * cadence. Staleness window for clusters.
 //!   /join endpoint: accepts optional `?x=&y=&z=` spawn position hint query params.
 //!     Joins are placed by the partition objective (epic #293).
@@ -437,20 +441,32 @@ async fn main() -> Result<(), String> {
             affinity_config.objective.mu = mu;
         }
     }
+    if let Ok(cap_str) = env::var("MANAGER_OBJECTIVE_CAP") {
+        if let Ok(cap) = cap_str.parse() {
+            affinity_config.objective.cap = cap;
+        }
+    }
+    if let Ok(kappa_str) = env::var("MANAGER_OBJECTIVE_KAPPA") {
+        if let Ok(kappa) = kappa_str.parse() {
+            affinity_config.objective.kappa = kappa;
+        }
+    }
     // Operator-error guard: negative/NaN weights invert the objective
     // (crowding becomes a reward, churn becomes free); γ ≤ 1 kills the
     // emergent-split property. Invalid values fall back to defaults, loudly.
     affinity_config.objective = arcane_affinity::objective::sanitize(affinity_config.objective);
 
     eprintln!(
-        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}}}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}",
         clusters.len(),
         cadence_ms,
         redis_url,
         affinity_config.objective.alpha,
         affinity_config.objective.gamma,
         affinity_config.objective.beta,
-        affinity_config.objective.mu
+        affinity_config.objective.mu,
+        affinity_config.objective.cap,
+        affinity_config.objective.kappa
     );
 
     // Initialize join state.

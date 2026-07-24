@@ -347,16 +347,42 @@ fn build_partition_decisions(
     // migration guardrails pace the resulting flip wave. Live-observed
     // failure this fixes: 100% of ~300 mingled players ratcheted onto one
     // cluster and no per-entity move could ever leave.
-    if let Some(report) = arcane_affinity::split::split_pass(
+    match arcane_affinity::split::split_pass(
         &mut refined_partition,
         &input.edges,
         num_partitions,
         &config.objective,
     ) {
-        eprintln!(
-            "[split] partition {} -> {}: {} movers, dJ={:.1}",
-            report.source, report.target, report.movers, report.delta_j
-        );
+        arcane_affinity::split::SplitOutcome::Adopted(report) => {
+            eprintln!(
+                "[split] partition {} -> {}: {} movers, dJ={:.1}",
+                report.source, report.target, report.movers, report.delta_j
+            );
+        }
+        arcane_affinity::split::SplitOutcome::Rejected(r) => {
+            // A blob wanted to split but the cut priced it out. This MUST be
+            // visible live (it is exactly the consolidation-ratchet signature)
+            // but must not spam: log every 40th rejection (~10s at the default
+            // cadence), or every one with ARCANE_DEBUG_SPLIT=1.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+            let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if nth.is_multiple_of(40) || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1")
+            {
+                eprintln!(
+                    "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
+                    r.source,
+                    r.size,
+                    r.cut_created,
+                    config.objective.beta,
+                    r.movers,
+                    config.objective.mu * r.movers as f64,
+                    r.crowding_saved,
+                    r.delta_j
+                );
+            }
+        }
+        arcane_affinity::split::SplitOutcome::NoCandidate => {}
     }
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:

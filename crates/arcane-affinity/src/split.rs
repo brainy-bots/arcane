@@ -38,6 +38,48 @@ pub struct SplitReport {
     pub delta_j: f64,
 }
 
+/// A candidate bisection that was evaluated and priced OUT (ΔJ ≥ 0), kept
+/// for diagnostics. Persistent consolidation because the cut is too expensive
+/// is a calibration signal, not silence — the caller should be able to see
+/// cut_created vs crowding_saved for the blob it could not break.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitRejection {
+    /// Partition whose bisection was priced out.
+    pub source: usize,
+    /// Entities in that partition.
+    pub size: usize,
+    /// Entities the rejected bisection would have moved.
+    pub movers: usize,
+    /// Soft-edge weight the bisection would have cut.
+    pub cut_created: f64,
+    /// Crowding relief the bisection would have bought.
+    pub crowding_saved: f64,
+    /// The (non-negative) objective delta that vetoed adoption.
+    pub delta_j: f64,
+}
+
+/// Outcome of one split pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SplitOutcome {
+    /// A bisection was adopted; the partition was updated in place.
+    Adopted(SplitReport),
+    /// The most crowded eligible partition's bisection was priced out.
+    Rejected(SplitRejection),
+    /// Nothing to evaluate: no free slot, or no partition passed the
+    /// necessary condition (ideal-halving relief ≤ β), or only hard atoms.
+    NoCandidate,
+}
+
+impl SplitOutcome {
+    /// The adopted report, if a split was adopted.
+    pub fn adopted(self) -> Option<SplitReport> {
+        match self {
+            SplitOutcome::Adopted(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
 /// One split pass over the partition (epic #293's missing global move).
 ///
 /// For each partition large enough that an ideal halving would pay for a new
@@ -56,7 +98,7 @@ pub fn split_pass(
     edges: &[WeightedEdge],
     num_partitions: usize,
     weights: &ObjectiveWeights,
-) -> Option<SplitReport> {
+) -> SplitOutcome {
     // Partition sizes + an empty target partition.
     let mut sizes = vec![0usize; num_partitions];
     for &p in partition.assignment().values() {
@@ -64,42 +106,47 @@ pub fn split_pass(
             sizes[p] += 1;
         }
     }
-    let target = (0..num_partitions).find(|&i| sizes[i] == 0)?;
+    let Some(target) = (0..num_partitions).find(|&i| sizes[i] == 0) else {
+        return SplitOutcome::NoCandidate;
+    };
 
     // Candidate sources: crowding relief of an ideal halving exceeds β.
     // Checked in DECREASING size order — the most crowded partition first.
     let mut candidates: Vec<usize> = (0..num_partitions).filter(|&i| sizes[i] >= 4).collect();
     candidates.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
 
+    let mut first_rejection: Option<SplitRejection> = None;
     for source in candidates {
         let n = sizes[source] as f64;
         let half = (sizes[source] / 2) as f64;
         let other_half = n - half;
-        let crowding_saved = weights.alpha
-            * (n.powf(weights.gamma) - half.powf(weights.gamma) - other_half.powf(weights.gamma));
+        let crowding_saved = crate::objective::cluster_cost(n, weights)
+            - crate::objective::cluster_cost(half, weights)
+            - crate::objective::cluster_cost(other_half, weights);
         if crowding_saved <= weights.beta {
             continue; // even a free-cut halving cannot pay for the instance
         }
 
         let members: HashSet<Uuid> = partition.members(source).into_iter().collect();
-        if let Some(report) = try_bisect(
-            partition,
-            &members,
-            source,
-            target,
-            edges,
-            weights,
-            crowding_saved,
-        ) {
-            return Some(report);
+        match try_bisect(partition, &members, source, target, edges, weights) {
+            Ok(report) => return SplitOutcome::Adopted(report),
+            Err(Some(rejection)) => {
+                // Keep the FIRST rejection: candidates are ordered most-crowded
+                // first, so it is the blob whose economics matter.
+                first_rejection.get_or_insert(rejection);
+            }
+            Err(None) => {} // degenerate (single hard atom etc.)
         }
     }
-    None
+    match first_rejection {
+        Some(r) => SplitOutcome::Rejected(r),
+        None => SplitOutcome::NoCandidate,
+    }
 }
 
 /// Attempt to bisect `members` (the induced subgraph of `source`); adopt into
-/// `target` iff ΔJ < 0. Returns the adopted split, or None.
-#[allow(clippy::too_many_arguments)]
+/// `target` iff ΔJ < 0. `Ok` = adopted; `Err(Some(_))` = a bisection was
+/// found but priced out; `Err(None)` = degenerate (no bisection exists).
 fn try_bisect(
     partition: &mut Partition,
     members: &HashSet<Uuid>,
@@ -107,8 +154,7 @@ fn try_bisect(
     target: usize,
     edges: &[WeightedEdge],
     weights: &ObjectiveWeights,
-    _ideal_saving: f64,
-) -> Option<SplitReport> {
+) -> Result<SplitReport, Option<SplitRejection>> {
     // 1. Hard atoms: union hard-connected members (joints never cut).
     let mut ids: Vec<Uuid> = members.iter().copied().collect();
     ids.sort();
@@ -143,7 +189,7 @@ fn try_bisect(
     }
     atom_list.sort_by(|a, b| a[0].cmp(&b[0]));
     if atom_list.len() < 2 {
-        return None; // one giant hard atom: cannot split
+        return Err(None); // one giant hard atom: cannot split
     }
 
     // Soft-edge adjacency between ATOMS (weights aggregated).
@@ -228,7 +274,7 @@ fn try_bisect(
         }
     }
     if side_b.len() == atom_list.len() || side_b.is_empty() {
-        return None; // degenerate: everything (or nothing) on one side
+        return Err(None); // degenerate: everything (or nothing) on one side
     }
 
     // 3. Price the ACTUAL bisection: cut created + β + μ·movers − crowding saved.
@@ -249,12 +295,22 @@ fn try_bisect(
     let n = total_entities as f64;
     let b_n = b_entities as f64;
     let a_n = n - b_n;
-    let crowding_saved =
-        weights.alpha * (n.powf(weights.gamma) - a_n.powf(weights.gamma) - b_n.powf(weights.gamma));
+    let crowding_saved = crate::objective::cluster_cost(n, weights)
+        - crate::objective::cluster_cost(a_n, weights)
+        - crate::objective::cluster_cost(b_n, weights);
     let movers = b_entities;
     let delta_j = cut_created + weights.beta + weights.mu * movers as f64 - crowding_saved;
     if delta_j >= 0.0 {
-        return None; // split does not pay at this size/cut — economics say stay
+        // Split does not pay at this size/cut — economics say stay. Surface
+        // the numbers: a persistently-rejected big blob is a calibration signal.
+        return Err(Some(SplitRejection {
+            source,
+            size: total_entities,
+            movers,
+            cut_created,
+            crowding_saved,
+            delta_j,
+        }));
     }
 
     // 4. Adopt: move side-B atoms to the empty target partition.
@@ -263,7 +319,7 @@ fn try_bisect(
             partition.set(e, target);
         }
     }
-    Some(SplitReport {
+    Ok(SplitReport {
         source,
         target,
         movers,
@@ -308,7 +364,9 @@ mod tests {
         // (α·(300^1.5 − 2·150^1.5) ≈ 1900) dwarfs β + cut + μ·150.
         let w = ObjectiveWeights::default();
         let (_ids, edges, mut part) = ring_blob(300, 3.3);
-        let report = split_pass(&mut part, &edges, 4, &w).expect("must split at n=300");
+        let report = split_pass(&mut part, &edges, 4, &w)
+            .adopted()
+            .expect("must split at n=300");
         assert!(report.delta_j < 0.0, "adopted split must improve J");
         let mut sizes = [0usize; 4];
         for &p in part.assignment().values() {
@@ -339,7 +397,7 @@ mod tests {
         let w = ObjectiveWeights::default();
         let (_ids, edges, mut part) = ring_blob(30, 3.3);
         assert!(
-            split_pass(&mut part, &edges, 4, &w).is_none(),
+            split_pass(&mut part, &edges, 4, &w).adopted().is_none(),
             "below the bulk onset (n≈35) the blob must stay consolidated"
         );
     }
@@ -365,10 +423,63 @@ mod tests {
         }
         let assignment: HashMap<Uuid, usize> = ids.iter().map(|&e| (e, 0)).collect();
         let mut part = Partition::new(assignment);
+        let outcome = split_pass(&mut part, &edges, 4, &wts);
         assert!(
-            split_pass(&mut part, &edges, 4, &wts).is_none(),
+            outcome.clone().adopted().is_none(),
             "a dense clique's cut must veto the split"
         );
+        // The veto must be observable: a Rejected outcome with the cut ≥ the
+        // crowding relief it would buy.
+        match outcome {
+            SplitOutcome::Rejected(r) => {
+                assert!(r.cut_created > r.crowding_saved, "cut vetoed: {r:?}");
+            }
+            other => panic!("dense clique should report a priced-out bisection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_expander_splits_despite_expensive_cut() {
+        // An expander (K80 at weight 0.5) whose balanced cut (≈800) exceeds
+        // what pure affinity crowding can save (≈262 − β − μ·movers ⇒
+        // dJ ≈ +673: affinity REJECTS the split; verified by the assert
+        // below with the barrier off). With cap = 30, κ = 0.5 the barrier
+        // adds 0.5·(50² − 2·10²) = 1150 of relief ⇒ dJ ≈ −477: survival
+        // outbids locality and the SAME graph must now split.
+        let ids: Vec<Uuid> = (0..80).map(uuid).collect();
+        let mut edges = Vec::new();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                edges.push(WeightedEdge {
+                    a: ids[i],
+                    b: ids[j],
+                    weight: 0.5,
+                    colocation: Colocation::Soft,
+                });
+            }
+        }
+        let assignment: HashMap<Uuid, usize> = ids.iter().map(|&e| (e, 0)).collect();
+
+        // Barrier off: affinity economics must reject this expander.
+        let mut part_off = Partition::new(assignment.clone());
+        assert!(
+            split_pass(&mut part_off, &edges, 4, &ObjectiveWeights::default())
+                .adopted()
+                .is_none(),
+            "without the barrier the expander's cut must veto the split"
+        );
+
+        // Barrier on: the overloaded blob must split anyway.
+        let wts = ObjectiveWeights {
+            cap: 30.0,
+            kappa: 0.5,
+            ..ObjectiveWeights::default()
+        };
+        let mut part = Partition::new(assignment);
+        let report = split_pass(&mut part, &edges, 4, &wts)
+            .adopted()
+            .expect("barrier must force the overloaded expander to split");
+        assert!(report.delta_j < 0.0);
     }
 
     #[test]
@@ -398,7 +509,9 @@ mod tests {
         let assignment: HashMap<Uuid, usize> =
             left.iter().chain(right.iter()).map(|&e| (e, 0)).collect();
         let mut part = Partition::new(assignment);
-        let report = split_pass(&mut part, &edges, 4, &wts).expect("communities must split");
+        let report = split_pass(&mut part, &edges, 4, &wts)
+            .adopted()
+            .expect("communities must split");
         // Each community must be whole on one side.
         let side_of = |e: Uuid| part.of(e).unwrap();
         let l0 = side_of(left[0]);
@@ -428,7 +541,7 @@ mod tests {
             weight: 0.0,
             colocation: Colocation::Hard,
         });
-        if split_pass(&mut part, &edges, 4, &wts).is_some() {
+        if split_pass(&mut part, &edges, 4, &wts).adopted().is_some() {
             assert_eq!(
                 part.of(ids[0]),
                 part.of(ids[100]),
@@ -445,7 +558,10 @@ mod tests {
         let assignment: HashMap<Uuid, usize> =
             ids.iter().enumerate().map(|(i, &e)| (e, i % 4)).collect();
         let mut part = Partition::new(assignment.clone());
-        assert!(split_pass(&mut part, &edges, 4, &wts).is_none());
+        assert_eq!(
+            split_pass(&mut part, &edges, 4, &wts),
+            SplitOutcome::NoCandidate
+        );
         assert_eq!(part.assignment(), &assignment, "partition untouched");
     }
 
