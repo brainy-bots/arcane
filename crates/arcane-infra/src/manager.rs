@@ -325,7 +325,7 @@ fn build_partition_decisions(
     } else {
         std::collections::HashSet::new()
     };
-    let refined_partition = refine(
+    let mut refined_partition = refine(
         &partition,
         &input.edges,
         num_partitions,
@@ -337,6 +337,52 @@ fn build_partition_decisions(
             moved_in_seed,
         },
     );
+
+    // Split pass (epic #293 follow-up): the global move single-entity
+    // refinement cannot make. A consolidated blob above the split onset is a
+    // LOCAL minimum for per-entity moves (the first mover pays cut + β + μ
+    // for ~√n relief); this pass bisects the crowded partition's subgraph
+    // and adopts the bisection iff the REAL ΔJ (cut created + β + μ·movers
+    // − crowding saved) is strictly negative. One split per cycle; the
+    // migration guardrails pace the resulting flip wave. Live-observed
+    // failure this fixes: 100% of ~300 mingled players ratcheted onto one
+    // cluster and no per-entity move could ever leave.
+    match arcane_affinity::split::split_pass(
+        &mut refined_partition,
+        &input.edges,
+        num_partitions,
+        &config.objective,
+    ) {
+        arcane_affinity::split::SplitOutcome::Adopted(report) => {
+            eprintln!(
+                "[split] partition {} -> {}: {} movers, dJ={:.1}",
+                report.source, report.target, report.movers, report.delta_j
+            );
+        }
+        arcane_affinity::split::SplitOutcome::Rejected(r) => {
+            // A blob wanted to split but the cut priced it out. This MUST be
+            // visible live (it is exactly the consolidation-ratchet signature)
+            // but must not spam: log every 40th rejection (~10s at the default
+            // cadence), or every one with ARCANE_DEBUG_SPLIT=1.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+            let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if nth.is_multiple_of(40) || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1") {
+                eprintln!(
+                    "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
+                    r.source,
+                    r.size,
+                    r.cut_created,
+                    config.objective.beta,
+                    r.movers,
+                    config.objective.mu * r.movers as f64,
+                    r.crowding_saved,
+                    r.delta_j
+                );
+            }
+        }
+        arcane_affinity::split::SplitOutcome::NoCandidate => {}
+    }
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:
     // two partitions must never map to the same cluster (the old plurality-only

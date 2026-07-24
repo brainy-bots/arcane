@@ -7,6 +7,7 @@ pub mod partition;
 pub mod predictor;
 pub mod rate_field;
 pub mod refinement;
+pub mod split;
 
 // The crate's public surface is its modules. The old `AffinityEngine`
 // (an `IClusteringModel` implementation) and the `scorer` it used were
