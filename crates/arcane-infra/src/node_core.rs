@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 use arcane_core::cluster_simulation::GameAction;
 use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
+#[cfg(feature = "migration")]
 use arcane_core::IPersistence;
 use uuid::Uuid;
 
@@ -799,13 +800,24 @@ impl NodeCore {
                 self.maybe_send_reconnect_hint(entity_id, owner);
                 continue;
             }
-            // Revival rule (L0): if this update is for a tombstoned id, the client
-            // reconnected before we forgot. Clear the tombstone and treat as fresh spawn-grace.
+            // Revival + rehydration (epic #305, decoupled per #321): the
+            // tombstone clears on any real client update (anti-resurrection
+            // revival); the L1/L2 restore is gated on FIRST CONTACT for an
+            // unrepresented entity — bounded by the Redis key's OWN TTL
+            // (`ARCANE_RECONNECT_TTL_SECS`), not the tombstone's lifetime.
             let entity_id = entry.entity_id;
             let mut entry = entry; // mutable so we can rehydrate user_data
-            if self.departed.remove(&entity_id).is_some() {
+            let action = revival_action(
+                entity_id,
+                &mut self.departed,
+                &self.owned_view,
+                &self.spawn_grace,
+            );
+            if action.revived {
                 self.spawn_grace.insert(entity_id, self.tick_count);
-                // L1 rehydration (epic #305): restore user_data from parked snapshot (fresher, TTL-limited).
+            }
+            if action.try_rehydrate {
+                // L1: parked snapshot (fresher, consume-once, TTL-bounded).
                 let rehydrated = if let Some(parked_snapshot) =
                     crate::parking::unpark_entity(&self.redis_url, entity_id)
                 {
@@ -1367,6 +1379,56 @@ impl NodeCore {
     }
 }
 
+/// Decide the revival/rehydration action for an inbound client update
+/// (epic #305, issue #321). Extracted from `drain_inputs` per the
+/// `forward_target` precedent so it is unit-testable without a `NodeCore`.
+///
+/// Two DECOUPLED mechanisms meet here: the anti-resurrection tombstone
+/// (`departed`, tick-based, sized for the manager's forget latency), whose
+/// clearing on a real client update is the REVIVAL rule; and the L1 parked
+/// snapshot (Redis key, `ARCANE_RECONNECT_TTL_SECS`, wall-clock), whose
+/// restore is REHYDRATION.
+///
+/// The former bug: rehydration only ran inside the tombstone branch, so the
+/// effective reconnect window was min(tombstone, TTL) instead of the TTL.
+/// The rule now: rehydration is gated on FIRST CONTACT — the entity is not
+/// currently represented here (not owned, not in spawn grace) — which is
+/// exactly when a parked snapshot could exist. A live, continuously-driven
+/// entity never probes Redis (hot-path safety); the tombstone is cleared
+/// independently whenever present.
+#[cfg(feature = "migration")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct RevivalOutcome {
+    /// The tombstone was present and cleared: re-grace the entity.
+    pub revived: bool,
+    /// First contact for an unrepresented entity: attempt L1 unpark (and
+    /// L2 durable load if no snapshot). False for live entities — never
+    /// probe Redis for an entity we already represent.
+    pub try_rehydrate: bool,
+}
+
+#[cfg(feature = "migration")]
+pub fn revival_action(
+    entity_id: Uuid,
+    departed: &mut HashMap<Uuid, u64>,
+    owned_view: &HashSet<Uuid>,
+    spawn_grace: &HashMap<Uuid, u64>,
+) -> RevivalOutcome {
+    let revived = departed.remove(&entity_id).is_some();
+    // First contact = we do not currently represent this entity. Covers:
+    // tombstoned (just left, reconnect before manager forgot), tombstone
+    // EXPIRED but parked key still live (the #321 gap), and fresh joins
+    // (no parked key; the probe is one GET on a brand-new session, not per
+    // update — after this tick the entity is in spawn_grace and never
+    // probes again).
+    let try_rehydrate =
+        revived || (!owned_view.contains(&entity_id) && !spawn_grace.contains_key(&entity_id));
+    RevivalOutcome {
+        revived,
+        try_rehydrate,
+    }
+}
+
 /// D1 forwarding invariant (epic #287), #289 record-based: decide where an
 /// inbound client input for `entity_id` must go — from the RECORDS this node
 /// holds, not from a folded event map.
@@ -1451,6 +1513,104 @@ pub fn merge_with_neighbor_latest(
         timestamp: our_delta.timestamp,
         updated: merged_updated,
         removed: our_delta.removed,
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "migration")]
+mod revival_tests {
+    //! Issue #321: L1 rehydration must be bounded by the parked key's OWN
+    //! TTL, not the anti-resurrection tombstone's lifetime. These tests
+    //! drive `revival_action` — the extracted decision `drain_inputs`
+    //! executes — across the exact states of the defect.
+    use super::{revival_action, RevivalOutcome};
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    #[test]
+    fn tombstoned_id_revives_and_rehydrates() {
+        // Reconnect BEFORE the tombstone expired: clear it, re-grace, and
+        // attempt the restore (both mechanisms fire).
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = [(e, 100u64)].into();
+        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: true,
+                try_rehydrate: true
+            }
+        );
+        assert!(!departed.contains_key(&e), "tombstone cleared");
+    }
+
+    #[test]
+    fn expired_tombstone_still_rehydrates_within_parked_ttl() {
+        // THE #321 defect: tombstone already pruned (tick-based, e.g. ~14s at
+        // 128Hz) but the Redis parked key (wall-clock TTL, default 120s) is
+        // still live. The old gate `departed.remove(..).is_some()` returned
+        // false here and silently skipped the restore — the effective
+        // reconnect window was min(tombstone, TTL). The unrepresented-entity
+        // first contact must still try to rehydrate.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
+        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert!(!out.revived, "no tombstone to clear");
+        assert!(
+            out.try_rehydrate,
+            "first contact for an unrepresented entity must probe the parked \
+             key — its own TTL decides, not the tombstone's"
+        );
+    }
+
+    #[test]
+    fn live_owned_entity_never_probes() {
+        // Hot-path safety (the PR #327 regression): a continuously-driven,
+        // owned entity must NOT open a Redis probe on every update.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new();
+        let owned: HashSet<Uuid> = [e].into();
+        let out = revival_action(e, &mut departed, &owned, &HashMap::new());
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: false,
+                try_rehydrate: false
+            }
+        );
+    }
+
+    #[test]
+    fn graced_entity_never_probes() {
+        // Same for an entity in spawn grace: it was already admitted (and
+        // rehydrated, if a snapshot existed) on its first contact.
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new();
+        let grace: HashMap<Uuid, u64> = [(e, 7u64)].into();
+        let out = revival_action(e, &mut departed, &HashSet::new(), &grace);
+        assert_eq!(
+            out,
+            RevivalOutcome {
+                revived: false,
+                try_rehydrate: false
+            }
+        );
+    }
+
+    /// Sanity: the tests above genuinely distinguish the old gate from the
+    /// new one. Simulating the pre-fix logic (rehydrate ONLY when the
+    /// tombstone was present) fails the #321 gap case.
+    #[test]
+    fn pre_fix_gate_would_fail_the_gap_case() {
+        let e = Uuid::from_u128(1);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
+        let old_gate_rehydrates = departed.remove(&e).is_some();
+        assert!(
+            !old_gate_rehydrates,
+            "old gate skips the restore in the gap state"
+        );
+        let new_gate = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        assert!(new_gate.try_rehydrate, "new gate restores in the gap state");
     }
 }
 
