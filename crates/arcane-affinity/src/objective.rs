@@ -33,17 +33,23 @@ impl Default for ObjectiveWeights {
     fn default() -> Self {
         Self {
             // Crowding exponent: FENNEL sweet spot. Convexity ensures crowding
-            // at a few hundred players outweighs weak edges but not strong pairs.
+            // at scale outweighs weak edges but not strong pairs.
             gamma: 1.5,
 
-            // Crowding penalty scale: anchored to proximity-edge weight scale (~0.1/cycle).
-            // At stable convergence (decay 0.97), a tight pair reaches ~3.3 edge weight.
-            // alpha = 0.05 → marginal crowding cost alpha·1.5·√n ≈ 0.6 at n=64, ≈1.2 at n=256.
-            alpha: 0.05,
+            // Crowding penalty scale. The split onset for a weakly-connected
+            // population is where the placement marginal crosses the instance
+            // cost: 1.5·alpha·√s ≈ beta  ⇒  s* ≈ (beta / (1.5·alpha))².
+            // alpha = 1.25 with beta = 15 puts s* ≈ 64 players — the epic's
+            // growth acceptance (arrivals 0→120 produce a 1→2 step) requires
+            // an onset below ~120. (The original 0.05 put s* ≈ 40,000: no
+            // split could ever emerge at game scale.) A strong pair (edge
+            // ≈3.3 at proximity equilibrium 0.1/(1−0.97)) is still protected:
+            // cutting it needs a crowding differential > 3.3 + mu.
+            alpha: 1.25,
 
-            // Instance cost: ≈ the internal weight of a ~5-player tight group.
-            // Instances open only when at least a small group's worth of structure
-            // is concentrated. Prevents singleton spawning from weak edges.
+            // Instance cost: ≈ the internal weight of a ~5-player half-strong
+            // group (K5 × ~1.5). Instances open only when a small group's
+            // worth of structure is concentrated. Prevents singleton spawning.
             beta: 15.0,
 
             // Move cost: ≈ one strong edge. A migration must save at least
