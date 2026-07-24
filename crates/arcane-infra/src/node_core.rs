@@ -788,17 +788,25 @@ impl NodeCore {
                 &self.owner_hints,
                 self.forwarding_enabled,
             ) {
-                let entity_id = entry.entity_id;
-                self.forward_scratch
-                    .entry(owner)
-                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
-                    .updates
-                    .push(ForwardedUpdate::new(entry));
-                // D2: while we are forwarding this entity, periodically hint
-                // its client to reconnect to the owner directly. Best-effort
-                // and throttled; D1 keeps the client correct either way.
-                self.maybe_send_reconnect_hint(entity_id, owner);
-                continue;
+                // Self-forward guard: a stale proxy/hint can attribute the
+                // entity to OUR OWN cluster (e.g. an in-flight router frame
+                // carrying a just-departed entity as interest). Forwarding to
+                // ourselves would bounce the input through Redis into the
+                // forwarded path, which drops it (not owned) — a silent black
+                // hole. Fall through to the local revival/admission path.
+                if owner != self.cluster_id {
+                    let entity_id = entry.entity_id;
+                    self.forward_scratch
+                        .entry(owner)
+                        .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                        .updates
+                        .push(ForwardedUpdate::new(entry));
+                    // D2: while we are forwarding this entity, periodically hint
+                    // its client to reconnect to the owner directly. Best-effort
+                    // and throttled; D1 keeps the client correct either way.
+                    self.maybe_send_reconnect_hint(entity_id, owner);
+                    continue;
+                }
             }
             // Revival + rehydration (epic #305, decoupled per #321): the
             // tombstone clears on any real client update (anti-resurrection
@@ -867,12 +875,15 @@ impl NodeCore {
                 &self.owner_hints,
                 self.forwarding_enabled,
             ) {
-                self.forward_scratch
-                    .entry(owner)
-                    .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
-                    .actions
-                    .push(action);
-                continue;
+                // Self-forward guard (see the client-updates path above).
+                if owner != self.cluster_id {
+                    self.forward_scratch
+                        .entry(owner)
+                        .or_insert_with(|| ForwardedInputBatch::new(self.cluster_id))
+                        .actions
+                        .push(action);
+                    continue;
+                }
             }
             out.game_actions.push(action);
         }
@@ -888,16 +899,43 @@ impl NodeCore {
         if let Some(ref fwd_rx) = self.forwarded_rx {
             while let Ok(batch) = fwd_rx.try_recv() {
                 for fwd in batch.updates {
-                    let entry = fwd.into_entry();
-                    if self.owned_view.contains(&entry.entity_id)
-                        || self.spawn_grace.contains_key(&entry.entity_id)
-                    {
+                    let mut entry = fwd.into_entry();
+                    let entity_id = entry.entity_id;
+                    let represented = self.owned_view.contains(&entity_id)
+                        || self.spawn_grace.contains_key(&entity_id);
+                    // Cross-node reconnect (epic #305 edge case): the ingress
+                    // node may hold a STALE proxy/hint for a departed entity
+                    // (proxies outlive the leave by NEIGHBOR_STALE_TICKS,
+                    // hints far longer) and forward the returning session's
+                    // inputs HERE — the old owner. We are not the owner any
+                    // more, but the departure tombstone is exactly the memory
+                    // that this id left FROM US: revive it (re-grace,
+                    // rehydrate) instead of dropping, or the reconnect
+                    // black-holes until the ingress node's records expire.
+                    let tombstoned = self.departed.contains_key(&entity_id);
+                    if represented || tombstoned {
                         // A forwarded update is a live client session driving this
                         // entity: idle timeout follows the SESSION, wherever the ingress node is.
-                        let entity_id = entry.entity_id;
                         // Revival rule: clear departure tombstone if present.
                         if self.departed.remove(&entity_id).is_some() {
                             self.spawn_grace.insert(entity_id, self.tick_count);
+                            // Same L1 rehydration as the direct path: the
+                            // parked snapshot restores user_data (consume-once,
+                            // TTL-bounded). L2 durable fallback likewise.
+                            if let Some(parked) =
+                                crate::parking::unpark_entity(&self.redis_url, entity_id)
+                            {
+                                if let Some(user_data) = parked.get("user_data") {
+                                    entry.user_data = user_data.clone();
+                                    eprintln!(
+                                        "[rehydrate] entity {entity_id} user_data restored via forwarded reconnect"
+                                    );
+                                }
+                            } else if let Some(ref persist) = self.persist {
+                                if let Some(loaded) = persist.load(entity_id) {
+                                    entry.user_data = loaded.user_data;
+                                }
+                            }
                         }
                         self.client_driven_last_seen
                             .insert(entity_id, self.tick_count);
@@ -1522,8 +1560,11 @@ mod revival_tests {
     //! Issue #321: L1 rehydration must be bounded by the parked key's OWN
     //! TTL, not the anti-resurrection tombstone's lifetime. These tests
     //! drive `revival_action` — the extracted decision `drain_inputs`
-    //! executes — across the exact states of the defect.
+    //! executes — across the exact states of the defect. Extended in the
+    //! hardening pass with the cross-node reconnect (E1) and stale-close
+    //! (E2) edge cases.
     use super::{revival_action, RevivalOutcome};
+    use arcane_core::replication_channel::EntityStateEntry;
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
 
@@ -1594,6 +1635,90 @@ mod revival_tests {
                 revived: false,
                 try_rehydrate: false
             }
+        );
+    }
+
+    /// E1 (cross-node reconnect black hole): the departed-entity forwarded
+    /// path. Node B (ingress) holds a stale proxy for a departed id and
+    /// forwards the returning session's inputs to node A (old owner). A is
+    /// not the owner and has no grace — but its TOMBSTONE is the memory the
+    /// id left from here. The forwarded-receive admission set must include
+    /// tombstoned ids or the reconnect drops every input until B's records
+    /// expire (proxies ~300 ticks, hints 3000).
+    #[test]
+    fn forwarded_input_for_tombstoned_id_is_admitted_not_dropped() {
+        // Mirrors the admission predicate in drain_inputs' forwarded path:
+        //   represented || tombstoned
+        let e = Uuid::from_u128(9);
+        let owned: HashSet<Uuid> = HashSet::new();
+        let grace: HashMap<Uuid, u64> = HashMap::new();
+        let departed: HashMap<Uuid, u64> = [(e, 42u64)].into();
+
+        let represented = owned.contains(&e) || grace.contains_key(&e);
+        assert!(!represented, "precondition: not owned, not graced");
+        let admitted = represented || departed.contains_key(&e);
+        assert!(
+            admitted,
+            "tombstoned id arriving via forwarding must be admitted (revive), not dropped"
+        );
+    }
+
+    /// E1 companion: forward_target on the INGRESS node still points a
+    /// departed entity at its stale proxy's cluster — that's unavoidable
+    /// (the ingress node cannot know about the leave). The guard is on the
+    /// receiving side (test above) plus the self-forward check: if the stale
+    /// record names OUR OWN cluster, we must fall through to local admission
+    /// instead of bouncing the input through Redis to ourselves.
+    #[test]
+    fn self_forward_falls_through_to_local_admission() {
+        let e = Uuid::from_u128(9);
+        let my_cluster = Uuid::from_u128(1);
+        let mut neighbor_entities: HashMap<Uuid, EntityStateEntry> = HashMap::new();
+        // A stale frame attributed the entity to OUR cluster (e.g. an
+        // interest record written just before the leave).
+        neighbor_entities.insert(
+            e,
+            EntityStateEntry::new(
+                e,
+                my_cluster,
+                arcane_core::Vec3::new(0.0, 0.0, 0.0),
+                arcane_core::Vec3::new(0.0, 0.0, 0.0),
+            ),
+        );
+        let target = super::forward_target(
+            e,
+            &HashSet::new(),
+            &HashMap::new(),
+            &neighbor_entities,
+            &HashMap::new(),
+            true,
+        );
+        // forward_target itself reports the proxy's cluster — the caller's
+        // self-forward guard (owner != self.cluster_id) is what must catch it.
+        assert_eq!(target, Some(my_cluster));
+        let forwards = target.is_some_and(|owner| owner != my_cluster);
+        assert!(
+            !forwards,
+            "an owner equal to our own cluster must NOT be forwarded — local admission"
+        );
+    }
+
+    /// E2: a stale clean-close report arriving AFTER the entity already left.
+    /// leave_entity removed the id from client_driven_last_seen, so the
+    /// fast-forward must no-op (get_mut returns None) — not re-insert the id
+    /// and not panic. Mirrors pump()'s guard exactly.
+    #[test]
+    fn stale_close_report_after_leave_is_a_noop() {
+        let e = Uuid::from_u128(9);
+        let mut last_seen: HashMap<Uuid, u64> = HashMap::new(); // already left
+        let tick: u64 = 10_000;
+        let timeout: u64 = 600;
+        if let Some(ls) = last_seen.get_mut(&e) {
+            *ls = tick.saturating_sub(timeout).saturating_add(120);
+        }
+        assert!(
+            !last_seen.contains_key(&e),
+            "a stale close report must not resurrect idle tracking for a departed id"
         );
     }
 

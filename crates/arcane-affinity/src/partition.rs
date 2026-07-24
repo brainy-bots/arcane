@@ -921,6 +921,128 @@ mod tests {
     }
 
     #[test]
+    fn seed_empty_world_and_zero_partitions_do_not_panic() {
+        // Degenerate inputs the manager can feed during startup/teardown:
+        // no entities at all, and num_partitions = 0 (no known clusters yet —
+        // sizes falls back to 1 slot). Must not panic, must assign nothing
+        // it wasn't given.
+        let weights = ObjectiveWeights::default();
+        let empty = seed_from_assignments(&[], &HashMap::new(), 4, &weights, &[]);
+        assert!(empty.assignment().is_empty());
+
+        let e = uuid(1);
+        let zero_parts = seed_from_assignments(&[e], &HashMap::new(), 0, &weights, &[]);
+        // With zero declared partitions the fallback slot is index 0; the
+        // caller (build_partition_decisions) owns mapping it to a cluster.
+        assert_eq!(zero_parts.of(e), Some(0));
+    }
+
+    #[test]
+    fn seed_stale_assignment_index_treated_as_fresh() {
+        // A standing assignment can reference a partition index that no
+        // longer exists (cluster deregistered between cycles). The entity
+        // must be re-placed as FRESH, not dropped and not panicking.
+        let weights = ObjectiveWeights::default();
+        let e = uuid(1);
+        let mut current = HashMap::new();
+        current.insert(e, 7usize); // only 2 partitions exist
+        let seeded = seed_from_assignments(&[e], &current, 2, &weights, &[]);
+        let p = seeded.of(e).expect("stale-index entity must be re-placed");
+        assert!(p < 2, "must land in a REAL partition, got {p}");
+    }
+
+    #[test]
+    fn seed_fresh_never_opens_second_instance_below_onset() {
+        // A fresh join with NO edges must join the existing occupied
+        // partition while its size is below the split onset — paying β to
+        // open an empty instance for an edgeless singleton is exactly what
+        // the objective forbids. (Guards the open_delta sign: a flipped
+        // sign here silently scatters joins across empty clusters.)
+        let weights = ObjectiveWeights::default();
+        let occupied_sizes = [1usize, 10, 30];
+        for occupied in occupied_sizes {
+            let mut entities: Vec<Uuid> = (1..=occupied as u8).map(uuid).collect();
+            let current: HashMap<Uuid, usize> = entities.iter().map(|&e| (e, 0usize)).collect();
+            let fresh = uuid(200);
+            entities.push(fresh);
+            let seeded = seed_from_assignments(&entities, &current, 4, &weights, &[]);
+            assert_eq!(
+                seeded.of(fresh),
+                Some(0),
+                "edgeless fresh join at occupied={occupied} must NOT open a new instance"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_hard_edge_to_absent_entity_is_ignored() {
+        // A joint can reference an entity that already LEFT (departed — not
+        // in the feed). The union-find must skip the dangling endpoint and
+        // place the survivor normally instead of panicking or wedging.
+        let weights = ObjectiveWeights::default();
+        let survivor = uuid(1);
+        let departed = uuid(99); // NOT in entities
+        let edges = vec![WeightedEdge {
+            a: survivor,
+            b: departed,
+            weight: 100.0,
+            colocation: Colocation::Hard,
+        }];
+        let current: HashMap<Uuid, usize> = [(survivor, 1usize)].into();
+        let seeded = seed_from_assignments(&[survivor], &current, 4, &weights, &edges);
+        assert_eq!(
+            seeded.of(survivor),
+            Some(1),
+            "survivor keeps its standing assignment; dangling joint ignored"
+        );
+    }
+
+    #[test]
+    fn seed_fresh_join_prefers_strong_edge_over_less_crowded() {
+        // The FENNEL tradeoff in one case: a fresh entity with a STRONG edge
+        // (equilibrium ~3.3) into a crowded partition must still join its
+        // partner while the crowding differential stays below the edge —
+        // and an edgeless twin must pick the emptier partition. Same world,
+        // opposite placements: the edge is what decides.
+        let weights = ObjectiveWeights::default();
+        // Partition 0: 12 entities (incl. the partner); partition 1: 6.
+        let mut entities: Vec<Uuid> = Vec::new();
+        let mut current: HashMap<Uuid, usize> = HashMap::new();
+        for i in 1..=12u8 {
+            let e = uuid(i);
+            entities.push(e);
+            current.insert(e, 0);
+        }
+        for i in 13..=18u8 {
+            let e = uuid(i);
+            entities.push(e);
+            current.insert(e, 1);
+        }
+        let partner = uuid(1);
+        let linked = uuid(100);
+        let loner = uuid(101);
+        entities.push(linked);
+        entities.push(loner);
+        let edges = vec![WeightedEdge {
+            a: linked,
+            b: partner,
+            weight: 3.3,
+            colocation: Colocation::Soft,
+        }];
+        let seeded = seed_from_assignments(&entities, &current, 2, &weights, &edges);
+        assert_eq!(
+            seeded.of(linked),
+            Some(0),
+            "3.3 edge must beat the 12-vs-6 crowding differential"
+        );
+        assert_eq!(
+            seeded.of(loner),
+            Some(1),
+            "the edgeless twin must take the emptier partition"
+        );
+    }
+
+    #[test]
     fn info_returns_correct_strategy() {
         let partitioner = GreedyGrowthPartitioner::new();
         let info = partitioner.info();

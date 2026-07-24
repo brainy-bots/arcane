@@ -703,6 +703,62 @@ mod tests {
         );
     }
 
+    /// E6: feed-liveness must not permanently ban an entity that merely
+    /// LAGGED. A client hiccup makes the feed skip a few cycles (flip
+    /// cancelled — correct); when the feed RESUMES, new flips for the same
+    /// entity must be accepted again. Cancellation is per-decision, not a
+    /// blacklist.
+    #[test]
+    fn feed_lag_recovery_allows_new_flips() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        runtime.enable_feed_liveness();
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let laggy = Uuid::from_u128(0x100);
+        runtime.set_known_clusters(vec![c1, c2]);
+
+        // Feed the entity, then let it go stale with a flip in flight.
+        runtime.tick += 1;
+        runtime.update_entity(laggy, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: laggy,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: runtime.tick,
+        });
+        // 4 cycles without feed: past FLIP_FEED_LIVENESS_CYCLES (2).
+        for _ in 0..4 {
+            runtime.run_cycle().expect("cycle");
+        }
+        assert!(
+            runtime.pending_flips.iter().all(|f| f.entity_id != laggy),
+            "stale-feed flip must be cancelled"
+        );
+
+        // Feed RESUMES (the client was lagging, not leaving).
+        runtime.update_entity(laggy, c1, Vec3::new(5.0, 0.0, 0.0));
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: laggy,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: runtime.tick,
+        });
+        runtime.run_cycle().expect("cycle");
+        // The fresh flip survives the liveness filter (fed this cycle).
+        let flip_alive = runtime
+            .pending_flips
+            .iter()
+            .chain(runtime.confirmed_flips.iter())
+            .any(|f| f.entity_id == laggy)
+            || runtime.assignments.get(&laggy) == Some(&c2);
+        assert!(
+            flip_alive,
+            "a recovered feed must allow new flips — liveness is not a blacklist"
+        );
+    }
+
     /// Epic #305 anti-resurrection (manager side): an entity that LEFT while
     /// it had an in-flight flip must still be pruned — the migration
     /// exemption is bounded, and the stale flip is cancelled (otherwise the

@@ -109,6 +109,50 @@ pub fn open_cost_if_empty(size: usize, w: &ObjectiveWeights) -> f64 {
     }
 }
 
+/// Sanitize weights against operator error (env overrides accept any f64).
+///
+/// Invalid values are replaced with the field's DEFAULT, loudly:
+/// - `alpha`, `beta`, `mu`: must be finite and ≥ 0. Negative α turns
+///   crowding into a *reward* (J decreases as everything piles onto one
+///   cluster); negative β pays you to open instances; negative μ rewards
+///   churn. Zero stays legal (each term individually disableable).
+/// - `gamma`: must be finite and > 1.0. At γ = 1.0 crowding is linear —
+///   the marginal is constant, so no split can EVER pay the β opening
+///   cost and the emergent-count property silently dies. NaN in any field
+///   poisons every `<` comparison in placement/refinement.
+///
+/// Call this once at config ingestion (the manager binary does); the pure
+/// cost functions stay unchecked-fast.
+pub fn sanitize(weights: ObjectiveWeights) -> ObjectiveWeights {
+    let d = ObjectiveWeights::default();
+    let check_nonneg = |name: &str, v: f64, default: f64| -> f64 {
+        if v.is_finite() && v >= 0.0 {
+            v
+        } else {
+            eprintln!(
+                "objective: invalid {name}={v} (must be finite and ≥ 0); using default {default}"
+            );
+            default
+        }
+    };
+    let gamma = if weights.gamma.is_finite() && weights.gamma > 1.0 {
+        weights.gamma
+    } else {
+        eprintln!(
+            "objective: invalid gamma={} (must be finite and > 1.0 — convexity is what makes \
+             splits emerge); using default {}",
+            weights.gamma, d.gamma
+        );
+        d.gamma
+    };
+    ObjectiveWeights {
+        alpha: check_nonneg("alpha", weights.alpha, d.alpha),
+        gamma,
+        beta: check_nonneg("beta", weights.beta, d.beta),
+        mu: check_nonneg("mu", weights.mu, d.mu),
+    }
+}
+
 /// Move-gain threshold: minimum cost reduction a migration must achieve.
 ///
 /// A relocation is only worth executing if it improves (cut + crowding + open)
@@ -208,6 +252,81 @@ mod tests {
         // A refinement pass uses this to decide if a relocation is worth executing.
         let threshold = move_gain_threshold(&w);
         assert_eq!(threshold, w.mu, "move_gain_threshold must return μ");
+    }
+
+    #[test]
+    fn sanitize_rejects_inverted_weights() {
+        // Negative α turns crowding into a REWARD: J decreases as everything
+        // piles onto one cluster — the exact opposite of the design. The env
+        // overrides parse any f64, so sanitize is the only guard.
+        let bad = ObjectiveWeights {
+            alpha: -5.0,
+            gamma: 1.5,
+            beta: -1.0,
+            mu: f64::NAN,
+        };
+        let s = sanitize(bad);
+        let d = ObjectiveWeights::default();
+        assert_eq!(s.alpha, d.alpha, "negative alpha → default");
+        assert_eq!(s.beta, d.beta, "negative beta → default");
+        assert_eq!(s.mu, d.mu, "NaN mu → default");
+    }
+
+    #[test]
+    fn sanitize_rejects_nonconvex_gamma() {
+        // γ = 1.0 makes crowding LINEAR: marginal is constant, a split can
+        // never pay β, the emergent-count property silently dies. γ must be
+        // strictly > 1. NaN and inf likewise fall back.
+        for bad_gamma in [1.0, 0.5, -2.0, f64::NAN, f64::INFINITY] {
+            let s = sanitize(ObjectiveWeights {
+                gamma: bad_gamma,
+                ..ObjectiveWeights::default()
+            });
+            assert_eq!(
+                s.gamma,
+                ObjectiveWeights::default().gamma,
+                "gamma={bad_gamma} must fall back to default"
+            );
+        }
+        // Legal values pass through untouched.
+        let ok = sanitize(ObjectiveWeights {
+            gamma: 2.0,
+            ..ObjectiveWeights::default()
+        });
+        assert_eq!(ok.gamma, 2.0);
+    }
+
+    #[test]
+    fn sanitize_keeps_zero_weights() {
+        // Zero is LEGAL for α/β/μ — each term is individually disableable
+        // (α=0 ⇒ pure min-cut; β=0 ⇒ free instances; μ=0 ⇒ free churn).
+        let z = sanitize(ObjectiveWeights {
+            alpha: 0.0,
+            gamma: 1.5,
+            beta: 0.0,
+            mu: 0.0,
+        });
+        assert_eq!(z.alpha, 0.0);
+        assert_eq!(z.beta, 0.0);
+        assert_eq!(z.mu, 0.0);
+    }
+
+    #[test]
+    fn empty_partition_costs_nothing() {
+        // An all-empty layout must cost 0 (no crowding, no open instances) —
+        // the baseline every marginal is measured against.
+        let w = ObjectiveWeights::default();
+        assert_eq!(total_cost(&[], 0.0, 0, &w), 0.0);
+        assert_eq!(total_cost(&[0, 0, 0, 0], 0.0, 0, &w), 0.0);
+    }
+
+    #[test]
+    fn single_entity_world_costs_exactly_beta_plus_alpha() {
+        // n=1: exactly one open instance (β) + crowding α·1^γ = α. Pins the
+        // additive structure — a regression here means a term leaked.
+        let w = ObjectiveWeights::default();
+        let expected = w.beta + w.alpha;
+        assert!((total_cost(&[1], 0.0, 0, &w) - expected).abs() < 1e-12);
     }
 
     #[test]

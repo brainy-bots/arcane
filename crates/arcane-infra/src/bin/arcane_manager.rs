@@ -437,6 +437,10 @@ async fn main() -> Result<(), String> {
             affinity_config.objective.mu = mu;
         }
     }
+    // Operator-error guard: negative/NaN weights invert the objective
+    // (crowding becomes a reward, churn becomes free); γ ≤ 1 kills the
+    // emergent-split property. Invalid values fall back to defaults, loudly.
+    affinity_config.objective = arcane_affinity::objective::sanitize(affinity_config.objective);
 
     eprintln!(
         "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}}}",
