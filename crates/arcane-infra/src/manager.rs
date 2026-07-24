@@ -1,12 +1,12 @@
 //! ArcaneManager (IN-01) — central coordinator.
 
+#[cfg(feature = "migration")]
 use arcane_core::{
     clustering_model::{ClusterInfo, PlayerInfo, WorldStateView},
-    types::{Vec2, Vec3},
-    IClusteringModel, IServerPool, ServerHandle,
+    types::Vec2,
 };
+use arcane_core::{types::Vec3, IServerPool, ServerHandle};
 use arcane_pool::LocalPool;
-use arcane_rules::RulesEngine;
 use arcane_spatial::SpatialIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,6 +24,8 @@ use arcane_affinity::feature_map::FeatureMap;
 #[cfg(feature = "migration")]
 use arcane_affinity::interaction_graph::{Colocation, InteractionGraph, InteractionKind};
 #[cfg(feature = "migration")]
+use arcane_affinity::objective::{crowding_marginal, open_cost_if_empty};
+#[cfg(feature = "migration")]
 use arcane_affinity::partition::{
     GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
 };
@@ -40,7 +42,6 @@ type FeatureMap = ();
 
 /// Central coordinator: assignments, topology, clustering model.
 pub struct ArcaneManager {
-    model: Arc<dyn IClusteringModel>,
     pool: Arc<dyn IServerPool>,
     spatial_index: SpatialIndex,
     /// Allocated nodes. active_count = allocated_servers.len().
@@ -83,6 +84,9 @@ pub struct ArcaneManager {
     /// entities are pruned with the graph.
     prediction_memo: std::collections::HashMap<(Uuid, Uuid), (f64, u64)>,
     /// Manager evaluation cycle counter (drives the prediction cadence).
+    /// Only read on the migration path (prediction memo + timing logs); the
+    /// default build increments it but never reads it.
+    #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     eval_cycle: u64,
 }
 
@@ -156,29 +160,34 @@ fn build_partition_decisions(
         // - Hard if the pair has any uncuttable (Joint) edge
         // - CutFree if all edges are CutFree
         // - Soft otherwise (with weight = cut_cost for Soft aggregate)
-        let colocation = if interaction_graph.is_uncuttable(a, b) {
-            Colocation::Hard
+        let is_hard = interaction_graph.is_uncuttable(a, b);
+        // cut_cost is the Soft-aggregate weight; compute it once and reuse for
+        // both the class decision and the Soft base weight below.
+        let cut_cost = if is_hard {
+            0.0
         } else {
-            let cut_cost = interaction_graph.cut_cost(a, b);
-            if cut_cost == 0.0 {
-                Colocation::CutFree
-            } else {
-                Colocation::Soft
-            }
+            interaction_graph.cut_cost(a, b)
+        };
+        let colocation = if is_hard {
+            Colocation::Hard
+        } else if cut_cost == 0.0 {
+            Colocation::CutFree
+        } else {
+            Colocation::Soft
         };
 
         // For Soft edges, blend prediction into the weight.
         let final_weight = if colocation == Colocation::Soft {
-            let base_weight = interaction_graph.cut_cost(a, b);
+            let base_weight = cut_cost;
 
             // Compute predictive enhancement if both players are in view
             let predicted_p = if let (Some(player_a), Some(player_b)) =
                 (player_map.get(&a), player_map.get(&b))
             {
+                let dx = player_b.position.x - player_a.position.x;
+                let dy = player_b.position.y - player_a.position.y;
+                let distance = (dx * dx + dy * dy).sqrt();
                 let closing_speed = {
-                    let dx = player_b.position.x - player_a.position.x;
-                    let dy = player_b.position.y - player_a.position.y;
-                    let distance = (dx * dx + dy * dy).sqrt();
                     let rel_vel_x = player_b.velocity.x - player_a.velocity.x;
                     let rel_vel_y = player_b.velocity.y - player_a.velocity.y;
                     if distance > 1e-9 {
@@ -186,12 +195,6 @@ fn build_partition_decisions(
                     } else {
                         0.0
                     }
-                };
-
-                let distance = {
-                    let dx = player_b.position.x - player_a.position.x;
-                    let dy = player_b.position.y - player_a.position.y;
-                    (dx * dx + dy * dy).sqrt()
                 };
 
                 // Prediction is already incorporated into graph weights via the screen+predict pipeline.
@@ -253,34 +256,26 @@ fn build_partition_decisions(
     // old "distinct current clusters" rule, a world where everyone starts on one
     // cluster yields k=1 forever — capacity can never force a spread because no
     // second partition exists to spread INTO. Warm spares must count.
-    let num_partitions = {
+    // The sorted+deduped union of currently-assigned clusters and the known
+    // topology (warm spares included). Built ONCE and reused for the partition
+    // count, the cluster-uuid -> index seed map, and the index -> cluster_id
+    // mapping below, so all three share an identical ordering (required for the
+    // seed identity round-trip) instead of rebuilding the same list three times.
+    let sorted_clusters: Vec<Uuid> = {
         let mut clusters: Vec<Uuid> = current_assignments.values().copied().collect();
         clusters.extend_from_slice(known_clusters);
         clusters.sort();
         clusters.dedup();
-        std::cmp::max(1, clusters.len())
+        clusters
     };
+    let num_partitions = std::cmp::max(1, sorted_clusters.len());
 
-    // Capacity = ceil(ceil(n/k) * capacity_factor). The multiply must CEIL:
-    // truncation made a 2-entity/2-cluster world compute capacity 1
-    // (1 * 1.5 -> 1), under which co-locating any pair is illegal. That was
-    // masked for years by refinement running capacity-UNCHECKED (RefineConfig
-    // capacity 0) — the partitioner obeyed a limit refinement then violated.
-    // Now refinement enforces capacity (seeded stickiness requires it, else
-    // eviction repair and refine undo each other), so the formula must
-    // genuinely allow the headroom the factor promises.
-    let base_capacity = entities.len().div_ceil(num_partitions);
-    let capacity = std::cmp::max(
-        1,
-        (base_capacity as f64 * config.capacity_factor).ceil() as usize,
-    );
-
-    // Build partition input
+    // Build partition input: capacity = 0 (no hard cap); the objective replaces it.
     let input = PartitionInput {
         entities: entities.clone(),
         edges,
         num_partitions,
-        capacity,
+        capacity: 0,
     };
 
     // Partition stickiness (arcane#290): seed refinement from the STANDING
@@ -290,39 +285,57 @@ fn build_partition_decisions(
     // partition's plurality cluster is exactly the cluster it was seeded
     // from (identity round-trip for unmoved entities). Greedy still runs on
     // bootstrap (no assignments) or when stickiness is disabled.
-    let cluster_index: HashMap<Uuid, usize> = {
-        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
-        cs.extend_from_slice(known_clusters);
-        cs.sort();
-        cs.dedup();
-        cs.into_iter().enumerate().map(|(i, c)| (c, i)).collect()
-    };
+    let cluster_index: HashMap<Uuid, usize> = sorted_clusters
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| (c, i))
+        .collect();
+    let current_idx: HashMap<Uuid, usize> = current_assignments
+        .iter()
+        .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
+        .collect();
     let partition = if config.seed_from_current && !current_assignments.is_empty() {
-        let current_idx: HashMap<Uuid, usize> = current_assignments
-            .iter()
-            .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
-            .collect();
         arcane_affinity::partition::seed_from_assignments(
             &input.entities,
             &current_idx,
             num_partitions,
-            capacity,
+            &config.objective,
             &input.edges,
         )
     } else {
         GreedyGrowthPartitioner::new().partition(&input)
     };
 
-    // Run refinement, capacity-UNCHECKED (as always): cohesion beats the
+    // Run refinement with objective-driven gain (epic #293): cohesion beats the
     // balance preference — a clique larger than ceil(n/k)*factor may still
-    // co-locate. Balance acts at component granularity in the seed repair
-    // (whole groups relocate; cliques are never cut), and at bootstrap via
-    // the greedy layout.
+    // co-locate. Refinement evaluates moves on full ΔJ (cut + crowding + instance + move cost).
+    let moved_in_seed: std::collections::HashSet<Uuid> = if config.seed_from_current {
+        partition
+            .assignment()
+            .iter()
+            .filter(|(&e, &p)| {
+                if let Some(&standing_p) = current_idx.get(&e) {
+                    standing_p != p
+                } else {
+                    true // Fresh entities count as moved
+                }
+            })
+            .map(|(&e, _)| e)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let refined_partition = refine(
         &partition,
         &input.edges,
         num_partitions,
-        &RefineConfig::default(),
+        &RefineConfig {
+            max_passes: 4,
+            capacity: 0,
+            min_gain: 0.0,
+            weights: config.objective,
+            moved_in_seed,
+        },
     );
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:
@@ -332,15 +345,8 @@ fn build_partition_decisions(
     // by decreasing size; each takes its plurality cluster if still free, else
     // the free known cluster with the most of its members, else any free known
     // cluster (sorted for determinism).
-    let all_clusters: Vec<Uuid> = {
-        let mut cs: Vec<Uuid> = current_assignments.values().copied().collect();
-        cs.extend_from_slice(known_clusters);
-        cs.sort();
-        cs.dedup();
-        cs
-    };
     let mut free_clusters: std::collections::BTreeSet<Uuid> =
-        all_clusters.iter().copied().collect();
+        sorted_clusters.iter().copied().collect();
     let mut order: Vec<usize> = (0..num_partitions).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(refined_partition.members(i).len()));
 
@@ -381,14 +387,90 @@ fn build_partition_decisions(
     desired
 }
 
+/// Place a new entity based on cluster sizes, affinity, and the partition objective.
+/// Returns the best cluster ID, or None if no clusters are available.
+/// Stale clusters are excluded from placement.
+#[cfg(feature = "migration")]
+pub fn place_for_join(
+    entity_data: &[(Uuid, Uuid, Vec3)],
+    known_clusters: &[Uuid],
+    stale_clusters: &std::collections::HashSet<Uuid>,
+    spawn_pos: Option<Vec3>,
+    config: &arcane_affinity::config::AffinityConfig,
+) -> Option<Uuid> {
+    if known_clusters.is_empty() {
+        return None;
+    }
+
+    // Build a map of cluster_id -> entity count.
+    let mut cluster_sizes: HashMap<Uuid, usize> = HashMap::new();
+    for (_, cluster_id, _) in entity_data {
+        *cluster_sizes.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    // Ensure all known clusters are present (even empty ones).
+    for &cluster_id in known_clusters {
+        cluster_sizes.entry(cluster_id).or_insert(0);
+    }
+
+    // Compute affinity: predicted future edge weight per cluster. A player
+    // near the spawn point will form a proximity edge that converges to the
+    // EQUILIBRIUM weight w/(1−decay) (accrual w per cycle against decay),
+    // not the single-cycle increment w — using the raw per-cycle weight
+    // under-scales affinity ~33x against the objective's crowding/β terms
+    // (which are calibrated in equilibrium units; see ObjectiveWeights).
+    let mut affinities: HashMap<Uuid, f64> = HashMap::new();
+
+    if let Some(spawn) = spawn_pos {
+        let radius = config.proximity_radius;
+        let radius_sq = radius * radius;
+        let equilibrium_edge = if config.decay_factor < 1.0 {
+            config.proximity_weight / (1.0 - config.decay_factor)
+        } else {
+            config.proximity_weight
+        };
+
+        for (_entity_id, cluster_id, pos) in entity_data {
+            let dx = pos.x - spawn.x;
+            let dz = pos.z - spawn.z;
+            if dx * dx + dz * dz <= radius_sq {
+                *affinities.entry(*cluster_id).or_insert(0.0) += equilibrium_edge;
+            }
+        }
+    }
+
+    // Score each cluster: -affinity + crowding_marginal + open_cost_if_empty.
+    // Ties broken by lowest cluster Uuid. Exclude stale clusters.
+    let mut best_cluster: Option<Uuid> = None;
+    let mut best_score = f64::INFINITY;
+
+    let mut clusters_sorted = known_clusters.to_vec();
+    clusters_sorted.sort();
+
+    for &cluster_id in &clusters_sorted {
+        if stale_clusters.contains(&cluster_id) {
+            continue;
+        }
+
+        let size = *cluster_sizes.get(&cluster_id).unwrap_or(&0);
+        let affinity = *affinities.get(&cluster_id).unwrap_or(&0.0);
+
+        let crowding = crowding_marginal(size, &config.objective);
+        let open_cost = open_cost_if_empty(size, &config.objective);
+        let score = -affinity + crowding + open_cost;
+
+        if score < best_score {
+            best_score = score;
+            best_cluster = Some(cluster_id);
+        }
+    }
+
+    best_cluster
+}
+
 impl ArcaneManager {
-    pub fn new(
-        model: Arc<dyn IClusteringModel>,
-        pool: Arc<dyn IServerPool>,
-        spatial_index: SpatialIndex,
-    ) -> Self {
+    pub fn new(pool: Arc<dyn IServerPool>, spatial_index: SpatialIndex) -> Self {
         Self {
-            model,
             pool,
             spatial_index,
             allocated_servers: Vec::new(),
@@ -409,24 +491,19 @@ impl ArcaneManager {
         }
     }
 
-    /// Create with default LocalPool, RulesEngine, and fresh SpatialIndex (for tests / dev).
+    /// Create with default LocalPool and a fresh SpatialIndex (for tests / dev).
     pub fn with_defaults() -> Self {
-        Self::new(
-            Arc::new(RulesEngine::new()),
-            Arc::new(LocalPool::default()),
-            SpatialIndex::new(),
-        )
+        Self::new(Arc::new(LocalPool::default()), SpatialIndex::new())
     }
 
-    /// Create with a named clustering model. Supported values: "rules" (default), "affinity".
-    /// The "affinity" variant requires the `affinity-clustering` feature flag.
-    pub fn with_model(model_type: &str) -> Self {
-        let model: Arc<dyn IClusteringModel> = match model_type {
-            #[cfg(feature = "affinity-clustering")]
-            "affinity" => Arc::new(arcane_affinity::AffinityEngine::default()),
-            _ => Arc::new(RulesEngine::new()),
-        };
-        Self::new(model, Arc::new(LocalPool::default()), SpatialIndex::new())
+    /// Create with a named clustering model. The decision path is the
+    /// interaction-graph partitioner (`build_partition_decisions`); the legacy
+    /// `IClusteringModel` (rules/affinity) that this argument once selected was
+    /// computed-and-discarded and has been removed (arcane#291/#292). The
+    /// argument is retained for call-site compatibility until the swappable
+    /// predictor lands (#292) and is currently ignored.
+    pub fn with_model(_model_type: &str) -> Self {
+        Self::with_defaults()
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
@@ -575,53 +652,6 @@ impl ArcaneManager {
             return Ok(());
         }
 
-        // Build entity data for WorldStateView.players
-        let entity_data = self.spatial_index.snapshot_entities();
-        let mut cluster_player_ids: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
-        for &(entity_id, cluster_id, _) in &entity_data {
-            cluster_player_ids
-                .entry(cluster_id)
-                .or_default()
-                .push(entity_id);
-        }
-
-        let clusters: Vec<ClusterInfo> = snapshot
-            .into_iter()
-            .map(|g| ClusterInfo {
-                cluster_id: g.cluster_id,
-                server_host: "localhost".to_string(),
-                player_ids: cluster_player_ids.remove(&g.cluster_id).unwrap_or_default(),
-                player_count: g.entity_count,
-                cpu_pct: 0.0,
-                centroid: Vec2::new(g.centroid.x, g.centroid.z),
-                spread_radius: g.spread_radius as f32,
-                rpc_rate_out: 0.0,
-            })
-            .collect();
-
-        let players: Vec<PlayerInfo> = entity_data
-            .iter()
-            .map(|&(entity_id, cluster_id, pos)| {
-                let v = self
-                    .spatial_index
-                    .velocity_of(entity_id)
-                    .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
-                PlayerInfo {
-                    player_id: entity_id,
-                    cluster_id,
-                    position: Vec2::new(pos.x, pos.z),
-                    velocity: Vec2::new(v.x, v.z),
-                }
-            })
-            .collect();
-
-        let view = WorldStateView {
-            timestamp: 0.0,
-            evaluation_budget_ms: 50,
-            clusters,
-            players,
-        };
-        let _decisions = self.model.evaluate(&view);
         // Minimal apply: if we have clusters in the world and no servers allocated, allocate one.
         if !self.allocated_servers.is_empty() {
             return Ok(());
@@ -693,11 +723,8 @@ impl ArcaneManager {
             players,
         };
 
-        // Keep the existing evaluate() call for compatibility.
         let timing = std::env::var("ARCANE_DEBUG_TIMING").as_deref() == Ok("1");
         let t0 = std::time::Instant::now();
-        let _decisions = self.model.evaluate(&view);
-        let t_model = t0.elapsed();
 
         self.migration_state.advance_tick();
 
@@ -948,10 +975,9 @@ impl ArcaneManager {
         let t_partition = t0.elapsed();
         if timing && self.eval_cycle.is_multiple_of(5) {
             eprintln!(
-                "[eval timing] cycle {} model={:?} accrue={:?} screen+predict={:?} partition={:?}",
+                "[eval timing] cycle {} accrue={:?} screen+predict={:?} partition={:?}",
                 self.eval_cycle,
-                t_model,
-                t_accrue - t_model,
+                t_accrue,
                 t_predict - t_accrue,
                 t_partition - t_pre_part
             );
@@ -1097,6 +1123,31 @@ impl ArcaneManager {
                 (entity_id, cluster_id, position, velocity)
             })
             .collect()
+    }
+
+    /// Decide which cluster a NEW entity should join (epic #293).
+    ///
+    /// Streaming (FENNEL-style) placement using the same objective the
+    /// re-partitioner optimizes: for each known live cluster S,
+    ///   score(S) = -affinity(spawn_pos, S) + crowding_marginal(|S|) + open_cost_if_empty(|S|)
+    /// and the lowest score wins (ties: lowest cluster Uuid, deterministic).
+    ///
+    /// `affinity(spawn_pos, S)`: predicted future edge weight — the sum of
+    /// `proximity_weight` over S-owned players within `proximity_radius` of
+    /// `spawn_pos` (they will form real edges within a few cycles). `None`
+    /// spawn_pos contributes 0 affinity everywhere (pure size/open economics).
+    ///
+    /// Returns `None` when no clusters are known.
+    #[cfg(feature = "migration")]
+    pub fn place_new_entity(&self, spawn_pos: Option<arcane_core::Vec3>) -> Option<Uuid> {
+        let entity_data = self.spatial_index.snapshot_entities();
+        place_for_join(
+            &entity_data,
+            &self.known_clusters,
+            &std::collections::HashSet::new(),
+            spawn_pos,
+            &self.config,
+        )
     }
 }
 
@@ -1498,5 +1549,142 @@ mod view_enrichment_tests {
 
         // Verify velocity is removed
         assert_eq!(manager.spatial_index.velocity_of(entity_id), None);
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn placement_no_clusters_returns_none() {
+        let manager = ArcaneManager::with_defaults();
+        let spawn_pos = Some(arcane_core::Vec3::new(0.0, 0.0, 0.0));
+        let result = manager.place_new_entity(spawn_pos);
+        assert_eq!(result, None);
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn placement_prefers_cluster_with_nearby_players() {
+        let mut manager = ArcaneManager::with_defaults();
+        manager.set_observation_radius(100.0);
+
+        let c1 = Uuid::from_u128(100);
+        let c2 = Uuid::from_u128(200);
+        manager.set_known_clusters(vec![c1, c2]);
+
+        let e1 = Uuid::from_u128(1);
+        let e2 = Uuid::from_u128(2);
+        // Cluster 1: one player at (0, 0, 0)
+        manager.update_entity(e1, c1, arcane_core::Vec3::new(0.0, 0.0, 0.0));
+        // Cluster 2: one player at (100, 0, 100) (far away)
+        manager.update_entity(e2, c2, arcane_core::Vec3::new(100.0, 0.0, 100.0));
+
+        // Spawn near cluster 1
+        let spawn_pos = Some(arcane_core::Vec3::new(5.0, 0.0, 5.0));
+        let chosen = manager.place_new_entity(spawn_pos);
+        assert_eq!(
+            chosen,
+            Some(c1),
+            "should prefer cluster 1 with nearby player"
+        );
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn placement_avoids_crowded_cluster() {
+        let mut manager = ArcaneManager::with_defaults();
+        manager.set_observation_radius(100.0);
+
+        let c1 = Uuid::from_u128(100);
+        let c2 = Uuid::from_u128(200);
+        manager.set_known_clusters(vec![c1, c2]);
+
+        // Cluster 1: many entities (crowded)
+        for i in 0..100 {
+            manager.update_entity(
+                Uuid::from_u128(1000 + i),
+                c1,
+                arcane_core::Vec3::new(0.0, 0.0, 0.0),
+            );
+        }
+        // Cluster 2: few entities
+        manager.update_entity(
+            Uuid::from_u128(2000),
+            c2,
+            arcane_core::Vec3::new(500.0, 0.0, 500.0),
+        );
+
+        // Spawn far from everyone
+        let spawn_pos = Some(arcane_core::Vec3::new(250.0, 0.0, 250.0));
+        let chosen = manager.place_new_entity(spawn_pos);
+        assert_eq!(
+            chosen,
+            Some(c2),
+            "should prefer less crowded cluster 2 when spawn is far from all players"
+        );
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn placement_does_not_open_empty_cluster_for_free() {
+        let mut manager = ArcaneManager::with_defaults();
+        manager.set_observation_radius(100.0);
+
+        let c1 = Uuid::from_u128(100);
+        let c2 = Uuid::from_u128(200);
+        manager.set_known_clusters(vec![c1, c2]);
+
+        let e1 = Uuid::from_u128(1);
+        // Cluster 1: slightly crowded
+        manager.update_entity(e1, c1, arcane_core::Vec3::new(0.0, 0.0, 0.0));
+        // Cluster 2: empty
+
+        // Spawn far from cluster 1
+        let spawn_pos = Some(arcane_core::Vec3::new(500.0, 0.0, 500.0));
+
+        // With default config, spawn should prefer slightly-crowded c1 over empty c2
+        // (because opening an empty cluster costs β ≈ 15.0 by default, which is high).
+        let chosen = manager.place_new_entity(spawn_pos);
+        assert_eq!(
+            chosen,
+            Some(c1),
+            "should prefer slightly crowded cluster over empty cluster with default β"
+        );
+
+        // With β = 0.0, empty cluster becomes free and should win.
+        let mut config = manager.config.clone();
+        config.objective.beta = 0.0;
+        manager.set_affinity_config(config);
+
+        let chosen_low_beta = manager.place_new_entity(spawn_pos);
+        assert_eq!(
+            chosen_low_beta,
+            Some(c2),
+            "should prefer empty cluster when β = 0.0"
+        );
+    }
+
+    #[cfg(feature = "migration")]
+    #[test]
+    fn placement_deterministic() {
+        let mut manager = ArcaneManager::with_defaults();
+        manager.set_observation_radius(100.0);
+
+        let c1 = Uuid::from_u128(100);
+        let c2 = Uuid::from_u128(200);
+        manager.set_known_clusters(vec![c1, c2]);
+
+        let e1 = Uuid::from_u128(1);
+        let e2 = Uuid::from_u128(2);
+        manager.update_entity(e1, c1, arcane_core::Vec3::new(0.0, 0.0, 0.0));
+        manager.update_entity(e2, c2, arcane_core::Vec3::new(10.0, 0.0, 10.0));
+
+        let spawn_pos = Some(arcane_core::Vec3::new(5.0, 0.0, 5.0));
+
+        // Call multiple times with identical state; results should be identical.
+        let result1 = manager.place_new_entity(spawn_pos);
+        let result2 = manager.place_new_entity(spawn_pos);
+        let result3 = manager.place_new_entity(spawn_pos);
+
+        assert_eq!(result1, result2);
+        assert_eq!(result2, result3);
     }
 }

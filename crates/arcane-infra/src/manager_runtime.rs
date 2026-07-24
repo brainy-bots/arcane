@@ -84,7 +84,15 @@ pub struct ManagerRuntime<B: InboxBus> {
     /// Last cycle each entity appeared in the state feed (`update_entity`).
     /// Drives absence pruning: assignments/graph/index entries for entities
     /// a LIVE cluster stopped reporting are dropped after the grace window.
+    /// Also drives FLIP FEED-LIVENESS (epic #305): a flip is only decided,
+    /// kept pending, or promoted while the entity is live in the feed.
     last_seen: HashMap<Uuid, u64>,
+    /// Epic #305 flip feed-liveness switch. OFF by default: unit tests and
+    /// replay embedders feed entities once and cycle many times, so absence
+    /// from the feed means nothing there (same philosophy as `prune_absent`
+    /// being an explicit call). The manager binary — which maintains a real
+    /// continuous feed — turns it ON.
+    feed_liveness_enabled: bool,
     /// #289: clusters ever seen in entity sightings. Union-ed with
     /// `known_clusters` for routing so a cluster that lost ALL entities keeps
     /// receiving its (empty) owned statement — without this, a fully-drained
@@ -123,6 +131,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
             blocked_destinations: HashSet::new(),
             publish_frames: true,
             last_seen: HashMap::new(),
+            feed_liveness_enabled: false,
             routing_table: Box::new(InMemoryRoutingTable::new()),
             known_clusters: Vec::new(),
             seen_clusters: std::collections::HashSet::new(),
@@ -211,6 +220,15 @@ impl<B: InboxBus> ManagerRuntime<B> {
         self.manager.set_known_clusters(clusters);
     }
 
+    /// Enable flip feed-liveness (epic #305): flips are only decided or kept
+    /// in flight for entities the state feed reported within the last
+    /// `FLIP_FEED_LIVENESS_CYCLES`. Call this ONLY when the embedder feeds a
+    /// complete state snapshot every cycle (the manager binary does; unit
+    /// tests that feed once must not).
+    pub fn enable_feed_liveness(&mut self) {
+        self.feed_liveness_enabled = true;
+    }
+
     /// Absence pruning: drop entities the state feed stopped reporting.
     /// State keys are complete per-cluster statements, so absence from a
     /// complete feed means despawn (the grace window absorbs jitter).
@@ -235,10 +253,22 @@ impl<B: InboxBus> ManagerRuntime<B> {
             return 0;
         }
         let grace = self.config.absence_grace_cycles;
+        // Epic #305: the migration exemption is BOUNDED. Mid-migration feed
+        // gaps are expected (the source drops the entity a beat before the
+        // destination reports it), but a LEFT entity with an in-flight flip
+        // must not live forever: the replication gate feeds on the manager's
+        // OWN spatial snapshot, so a ghost's flip self-confirms, the
+        // destination node (no tombstone — it never saw the leave) adopts,
+        // and the entity resurrects on another cluster (live-verified in the
+        // #306 acceptance run). Past this window, the flip is CANCELLED and
+        // the entity pruned — a genuine mid-migration entity reappears in
+        // its destination's state key long before this fires.
+        let flip_exempt_limit = grace.saturating_mul(4);
         let tick = self.tick;
         let mut departed: Vec<Uuid> = Vec::new();
         for (entity_id, last) in &self.last_seen {
-            if tick.saturating_sub(*last) <= grace {
+            let absent_for = tick.saturating_sub(*last);
+            if absent_for <= grace {
                 continue;
             }
             if let Some(owner) = self.assignments.get(entity_id) {
@@ -251,7 +281,7 @@ impl<B: InboxBus> ManagerRuntime<B> {
                 .iter()
                 .chain(self.confirmed_flips.iter())
                 .any(|f| f.entity_id == *entity_id);
-            if migrating {
+            if migrating && absent_for <= flip_exempt_limit {
                 continue;
             }
             departed.push(*entity_id);
@@ -264,6 +294,10 @@ impl<B: InboxBus> ManagerRuntime<B> {
             self.gate.forget(entity_id);
             self.skip_confirmed.remove(&entity_id);
             self.first_cycle_flips.remove(&entity_id);
+            // Cancel any in-flight flip for the departed entity: actuating it
+            // would resurrect the ghost on the destination cluster.
+            self.pending_flips.retain(|f| f.entity_id != entity_id);
+            self.confirmed_flips.retain(|f| f.entity_id != entity_id);
         }
         pruned
     }
@@ -279,8 +313,37 @@ impl<B: InboxBus> ManagerRuntime<B> {
         let t_eval = t_start.elapsed();
 
         // 2. Drain newly-decided flips and append to pending_flips (with dedup).
+        //
+        // FLIP FEED-LIVENESS (epic #305, anti-resurrection): a flip may only
+        // exist for an entity the state feed is actually reporting. The legit
+        // mid-migration gap (source drops the entity a beat before the
+        // destination reports it) is 1-2 cycles; anything longer means the
+        // entity LEFT. Without this rule the manager resurrects ghosts: the
+        // gate self-confirms from the manager's OWN spatial snapshot (the
+        // force-include frames carry index state, not feed state), a fresh
+        // node with no departure tombstone adopts, publishes, and the ghost
+        // carousels between nodes forever (live-verified in the #306
+        // acceptance run: leave → re-adopt → leave → re-adopt across three
+        // nodes). Only applies when the embedder maintains a real feed
+        // (an entity with NO last_seen entry is exempt — unit tests that
+        // feed the manager directly never set one... they do via
+        // update_entity; entities fed within the window are live).
+        const FLIP_FEED_LIVENESS_CYCLES: u64 = 2;
+        let feed_stale: HashSet<Uuid> = if self.feed_liveness_enabled {
+            self.last_seen
+                .iter()
+                .filter(|(_, last)| self.tick.saturating_sub(**last) > FLIP_FEED_LIVENESS_CYCLES)
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         let new_flips = self.manager.take_pending_flips();
         for flip in new_flips {
+            if feed_stale.contains(&flip.entity_id) {
+                continue; // never open a flip for a departed entity
+            }
             if !self
                 .pending_flips
                 .iter()
@@ -289,6 +352,19 @@ impl<B: InboxBus> ManagerRuntime<B> {
                 self.pending_flips.push(flip);
                 self.first_cycle_flips.insert(flip.entity_id);
             }
+        }
+        // Cancel in-flight flips whose entity went feed-stale mid-flight:
+        // actuating them is what re-animates a ghost on the destination.
+        for flips in [&mut self.pending_flips, &mut self.confirmed_flips] {
+            flips.retain(|f| {
+                let stale = feed_stale.contains(&f.entity_id);
+                if stale {
+                    self.gate.forget(f.entity_id);
+                    self.skip_confirmed.remove(&f.entity_id);
+                    self.first_cycle_flips.remove(&f.entity_id);
+                }
+                !stale
+            });
         }
 
         // 3. Build entity_states from the manager's spatial snapshot.
@@ -527,16 +603,21 @@ mod tests {
         RouterConfig::default()
     }
 
-    /// Founder-observed in the viz crossing scenario: TWO parked groups
-    /// 1800u apart (no cross-group interaction at all while parked) ended
-    /// with ALL EIGHT entities on one cluster. Two spatially separate
-    /// communities must land on two clusters — total consolidation of
-    /// non-interacting groups is a partitioning failure regardless of any
-    /// cohesion-vs-balance policy. Groups of FOUR matter: the 6-player
-    /// matrix `cluster` phase (groups of 3, capacity 3) passes; groups of
-    /// 4 exceed the derived capacity and hit the repair/refinement paths.
+    /// HISTORY: this test originally asserted the OPPOSITE — that two parked
+    /// groups of four 1800u apart must land on two clusters. That was correct
+    /// under the pre-#293 design (imposed k, population-relative capacity,
+    /// balance-toward-mean): consolidation was a partitioning failure because
+    /// nothing else priced load. Epic #293 replaces that policy with explicit
+    /// economics: an instance costs β, and 8 total players are far below the
+    /// split onset s* ≈ (β/(1.5α))² ≈ 64 — splitting 8 into 4+4 saves
+    /// α·(8^1.5−2·4^1.5) ≈ 8.3 crowding but costs β = 15. One cluster for 8
+    /// players IS the designed outcome now ("never boot a UE5 instance for a
+    /// trivial group"). The anti-consolidation guarantee moved to the growth
+    /// property: `emergent_cluster_count_monotone` (arcane-affinity) pins the
+    /// split onset in [20, 120], so real crowds DO spread. This test now pins
+    /// the economics floor: sub-onset populations consolidate and STAY.
     #[test]
-    fn two_parked_groups_of_four_do_not_collapse_onto_one_cluster() {
+    fn two_parked_groups_of_four_stay_on_one_cluster_below_instance_economics() {
         let bus = InMemoryInboxBus::new();
         let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
         runtime.set_observation_radius(500.0);
@@ -613,10 +694,122 @@ mod tests {
 
         assert_eq!(east_owners.len(), 1, "east group should co-locate");
         assert_eq!(west_owners.len(), 1, "west group should co-locate");
+        assert_eq!(
+            all_owners.len(),
+            1,
+            "8 players are below the instance-opening economics (s* ≈ 64 with \
+             default α/β): they must consolidate onto ONE cluster, not pay β \
+             for a second instance"
+        );
+    }
+
+    /// E6: feed-liveness must not permanently ban an entity that merely
+    /// LAGGED. A client hiccup makes the feed skip a few cycles (flip
+    /// cancelled — correct); when the feed RESUMES, new flips for the same
+    /// entity must be accepted again. Cancellation is per-decision, not a
+    /// blacklist.
+    #[test]
+    fn feed_lag_recovery_allows_new_flips() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        runtime.enable_feed_liveness();
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let laggy = Uuid::from_u128(0x100);
+        runtime.set_known_clusters(vec![c1, c2]);
+
+        // Feed the entity, then let it go stale with a flip in flight.
+        runtime.tick += 1;
+        runtime.update_entity(laggy, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: laggy,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: runtime.tick,
+        });
+        // 4 cycles without feed: past FLIP_FEED_LIVENESS_CYCLES (2).
+        for _ in 0..4 {
+            runtime.run_cycle().expect("cycle");
+        }
         assert!(
-            all_owners.len() >= 2,
-            "two non-interacting groups 1800u apart must NOT share one cluster \
-             (founder-observed total consolidation)"
+            runtime.pending_flips.iter().all(|f| f.entity_id != laggy),
+            "stale-feed flip must be cancelled"
+        );
+
+        // Feed RESUMES (the client was lagging, not leaving).
+        runtime.update_entity(laggy, c1, Vec3::new(5.0, 0.0, 0.0));
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: laggy,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: runtime.tick,
+        });
+        runtime.run_cycle().expect("cycle");
+        // The fresh flip survives the liveness filter (fed this cycle).
+        let flip_alive = runtime
+            .pending_flips
+            .iter()
+            .chain(runtime.confirmed_flips.iter())
+            .any(|f| f.entity_id == laggy)
+            || runtime.assignments.get(&laggy) == Some(&c2);
+        assert!(
+            flip_alive,
+            "a recovered feed must allow new flips — liveness is not a blacklist"
+        );
+    }
+
+    /// Epic #305 anti-resurrection (manager side): an entity that LEFT while
+    /// it had an in-flight flip must still be pruned — the migration
+    /// exemption is bounded, and the stale flip is cancelled (otherwise the
+    /// gate self-confirms from the manager's own snapshot and the destination
+    /// resurrects the ghost; live-verified in the #306 acceptance run).
+    #[test]
+    fn departed_entity_with_inflight_flip_is_pruned_and_flip_cancelled() {
+        let bus = InMemoryInboxBus::new();
+        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        runtime.enable_feed_liveness();
+        let grace = runtime.config.absence_grace_cycles;
+
+        let c1 = Uuid::from_u128(0x1);
+        let c2 = Uuid::from_u128(0x2);
+        let ghost = Uuid::from_u128(0x100);
+
+        runtime.set_known_clusters(vec![c1, c2]);
+        runtime.update_entity(ghost, c1, Vec3::new(0.0, 0.0, 0.0));
+        runtime.tick += 1;
+        runtime.last_seen.insert(ghost, runtime.tick);
+
+        // A flip is in flight for the ghost when it leaves.
+        runtime.pending_flips.push(OwnershipFlip {
+            entity_id: ghost,
+            from_cluster: c1,
+            to_cluster: c2,
+            effective_tick: runtime.tick,
+        });
+
+        // Within the bounded exemption: still exempt (mid-migration gap).
+        for _ in 0..=grace {
+            runtime.tick += 1;
+            runtime.prune_absent();
+        }
+        assert!(
+            runtime.assignments.contains_key(&ghost) || runtime.last_seen.contains_key(&ghost),
+            "within the bounded exemption the migrating entity survives"
+        );
+
+        // Past grace*4 of absence: pruned AND the flip is gone.
+        for _ in 0..(grace * 4) {
+            runtime.tick += 1;
+            runtime.prune_absent();
+        }
+        assert!(
+            !runtime.last_seen.contains_key(&ghost),
+            "departed entity must be pruned past the bounded exemption"
+        );
+        assert!(
+            runtime.pending_flips.iter().all(|f| f.entity_id != ghost),
+            "the stale flip must be cancelled, not actuated"
         );
     }
 

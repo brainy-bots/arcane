@@ -35,7 +35,7 @@ ReplicationChannelManager is the component that keeps replication subscriptions 
 
 ## 3. What It Does NOT Do
 
-- **Decide which clusters are neighbors** — ArcaneManager (and IClusteringModel / SpatialIndex) decide; ArcaneManager writes cluster_topology. ReplicationChannelManager only reads and applies.
+- **Decide which clusters are neighbors** — ArcaneManager (via the clustering decision path — the global graph partition `arcane_infra::manager::build_partition_decisions`, ADR-004 — and SpatialIndex) decides; ArcaneManager writes cluster_topology. ReplicationChannelManager only reads and applies.
 - **Build entity state deltas** — ArcaneNode builds the delta from simulation state; ReplicationChannelManager only passes it to channels.
 - **Simulate or write to SpacetimeDB** — That is ArcaneNode. ReplicationChannelManager only manages replication transport.
 - **Authenticate or encrypt replication traffic** — Assumed private network (VPC). See IF-03.
@@ -43,6 +43,8 @@ ReplicationChannelManager is the component that keeps replication subscriptions 
 ---
 
 ## 4. Interface / Public API
+
+> **Code status (2026-07, arcane#291/#292):** The live `ReplicationChannelManager` (`arcane-infra::replication_channel_manager`) is currently thinner than the target design below. Its surface is `new(cluster_id)`, `start(redis_url)`, `stop()`, `set_neighbors(neighbor_ids)`, and `send_to_neighbors(delta)`. Neighbors are set directly via `set_neighbors` (not yet driven by a SpacetimeDB `cluster_topology` subscription), it holds a single broadcast `RedisReplicationChannel` rather than one channel per neighbor, and there is **no `ChannelConfig`** (that type was removed) and no `set_neighbor_geometry`/observation-radius filtering yet. The topology-subscription, per-neighbor channels, and geometry filtering described here are retained as the target design.
 
 ReplicationChannelManager is used in-process by ArcaneNode. It does not expose a network API.
 

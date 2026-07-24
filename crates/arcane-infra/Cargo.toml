@@ -7,7 +7,6 @@ description = "Arcane Engine — ArcaneManager, ArcaneNode, ReplicationChannelMa
 [dependencies]
 arcane-core = { path = "../arcane-core" }
 arcane-spatial = { path = "../arcane-spatial" }
-arcane-rules = { path = "../arcane-rules" }
 arcane-affinity = { path = "../arcane-affinity", optional = true }
 arcane-pool = { path = "../arcane-pool" }
 arcane-wire = { path = "../arcane-wire" }

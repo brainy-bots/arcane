@@ -126,6 +126,13 @@ pub struct SpatialIndex {
     cluster_to_cell: HashMap<Uuid, GridCell>,
     /// entity_id -> velocity. Optional per-entity velocity (default: zero if not set).
     velocities: HashMap<Uuid, Vec3>,
+    /// Cached max weighted spread across ALL buckets; None = dirty. Recomputed
+    /// lazily on the first `get_neighbors` after any spread-changing mutation,
+    /// then reused for the rest of that query batch. Without it, `get_neighbors`
+    /// rescanned every bucket for the max on EVERY call, making a full-cluster
+    /// neighbor pass O(N^2) and defeating the grid. `Cell` so the `&self` read
+    /// path can refresh it (single-consumer structure per IN-03).
+    cached_max_weighted_spread: Cell<Option<f64>>,
 }
 
 impl SpatialIndex {
@@ -145,6 +152,7 @@ impl SpatialIndex {
             grid: HashMap::new(),
             cluster_to_cell: HashMap::new(),
             velocities: HashMap::new(),
+            cached_max_weighted_spread: Cell::new(None),
         }
     }
 
@@ -226,6 +234,7 @@ impl SpatialIndex {
             .insert(entity_id, position);
         self.entity_to_cluster.insert(entity_id, cluster_id);
         self.rebucket(cluster_id);
+        self.cached_max_weighted_spread.set(None);
     }
 
     /// Remove an entity (despawn or reassignment). Updates that cluster's centroid and spread.
@@ -245,6 +254,7 @@ impl SpatialIndex {
         }
         self.velocities.remove(&entity_id);
         self.rebucket(cluster_id);
+        self.cached_max_weighted_spread.set(None);
     }
 
     /// Set or update the velocity for an entity.
@@ -274,6 +284,26 @@ impl SpatialIndex {
         })
     }
 
+    /// Max weighted spread across all non-empty buckets, cached until the next
+    /// spread-changing mutation invalidates it. First call after a mutation is
+    /// O(N) (each bucket's own spread is itself cached); subsequent calls are
+    /// O(1). Used by `get_neighbors` to bound the candidate search radius.
+    fn max_weighted_spread(&self, y_weight: f64) -> f64 {
+        if let Some(cached) = self.cached_max_weighted_spread.get() {
+            return cached;
+        }
+        let mut max_spread = 0.0_f64;
+        for bucket in self.clusters.values() {
+            if bucket.entities.is_empty() {
+                continue;
+            }
+            let (_, weighted) = bucket.spreads(y_weight);
+            max_spread = max_spread.max(weighted);
+        }
+        self.cached_max_weighted_spread.set(Some(max_spread));
+        max_spread
+    }
+
     /// Return cluster_ids whose effective area (centroid + spread_radius + observation_radius)
     /// overlaps this cluster's, under the weighted 3D metric.
     pub fn get_neighbors(&self, cluster_id: Uuid) -> Vec<Uuid> {
@@ -288,16 +318,12 @@ impl SpatialIndex {
         let effective_self = self_weighted_spread + self.observation_radius;
 
         // Candidate search radius must cover: our effective area + the other cluster's effective
-        // area + the other centroid's possible offset within its cell. Refresh the max weighted
-        // spread from caches (recomputes only dirty buckets — amortized O(1) per mutation).
-        let mut max_other_spread = 0.0_f64;
-        for (id, bucket) in self.clusters.iter() {
-            if *id == cluster_id || bucket.entities.is_empty() {
-                continue;
-            }
-            let (_, weighted) = bucket.spreads(y_weight);
-            max_other_spread = max_other_spread.max(weighted);
-        }
+        // area + the other centroid's possible offset within its cell. The bound only needs the
+        // GLOBAL max weighted spread (including our own bucket — a safe over-estimate for the
+        // "other" term), which is invariant across all get_neighbors calls until the next
+        // mutation. Compute it once and cache it, so a full-cluster neighbor pass is O(N) total
+        // instead of O(N^2) (the max scan used to run on every call).
+        let max_other_spread = self.max_weighted_spread(y_weight);
         let search_radius = effective_self + max_other_spread + self.observation_radius;
 
         // Cells within the search radius around our centroid's cell (weighted space).

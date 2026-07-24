@@ -39,13 +39,13 @@ If any rubric is uncertain, escalate. The cost of an unnecessary escalation is o
 
 The PR does **not** touch:
 
-- `IClusteringModel` and clustering-decision flow
+- The clustering decision path (`build_partition_decisions` / global graph partition, ADR-004)
 - Four-bucket entity/world state model
 - Replication channel pipeline
 - ClusterManager / ClusterServer (a.k.a. ArcaneManager / ArcaneNode after the rename) core logic
 - Hot-path code (per-tick, per-message, per-subscription)
 - SpacetimeDB integration patterns (subscriptions vs HTTP, write batching, persistence semantics)
-- Public APIs of `arcane-core`, `arcane-rules`, `arcane-pool`, `arcane-spatial`, `arcane-infra`
+- Public APIs of `arcane-core`, `arcane-affinity`, `arcane-pool`, `arcane-spatial`, `arcane-infra`, `arcane-wire`
 
 ## What "doesn't cheat in benchmarks" means
 

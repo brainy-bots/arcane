@@ -4,38 +4,35 @@
 //!
 //! ## Module responsibilities
 //! - `types`: shared math and geometry primitives (`Vec2`, `Vec3`, `ClusterGeometry`).
-//! - `clustering_model`: merge/split decision interface consumed by manager logic.
+//! - `clustering_model`: world-state view types consumed by the manager decision path.
 //! - `server_pool`: allocation/release contract for cluster server capacity.
 //! - `replication_channel`: neighbor-delta contract, [`EntityStateEntry`](replication_channel::EntityStateEntry) (four-bucket spine + JSON fields), [`IReplicationChannel`](replication_channel::IReplicationChannel).
-//! - `world_simulator`: contract for unobserved entity state progression.
+//! - `persistence`: durable entity state seam (L2, epic #305), [`IPersistence`](persistence::IPersistence).
 //! - `visibility`: per-client visibility filtering in the outbound pipeline, [`IVisibilityFilter`](visibility::IVisibilityFilter).
 //!
 //! ## Interaction model
-//! Implementations in sibling crates (`arcane-rules`, `arcane-pool`, `arcane-infra`) depend on
+//! Implementations in sibling crates (`arcane-pool`, `arcane-infra`) depend on
 //! these contracts. `arcane-core` itself has no runtime side effects and should remain a dependency
 //! root for cross-crate compatibility.
 
 pub mod cluster_simulation;
 pub mod clustering_model;
+pub mod persistence;
 pub mod physics_events;
 pub mod replication_channel;
 pub mod server_pool;
 pub mod types;
 pub mod visibility;
-pub mod world_simulator;
 
 pub use cluster_simulation::{ClusterSimulation, ClusterTickContext, GameAction};
-pub use clustering_model::{
-    ClusterDecision, ClusterInfo, DecisionReason, DecisionType, IClusteringModel, ModelInfo,
-    PlayerInfo, ValidationResult, WorldStateView,
-};
+pub use clustering_model::{ClusterInfo, PlayerInfo, WorldStateView};
+pub use persistence::IPersistence;
 pub use physics_events::{PhysicsEvent, PhysicsEventBatch, PhysicsOp};
 pub use replication_channel::{
-    ChannelConfig, CloseReason, EntityStateDelta, EntityStateEntry, IReplicationChannel,
+    CloseReason, EntityStateDelta, EntityStateEntry, IReplicationChannel,
 };
 pub use server_pool::{
     FailureType, IServerPool, PoolError, PoolErrorCode, PoolStatus, ReplacementHandle, ServerHandle,
 };
 pub use types::{ClusterGeometry, Vec2, Vec3};
 pub use visibility::IVisibilityFilter;
-pub use world_simulator::{IWorldSimulator, LastKnownState, SimulatedState, WorldContext};

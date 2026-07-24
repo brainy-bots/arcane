@@ -37,7 +37,7 @@ The interface is deliberately simple — three methods covering the full lifecyc
 ## 3. What It Does NOT Do
 
 - Run the simulation on the Arcane Node — that is ArcaneNode's job
-- Make clustering decisions — that is IClusteringModel's job
+- Make clustering decisions — that is the clustering decision path's job (the global graph partition in `arcane_infra::manager::build_partition_decisions`, ADR-004)
 - Route player connections — that is ArcaneManager's job
 - Monitor game-level health of a Arcane Node — only infrastructure health (reachable, responsive)
 - Persist any game state — Arcane Nodes are stateless infrastructure

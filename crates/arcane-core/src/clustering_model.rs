@@ -1,7 +1,15 @@
-//! IClusteringModel (IF-01) — merge/split decision interface.
+//! World-state view types consumed by the manager decision path.
 //!
-//! Consumed by `arcane-infra::ArcaneManager` to turn a `WorldStateView` into ordered actions.
-//! This module only models decision data; execution belongs to infra orchestration code.
+//! `WorldStateView` (with `ClusterInfo` / `PlayerInfo`) is the read-only
+//! snapshot the manager assembles from the spatial index each cycle. The
+//! interaction-graph partitioner (`arcane_infra::manager::build_partition_decisions`)
+//! reads it.
+//!
+//! The old merge/split decision interface (`IClusteringModel`,
+//! `ClusterDecision`, ...) lived here too. It was the pre-partition design:
+//! the manager computed and DISCARDED its output, so it was removed
+//! (arcane#291/#292). The swap seam moved to the interaction predictor
+//! (`arcane_affinity::predictor::InteractionPredictor`); see #292.
 
 use crate::types::Vec2;
 use uuid::Uuid;
@@ -51,91 +59,4 @@ pub struct PlayerInfo {
     pub position: Vec2,
     /// Current velocity vector (units/second).
     pub velocity: Vec2,
-}
-
-/// A single merge or split decision from the model.
-#[derive(Clone, Debug)]
-pub struct ClusterDecision {
-    /// Whether this is a merge or split decision.
-    pub decision_type: DecisionType,
-    /// Execution priority (1 = highest, 10 = lowest).
-    pub priority: u8,
-    /// Machine- and human-readable reason for the decision.
-    pub reason: DecisionReason,
-    /// Model confidence (0.0–1.0). Static rules always return 1.0.
-    pub confidence: f32,
-    /// For merge decisions: the source cluster whose players move to `target_cluster_id`.
-    pub source_cluster_id: Option<Uuid>,
-    /// For merge decisions: the target cluster receiving the source cluster's players.
-    pub target_cluster_id: Option<Uuid>,
-    /// For split decisions: the cluster being split into two groups.
-    pub cluster_id: Option<Uuid>,
-    /// For split decisions: first subgroup of player UUIDs.
-    pub split_group_a: Option<Vec<Uuid>>,
-    /// For split decisions: second subgroup of player UUIDs.
-    pub split_group_b: Option<Vec<Uuid>>,
-}
-
-/// Whether a decision proposes merging two clusters or splitting one cluster into two.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecisionType {
-    /// Combine `source_cluster_id` into `target_cluster_id`.
-    Merge,
-    /// Divide `cluster_id` into two groups.
-    Split,
-}
-
-/// Machine- and human-readable reason code for a clustering decision.
-#[derive(Clone, Debug)]
-pub struct DecisionReason {
-    /// Machine-readable code (e.g. `"PARTY_SEPARATED"`, `"SPATIAL_PROXIMITY"`).
-    pub code: String,
-    /// Human-readable explanation for logging and debugging.
-    pub detail: String,
-}
-
-/// Pluggable clustering model. Implemented by RulesEngine (MVP) and ML model (production).
-pub trait IClusteringModel: Send + Sync {
-    /// Evaluate the live view and return decisions in priority order. Empty = no action.
-    fn evaluate(&self, view: &WorldStateView) -> Vec<ClusterDecision>;
-
-    /// Model metadata for logging and guardrails.
-    fn get_model_info(&self) -> ModelInfo;
-
-    /// Validate the view before evaluation. Caller may use this to skip invalid views.
-    fn validate_view(&self, view: &WorldStateView) -> ValidationResult;
-
-    /// Return per-entity cluster assignments (entity_id → cluster_id).
-    /// Entities not in the map retain their current assignment.
-    /// Default returns empty map — models that reason per-entity override this.
-    fn compute_entity_assignments(
-        &self,
-        _view: &WorldStateView,
-    ) -> std::collections::HashMap<Uuid, Uuid> {
-        std::collections::HashMap::new()
-    }
-}
-
-/// Metadata describing a clustering model implementation.
-#[derive(Clone, Debug)]
-pub struct ModelInfo {
-    /// Human-readable model type (e.g. `"static_rules"`, `"ml_model"`).
-    pub model_type: String,
-    /// Semantic version or build identifier for the model.
-    pub version: String,
-    /// Unix timestamp of the model's training, if applicable.
-    pub trained_at: Option<f64>,
-    /// Number of features the ML model was trained on, if applicable.
-    pub feature_count: Option<u32>,
-}
-
-/// Outcome of a `validate_view` call: whether the view is structurally valid and any diagnostics.
-#[derive(Clone, Debug)]
-pub struct ValidationResult {
-    /// Whether the view passed all validation checks.
-    pub valid: bool,
-    /// Non-fatal diagnostics that may be of interest to operators.
-    pub warnings: Vec<String>,
-    /// Fatal validation failures that make the view unsuitable for evaluation.
-    pub errors: Vec<String>,
 }

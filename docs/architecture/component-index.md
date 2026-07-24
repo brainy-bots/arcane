@@ -27,7 +27,7 @@ The server has no knowledge of the client engine. It speaks TCP and WebSocket, e
 Each component owns exactly one concern. The ArcaneManager assigns players to servers. It does not simulate physics. The Arcane Node simulates physics. It does not make clustering decisions. Violations of this boundary are architectural debt that compounds over time.
 
 ### Interface-First
-Every component that has more than one possible implementation — the clustering model, the world simulator, the client adapter, the server pool — is defined by an interface before any implementation is written. This is how the MVP static rules are swapped for the ML model later without touching calling code.
+Every component that has more than one possible implementation — the client adapter, the server pool, the replication channel, the visibility filter — is defined by an interface before any implementation is written. This is how, for example, the local dev pool is swapped for the ECS pool without touching calling code. (The clustering decision followed a different path: rather than a swappable `IClusteringModel`, it became the global graph partition `arcane_infra::manager::build_partition_decisions` with a pluggable `InteractionPredictor` ML seam — see ADR-004.)
 
 ### Honest Overhead
 Cross-cluster interactions are a real cost. Documents describe both the capability and the cost. The replication architecture and merge logic exist specifically to minimize this cost — but they do not eliminate it. Any component that introduces cross-cluster traffic must measure and expose that traffic.
@@ -65,8 +65,8 @@ Components are grouped into four layers. Documents within each layer are written
 │  IClientAdapter · UnrealAdapter · GodotAdapter · UnityAdapter                  │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  INFRASTRUCTURE LAYER                                                           │
-│  IClusteringModel · IServerPool · IReplicationChannel · IWorldSimulator        │
-│  ArcaneManager · ArcaneNode · SpatialIndex · RulesEngine                    │
+│  IServerPool · IReplicationChannel · IVisibilityFilter                          │
+│  ArcaneManager · ArcaneNode · SpatialIndex                                    │
 │  RPCHandler (optional) · ReplicationChannelManager · ArcaneNodePool       │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  AI LAYER                                                                       │
@@ -102,19 +102,20 @@ Components are grouped into four layers. Documents within each layer are written
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
-| IF-01 | IClusteringModel | `if_01_iclusteringmodel.md` | Merge and split decision contract; neighbor topology and decisions driven by graph+ML optimization; cluster size can go as low as one player per server. Implemented by StaticRulesModel (MVP) and MLClusteringModel (production). |
+| ~~IF-01~~ | ~~IClusteringModel~~ | [`interface-iclusteringmodel.md`](interface-iclusteringmodel.md) | **REMOVED / SUPERSEDED (arcane#291/#292).** The merge/split decision interface was dead (manager discarded its output). The clustering decision is now the global graph partition `arcane_infra::manager::build_partition_decisions` (ADR-004); the pluggable ML seam is `arcane_affinity::predictor::InteractionPredictor`. Spec retained as design history. |
 | IF-02 | IServerPool | `if_02_iserverpool.md` | Arcane Node allocation and release contract. Implemented by LocalPool (dev) and ECSPool (production). |
 | IF-03 | IReplicationChannel | `if_03_ireplicationchannel.md` | Cluster-to-cluster state broadcast via pub/sub (publish/subscribe). Default transport Redis. Allows replication transport substitution. |
-| IF-04 | IWorldSimulator | `if_04_iworldsimulator.md` | Unobserved entity state contract. Implemented by Static, FastForward, and MLPredictive modes. |
+| IF-05 | IVisibilityFilter | (`arcane_core::visibility`) | Per-client visibility filtering in the outbound pipeline. Default impl `RadiusVisibilityFilter` (lives only in `arcane-core::visibility`). The third live core contract alongside IServerPool and IReplicationChannel. |
+| ~~IF-04~~ | ~~IWorldSimulator~~ | [`interface-iworldsimulator.md`](interface-iworldsimulator.md) | **REMOVED (arcane#291/#292).** Unobserved-entity state contract; no implementer ever existed. Trait and module deleted. Spec retained as design history. |
 
 ### 3.4 Infrastructure Components
 
 | ID | Component | Document | Summary |
 |----|-----------|----------|---------|
-| IN-01 | ArcaneManager | `in_01_manager.md` | Central coordinator. Assigns players to Arcane Nodes, maintains spatial index, publishes neighbor lists, invokes clustering model. |
+| IN-01 | ArcaneManager | `in_01_manager.md` | Central coordinator. Assigns players to Arcane Nodes, maintains spatial index, publishes neighbor lists, computes ownership via the global graph partition (`arcane_infra::manager::build_partition_decisions`, ADR-004). |
 | IN-02 | ArcaneNode | `in_02_arcane_node.md` | Simulation unit per cluster. Runs physics tick, AI, movement; publishes state to replication (Redis); subscribes to neighbors; calls SpacetimeDB reducers for discrete events (e.g. attack hit). Optional RPCHandler for non-game use. |
 | IN-03 | SpatialIndex | `in_03_spatial_index.md` | 2D coarse grid hash updated by Arcane Nodes. Drives proximity merge triggers and which clusters subscribe to which (neighbor discovery). |
-| IN-04 | RulesEngine | `in_04_rules_engine.md` | Evaluates merge and split conditions. Implements IClusteringModel. Stateless — pure function from world state to decisions. |
+| ~~IN-04~~ | ~~RulesEngine~~ | [`module-rules-engine.md`](module-rules-engine.md) | **REMOVED (arcane#291/#292).** The `arcane-rules` crate and its static `IClusteringModel` impl were deleted. The clustering decision is now the global graph partition in `arcane_infra::manager::build_partition_decisions` (ADR-004). Spec retained as design history. |
 | IN-05 | RPCHandler | `in_05_rpc_handler.md` | **Optional.** TCP endpoint for non-game server-to-server RPC (admin, tools). Game logic (attack, inventory) uses SpacetimeDB reducers, not TCP RPC. |
 | IN-06 | ReplicationChannelManager | `in_06_replication_channel_manager.md` | Manages which clusters each server subscribes to (and publishes to); replication transport is Redis pub/sub. Receives neighbor list updates from ArcaneManager. |
 | IN-07 | ArcaneNodePool | `in_07_arcane_node_pool.md` | Implements IServerPool. Pre-provisioned local pool for development; ECS Fargate pool for production. |
@@ -125,7 +126,7 @@ Components are grouped into four layers. Documents within each layer are written
 |----|-----------|----------|---------|
 | AI-01 | IAIBehavior | `ai_01_iaibehavior.md` | Behavior tree interface for enemy entities. Swappable per entity class at runtime. |
 | AI-02 | AINode | `ai_02_ai_node.md` | Dedicated process for enemy AI. Runs behavior trees, memory systems, and group coordination separate from simulation thread. |
-| AI-03 | UnobservedWorldSimulator | `ai_03_unobserved_simulator.md` | Implements IWorldSimulator. Three modes: Static, FastForward, MLPredictive. |
+| AI-03 | UnobservedWorldSimulator | `ai_03_unobserved_simulator.md` | **Design-only (never implemented).** Was to implement the now-removed IF-04 IWorldSimulator (arcane#291/#292). Three envisioned modes: Static, FastForward, MLPredictive. |
 | AI-04 | EntityInstantiationManager | `ai_04_entity_instantiation.md` | Lazy entity instantiation. Detects player approach, hydrates entity from world state, allocates AI node. |
 | AI-05 | WorldBossNode | `ai_05_world_boss_node.md` | Dedicated AI node with permanent entity authority. Hub-and-spoke RPC endpoint. Writes state to SpacetimeDB. |
 
@@ -146,7 +147,9 @@ Components are grouped into four layers. Documents within each layer are written
 
 A `·` means the row component depends on the column component.
 
-> **Build order:** Interfaces first (IF-\*), then IN-03 and IN-07 (no deps), then IN-04 (needs IF-01), then IN-01 (needs all IN), then IN-02 (needs IN-01), then AI-\* (need IN-01/02), then CA-01, then CA-02/03/04.
+> **Build order:** Interfaces first (IF-\*), then IN-03 and IN-07 (no deps), then IN-01 (needs the interfaces + IN-03), then IN-02 (needs IN-01), then AI-\* (need IN-01/02), then CA-01, then CA-02/03/04. IN-04 RulesEngine dropped out of the build order — it was removed.
+
+> **Removed rows/columns (arcane#291/#292):** IF-01 (IClusteringModel), IF-04 (IWorldSimulator), and IN-04 (RulesEngine) below are **removed**; the clustering decision is now the global graph partition `arcane_infra::manager::build_partition_decisions` (ADR-004). Their rows/columns are kept here only for historical dependency mapping. AI-03 (UnobservedWorldSimulator) and AI-04 (EntityInstantiationManager) were design-only consumers of the removed IF-04 and were never implemented.
 
 | | IF-01 | IF-02 | IF-03 | IF-04 | IN-01 | IN-02 | IN-03 | IN-04 | IN-05 | IN-06 | IN-07 | AI-02 | AI-03 | CA-01 |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -173,12 +176,12 @@ A `·` means the row component depends on the column component.
 |----------|---------|
 | `docs/END_TO_END_FLOWS.md` | Step-by-step flows: player join, merge, split. Order of operations and messages; references interfaces and components. Use when implementing ArcaneManager, ArcaneNode, or client adapter. |
 | `ca_02_unreal_adapter.md` | CA-02 UnrealAdapter: UE5 implementation of IClientAdapter for the demo. Mass Entity for crowd rendering, WebSocket (Manager + Cluster), msgpack/JSON, threading, interpolation, validation checklist. |
-| `in_01_manager.md` | IN-01 ArcaneManager: responsibilities, main loop, Manager WebSocket, SpacetimeDB subscribe/write, IClusteringModel cadence, guardrails, neighbor list, config, metrics, failure modes. |
+| `in_01_manager.md` | IN-01 ArcaneManager: responsibilities, main loop, Manager WebSocket, SpacetimeDB subscribe/write, global-partition decision cadence (`build_partition_decisions`, ADR-004), guardrails, neighbor list, config, metrics, failure modes. |
 | `docs/SPACETIMEDB_SCHEMA.md` | Base schema (cluster_assignments, entity_assignments, cluster_topology, entity_state) and base reducers; extension points for game-specific tables and columns. Who writes what, who subscribes to what. |
 | `in_02_arcane_node.md` | IN-02 ArcaneNode: tick loop, SpacetimeDB subscribe/write, replication publish/subscribe, Cluster WebSocket (STATE_UPDATE, PLAYER_INPUT, HANDOFF), RPC host, config, metrics, failure modes. |
 | `in_03_spatial_index.md` | IN-03 SpatialIndex: 2D coarse grid/hash, centroid + spread_radius, neighbor discovery (centroid + spread + observation_radius), API for ArcaneManager; data from SpacetimeDB (entity_state) written by ArcaneNodes. |
 | `in_06_replication_channel_manager.md` | IN-06 ReplicationChannelManager: runs on each ArcaneNode; subscribes to cluster_topology; opens/closes IReplicationChannel per neighbor; send_to_neighbors, on_receive, neighbor geometry for filtering; config, metrics, failure modes. |
-| `in_04_rules_engine.md` | IN-04 RulesEngine: static, non-ML implementation of IClusteringModel; evaluates WorldStateView with hand-written rules to propose merge/split decisions; config, thresholds, metrics, failure modes. |
+| ~~`module-rules-engine.md`~~ | **IN-04 RulesEngine — REMOVED (arcane#291/#292).** The static `IClusteringModel` impl and the `arcane-rules` crate were deleted; the clustering decision is now the global graph partition `arcane_infra::manager::build_partition_decisions` (ADR-004). Spec retained as design history. |
 | `docs/BEST_PRACTICES_SPACETIMEDB_AND_CLUSTERS.md` | Best practices for game devs: simulation vs world state, what goes in clusters vs SpacetimeDB reducers, AI on cluster, recommended folder structure. |
 | `in_05_rpc_handler.md` | IN-05 RPCHandler: **Optional** TCP endpoint for non-game RPC; game logic uses SpacetimeDB reducers. Wire format, config, metrics. |
 
@@ -213,7 +216,7 @@ Every component document follows this structure exactly.
 - Sequence numbers are fixed — renaming requires updating this index
 
 ### Interface Naming
-- All interfaces prefixed with `I` — `IClientAdapter`, `IClusteringModel`, `IServerPool`
+- All interfaces prefixed with `I` — `IClientAdapter`, `IServerPool`, `IReplicationChannel`, `IVisibilityFilter`
 - Interface methods use present-tense verbs — `assign_player()`, `evaluate()`, `broadcast()`
 - Error types are component-scoped — `ArcaneManagerError`, `RPCError`, not generic `Exception`
 

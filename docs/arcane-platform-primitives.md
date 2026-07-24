@@ -46,6 +46,7 @@ These are first-pass estimates and will be revised as more genres are analyzed a
 | 15 | [Activity-based world simulation hooks](#15-activity-based-world-simulation-hooks) | On-reactivation fast-forward for dormant regions | Survival, Factory/automation, Life sims, Persistent worlds | Low | Niche |
 | 16 | [Structural integrity graph](#16-structural-integrity-graph) | Support graph with placement validation and cascade queries | Survival, Sandbox, Building games, Destruction-heavy Shooters | Medium | Important |
 | 17 | [Session relay](#17-session-relay) | Edge ingress tier: stable client connection, migration handoff, fan-out collapse | MMORPGs, Action MMOs, Persistent worlds; opt-in ops tier for session games | High | Important |
+| 18 | [Entity session lifecycle](#18-entity-session-lifecycle) | Connect/disconnect/reconnect/leave paths with configurable persistence ladder | Universal | Low | Essential |
 
 ---
 
@@ -74,7 +75,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 | **Outbound pipeline** | #13, #4, #2 *(read path)* | Per-subscriber per-tick: what each client receives |
 | **Simulation loop** | #1, #3, #6 | Per-tick: what the cluster computes |
 | **Entity lifecycle** | #8, #14 | SpacetimeDB: creation, transfer, persistence |
-| **Cluster management** | #5, #15 | `IClusteringModel` / tier system: authority partitioning |
+| **Cluster management** | #5, #15 | clustering decision (`build_partition_decisions`) / tier system: authority partitioning |
 | **Composite entities** | #10, #11, #12 | Hierarchical relationships, transforms, input routing |
 | **Validation** | #7 | Inbound path: server-side checks on client claims |
 | **Infrastructure** | #9, #16, #17 | Self-contained subsystems with own transport or data structures |
@@ -98,7 +99,7 @@ Primitives are not 16 independent hooks into the same code. They cluster into **
 
 **Entity lifecycle and persistence** — #14 (linear persistent entities) and #8 (replay recording) both operate through SpacetimeDB transactional paths. Independent of the tick-rate simulation and the outbound pipeline.
 
-**Cluster management** — #5 (terrain authority) and #15 (activity-based world simulation hooks) interact with `IClusteringModel` and the tier system ([#33](https://github.com/brainy-bots/arcane/issues/33) / [#34](https://github.com/brainy-bots/arcane/issues/34)). They don't touch the per-client outbound pipeline.
+**Cluster management** — #5 (terrain authority) and #15 (activity-based world simulation hooks) interact with the clustering decision (`build_partition_decisions`, the global graph partition) and the tier system ([#33](https://github.com/brainy-bots/arcane/issues/33) / [#34](https://github.com/brainy-bots/arcane/issues/34)). They don't touch the per-client outbound pipeline.
 
 **Composite entity system** — #10 (composite entities), #11 (relative coordinate frames), #12 (role-based input arbitration) are tightly coupled by design. They describe different aspects of the same concept — multi-occupant vehicles and structures — with each owning a distinct concern: topology (#10), geometry (#11), input (#12). Shared data structures, no conflict.
 
@@ -628,6 +629,30 @@ Testing is the second watchpoint: relay tiers must not ship before a real consum
 Cost is the third: a relay doubles egress for traffic that transits it and adds instances. This is only paid by games at tiers that benefit (fan-out collapse at L3, ops value at L1); the per-game-container-on-shared-hosts model amortizes the fixed cost across titles. No game pays for machinery it doesn't opt into.
 
 **Related to:** #13 (per-client visibility filtering — at L3 the relay fans out a per-cluster stream, so per-client filtering either moves to the edge or constrains what the relay can collapse; the interaction needs explicit design when L3 is built), #4 (reliability annotations — relay must preserve per-field transport semantics end-to-end), #6 (per-cluster tick rates shape relay subscription cadence), #9 (spatial voice could share the same edge tier and regional host fleet).
+
+---
+
+### 18. Entity session lifecycle
+
+**What:** A first-class entity lifecycle model that defines the full path an entity takes: connect (materialize in a cluster), disconnect (leave a cluster), reconnect (re-enter within a configurable TTL window), and leave (session ends, entity released). The platform provides configurable persistence levels: L0 (ephemeral, no SpacetimeDB), L1 (short-term reconnection window with Redis TTL), L2 (durable SpacetimeDB recovery), L3 (game-defined custom bucket-4 logic).
+
+**Why it matters:** Entity persistence is one of the first decisions a game makes, and it shapes replication, recovery, and session management. A platform-provided lifecycle primitive makes this decision explicit and compositional: games choose the level once via environment variable (`ARCANE_PERSISTENCE`), and the platform handles the wiring from that choice through replication, storage, and reconnection logic. This eliminates per-game custom session management.
+
+**Genres benefiting:** Universal. Every multiplayer game has entities with sessions, and every game has decided whether entities survive restarts. Prototypes need L0 (free, fast). Live games need L2+ (durable). The ladder shape lets games start simple and climb only where needed, paying zero cost for levels they don't use.
+
+**Progressive-API sketch:**
+- **L0** — Ephemeral: entities exist only while the cluster runs. No durable state, no reconnection window. Fast, zero overhead. Environment: `ARCANE_PERSISTENCE=none`.
+- **L1** — Short-term reconnection (default): entity snapshots park in Redis with TTL (default 120 seconds / 2 minutes). Clients can reconnect within the window. Session ends after TTL or explicit leave. Environment: `ARCANE_PERSISTENCE=short` (default), `ARCANE_RECONNECT_TTL_SECS=120` (default), `NODE_CLIENT_IDLE_TIMEOUT_SECS=<seconds>`.
+- **L2** — Full durable recovery: entity state persists in SpacetimeDB. Survives any cluster crash or graceful restart. Reconnect semantics automatic. Environment: `ARCANE_PERSISTENCE=full`.
+- **L3** — Game-defined persistence: game extends bucket 4 with custom tables, reducers, and session-state logic. Combines L2 durability with game-specific recovery rules. Environment: `ARCANE_PERSISTENCE=full` + custom reducer registration.
+
+**Watchpoints:** TTL interaction with idle timeout. A client idle longer than `NODE_CLIENT_IDLE_TIMEOUT_SECS` triggers a session-end at the server; even if the client reconnects later, the TTL window is closed. The two timeouts work together: `NODE_CLIENT_IDLE_TIMEOUT_SECS` should be ≤ `ARCANE_RECONNECT_TTL_SECS` to avoid contradictory semantics (client trying to reconnect to an expired entity because the server already ended the session).
+
+A second watchpoint: SpacetimeDB cold-restart role. In L2+, SpacetimeDB acts as the authoritative durable backing for entity state on a full cluster restart. It is *not* read on every tick (that would defeat the performance model). It is read only once: when a cluster restarts from cold, SpacetimeDB is the source of truth for what entities existed. Bucket 1/2 state is replicated live from other clusters or recomputed; bucket 4 is loaded from SpacetimeDB. This role is formalized by the `IPersistence` interface — the platform asks "give me entities that belong in this cluster" and the implementation (L0: empty; L1: Redis TTL buckets; L2+: SpacetimeDB query) answers.
+
+**Status:** IMPLEMENTED — epic #305 merged 2026-07-24 (L0/L1/L2 + docs + demo proof). #321 (L1 reconnect rehydration TTL gating) is FIXED: rehydration is gated on first contact and bounded by the parked key's own Redis TTL, decoupled from the anti-resurrection tombstone; the cross-node reconnect path (returning session routed through a node holding stale records) revives and rehydrates via the forwarding path.
+
+**Related to:** [`four-bucket-state-model.md`](four-bucket-state-model.md) (defines bucket 4 and the lifecycle invariant); [`progressive-api.md`](progressive-api.md) (the persistence ladder and environment surface); [`meta-control-layer.md`](meta-control-layer.md) (SpacetimeDB's durable role as L2 backend).
 
 ---
 

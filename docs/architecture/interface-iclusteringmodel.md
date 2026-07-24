@@ -1,6 +1,8 @@
 # IF-01 — IClusteringModel
 **Merge and Split Decision Interface**
 
+> **Status: REMOVED / SUPERSEDED (2026-07, arcane#291/#292).** The clustering decision is now a global graph partition (`arcane_infra::manager::build_partition_decisions`, ADR-004); the pluggable ML seam is `arcane_affinity::predictor::InteractionPredictor`. This spec is retained as design history.
+
 ---
 
 | | |

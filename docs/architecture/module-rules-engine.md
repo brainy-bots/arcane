@@ -1,6 +1,8 @@
 # IN-04 — RulesEngine
 **Static rules implementation of IClusteringModel**
 
+> **Status: REMOVED (2026-07, arcane#291/#292).** The `arcane-rules` crate and RulesEngine (the static IClusteringModel impl) were deleted; the clustering decision is now the global graph partition in `arcane_infra::manager::build_partition_decisions` (ADR-004). This spec is retained as design history.
+
 ---
 
 | | |

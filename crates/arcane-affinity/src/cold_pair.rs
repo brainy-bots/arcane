@@ -135,7 +135,8 @@ pub fn screen_candidates(
                         continue; // each unordered pair once
                     }
                     let (b, pos_b, vel_b) = players[j];
-                    if graph.get_weight(*a, b) >= hot_floor {
+                    let history_weight = graph.get_weight(*a, b);
+                    if history_weight >= hot_floor {
                         continue;
                     }
                     let dx = pos_b.x - pos_a.x;
@@ -152,7 +153,7 @@ pub fn screen_candidates(
                             pos_b,
                             vel_a: *vel_a,
                             vel_b,
-                            history_weight: graph.get_weight(*a, b),
+                            history_weight,
                         });
                     }
                 }
@@ -173,11 +174,11 @@ pub fn screen_candidates(
             adjacency.entry(nb).or_default().push(na);
         }
     }
-    for (n, neighbors) in &adjacency {
-        let _ = n;
+    for neighbors in adjacency.values() {
         for (ai, &a) in neighbors.iter().enumerate() {
             for &b in neighbors.iter().skip(ai + 1) {
-                if graph.get_weight(a, b) >= hot_floor {
+                let history_weight = graph.get_weight(a, b);
+                if history_weight >= hot_floor {
                     continue; // strongly connected already (same rule as (a))
                 }
                 let (Some(&ia), Some(&ib)) = (player_index.get(&a), player_index.get(&b)) else {
@@ -192,7 +193,7 @@ pub fn screen_candidates(
                     pos_b,
                     vel_a,
                     vel_b,
-                    history_weight: graph.get_weight(a, b),
+                    history_weight,
                 });
             }
         }
@@ -219,7 +220,8 @@ pub fn screen_candidates(
                     let a = group[i];
                     let b = group[j];
 
-                    if graph.get_weight(a, b) >= hot_floor {
+                    let history_weight = graph.get_weight(a, b);
+                    if history_weight >= hot_floor {
                         continue;
                     }
 
@@ -234,7 +236,7 @@ pub fn screen_candidates(
                             pos_b,
                             vel_a,
                             vel_b,
-                            history_weight: graph.get_weight(a, b),
+                            history_weight,
                         });
                     }
                 }

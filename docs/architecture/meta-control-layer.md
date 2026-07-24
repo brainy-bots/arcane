@@ -309,9 +309,13 @@ separation**, not the interaction min-cut: peel off the geographically-distant
 group so its terrain unloads. So: CPU-bound → min-cut; memory-bound → spatial cut.
 See §9.
 
-Hysteresis/cooldown (already in `arcane-affinity`) rate-limits splits so they do
+Hysteresis/cooldown (live in `arcane_infra::manager::MigrationState`) rate-limits splits so they do
 not thrash; `SCALING_MODEL.md`'s K_max slack (~218 boundary entities on demo
 constants) means there is large tolerance before action is forced.
+
+### 5.1 Implementation status (epic #293)
+
+§5's policy is now implemented as the explicit objective `J = cut + α·Σ|S|^γ + β·open + μ·moves` (epic #293). The packing strategy ("pack maximally") is encoded in the `β·open` term (cost of non-empty partitions); resource-pressure splits are driven by the `α·Σ|S|^γ` crowding penalty (resource signal integration with Sigil remains future work). Cluster count emerges from the partitioner's cost minimization, not a fixed topology.
 
 ---
 
@@ -451,6 +455,14 @@ on an already-replicating node — no in-process `ServerPool` shuffle (the old
 Guardrails (cooldown, rate limit, CPU cap, max in-flight) gate the flip. See the
 migration executor epic (#207).
 
+### 8.1 Session end as first-class lifecycle (added 2026-07-24)
+
+**Implementation status:** Entity session lifecycle (epic #305) formalizes connect/disconnect/reconnect/leave paths as platform primitives. Session end (the leave transition) is now first-class in the control layer: when a client explicitly ends a session or the server times out an idle connection, the entity is released from its owning cluster and may be recovered (L2+) or expired (L0/L1). The player entity transitions from "owned and replicated" to "released," freeing the entity slot in the cluster and notifying SpacetimeDB (if L2+) that recovery state is final.
+
+**Anti-resurrection guarantee:** Once session-end fires for a player entity, replication to that entity stops and the entity is no longer owned by any cluster. A reconnecting client cannot "resurrect" an old entity; instead, they receive a fresh entity loaded from SpacetimeDB (L2+) or cold-start from L0 defaults (L0/L1). This prevents the "invisible ghost player" failure mode where a stale entity remains partially replicated to old clusters after the real entity has moved on.
+
+**SpacetimeDB's cold-restart role formalized:** SpacetimeDB is the `IPersistence` backend for L2+ games. It serves a single, focused role: when a cluster starts from cold (after a crash or full restart), SpacetimeDB answers "which entities belong in my region?" The entities returned are hydrated into the cluster as owned state. Bucket 4 is read *once* at cold-start, never on the hot path. Live state flows through Redis (bucket 1/2); SpacetimeDB is a crash-recovery snapshot, not a live coordinator. This role is now explicitly contractual between the control layer and the persistence layer via the `IPersistence` trait.
+
 ---
 
 ## 9. Cluster lifecycle (Plane 2) — orthogonal, infra-driven
@@ -547,7 +559,7 @@ converge:
    distance + closing velocity + combat state), measured against binary AOI
    (paper C2). No SpacetimeDB brain, no self-scheduling meta-rates yet.
 3. **Manager owns the graph + partition decisions** (single, in-memory, the hot
-   graph). Predictor as a rule-based `p(i,j,T)` behind `arcane-affinity`'s scorer.
+   graph). Predictor as a rule-based `p(i,j,T)` in `arcane-affinity`'s `predictor` module (`InteractionPredictor` trait, `HeuristicPredictor` today).
 4. **Router as a distinct component** once whole-cluster replication is shown
    insufficient by measurement — not before. The full continuous-rate router with
    the manager/router split and the Redis-bus form is the **regime-3 / C2-full

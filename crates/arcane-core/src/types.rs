@@ -5,9 +5,6 @@
 
 use uuid::Uuid;
 
-/// Re-export for use in interface types.
-pub use uuid::Uuid as EntityId;
-
 /// 2D vector (e.g. centroid in 2D plane, or x/z).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Vec2 {

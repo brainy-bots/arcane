@@ -795,15 +795,6 @@ impl RapierState {
         body_handle
     }
 
-    fn set_linvel(&mut self, entity_id: Uuid, vel: Vec3) {
-        let Some(&handle) = self.handles.get(&entity_id) else {
-            return;
-        };
-        if let Some(body) = self.bodies.get_mut(handle) {
-            body.set_linvel(to_rapier(vel), true);
-        }
-    }
-
     fn despawn(&mut self, entity_id: Uuid) {
         let Some(body_handle) = self.handles.remove(&entity_id) else {
             return;
@@ -1593,12 +1584,17 @@ impl RapierClusterSim {
             if removed.contains(id) {
                 continue;
             }
-            if state.handles.contains_key(id) {
+            // Fetch the handle once (RigidBodyHandle is Copy) instead of
+            // contains_key + set_linvel's internal get — one hash lookup per
+            // owned body per tick instead of two.
+            if let Some(&handle) = state.handles.get(id) {
                 // Skip the declarative linvel sync for entities whose linvel
                 // was set imperatively this tick (via PhysicsHandle::set_linvel
                 // or apply_impulse) — the imperative override wins.
                 if !state.pending_imperative_linvel.contains(id) {
-                    state.set_linvel(*id, entry.velocity);
+                    if let Some(body) = state.bodies.get_mut(handle) {
+                        body.set_linvel(to_rapier(entry.velocity), true);
+                    }
                 }
             } else {
                 let params = SpawnParams {

@@ -48,6 +48,8 @@ Replication carries **simulation state** (position, movement) only. **Discrete g
 
 ## 4. Interface Definition
 
+> **Code status (2026-07, arcane#291/#292):** The live `IReplicationChannel` trait (`arcane-core::replication_channel`) is intentionally minimal — only `send(delta)` and `close(reason)`. There is **no `open()` method and no `ChannelConfig` struct** in code; `ChannelConfig` was removed. A channel is constructed directly (e.g. `RedisReplicationChannel::new(cluster_id, connection)` in `arcane-infra::replication_channel_manager`), and the manager wires neighbors via `set_neighbors` / `send_to_neighbors` / `start(redis_url)`. Observation-radius filtering, queue depth, and send interval described below are design intent, not yet fields on a live config type. The lifecycle and config shapes in this section are retained as the target design.
+
 ### 4.1 Lifecycle
 
 ```

@@ -14,9 +14,13 @@
 
 ---
 
+> **Reconciled to code (2026-07, arcane#291/#292).** The external `IClusteringModel` trait / `evaluate(view)` seam and the `arcane-rules` `RulesEngine` were **removed**. ArcaneManager now computes the clustering decision **in-crate** via `build_partition_decisions` (`crates/arcane-infra/src/manager.rs:122`): it snapshots the spatial index into a `WorldStateView`, derives weighted edges from the persistent `InteractionGraph`, runs the global `GreedyGrowthPartitioner` (`arcane-affinity/src/partition.rs:434`), refines with KL/FM pair moves (`arcane-affinity/src/refinement.rs:162`), and maps partition indices to cluster ids. Migration cooldown/hysteresis lives in the manager's own `MigrationState` (`manager.rs:94`), not in a model. Where this spec still says "call `IClusteringModel.evaluate(view)`", read it as "run `build_partition_decisions` over the interaction graph"; the merge/split framing is preserved as intent. See [ADR-004](adr/004-global-partitioning-and-ml-seams.md).
+
+---
+
 ## 1. Overview
 
-ArcaneManager is the single process through which all client connections (join/leave) and all clustering decisions (merge/split) flow. It does not simulate game state or run replication; it only decides *who belongs to which cluster* and *which clusters are neighbors*, and writes that state to SpacetimeDB. Arcane Nodes and clients then react to that state (via SpacetimeDB subscriptions or Manager messages). ArcaneManager uses IClusteringModel for merge/split decisions and IServerPool to allocate or release Arcane Nodes. It maintains a live view of world state from SpacetimeDB subscriptions and runs the clustering model on a fixed cadence. See `docs/END_TO_END_FLOWS.md` for step-by-step player join, merge, and split.
+ArcaneManager is the single process through which all client connections (join/leave) and all clustering decisions (merge/split) flow. It does not simulate game state or run replication; it only decides *who belongs to which cluster* and *which clusters are neighbors*, and writes that state to SpacetimeDB. Arcane Nodes and clients then react to that state (via SpacetimeDB subscriptions or Manager messages). ArcaneManager runs the clustering decision itself (`build_partition_decisions`, a global partition of the interaction graph) for merge/split and uses IServerPool to allocate or release Arcane Nodes. It maintains a live view of world state from SpacetimeDB subscriptions and runs the partition on a fixed cadence. See `docs/END_TO_END_FLOWS.md` for step-by-step player join, merge, and split.
 
 ---
 
@@ -27,8 +31,8 @@ ArcaneManager is the single process through which all client connections (join/l
 - Send **CLUSTER_ASSIGN** to the client with cluster_id, server_host, server_port.
 - Accept **PLAYER_LEAVE**; update SpacetimeDB (remove or mark player left); optionally release a Arcane Node if it becomes empty (IServerPool.release()).
 - Maintain a **live in-memory view** of world state (cluster assignments, player positions, cluster topology, interaction signals) via SpacetimeDB subscriptions. No ad-hoc polling; the view is kept current by subscription callbacks.
-- On a **fixed cadence**, call **IClusteringModel.evaluate(view)** to get merge/split decisions. Apply guardrails (confidence threshold, rate limits, resource limits). For each decision the ArcaneManager agrees with: write updated assignments and topology to SpacetimeDB; send **CLUSTER_REASSIGN** to affected clients; ensure Arcane Nodes can observe the change (they subscribe to SpacetimeDB) and, if needed, notify Arcane Nodes to drop players/entities at end of tick (see Message Protocol).
-- **Publish or write neighbor lists** so that each Arcane Node (or ReplicationChannelManager) knows which clusters to subscribe to for replication. Neighbor list is derived from spatial index and clustering model; stored in SpacetimeDB or pushed via a dedicated channel (see Open Questions).
+- On a **fixed cadence**, run **`build_partition_decisions(view)`** — a global partition of the interaction graph (weighted edges → `GreedyGrowthPartitioner` → KL/FM `refine`) — to get the desired per-entity cluster assignments, which surface as merge/split. Apply guardrails (migration cooldown via `MigrationState`, in-flight cap, resource limits). For each ownership flip the ArcaneManager accepts: write updated assignments and topology to SpacetimeDB; send **CLUSTER_REASSIGN** to affected clients; ensure Arcane Nodes can observe the change (they subscribe to SpacetimeDB) and, if needed, notify Arcane Nodes to drop players/entities at end of tick (see Message Protocol).
+- **Publish or write neighbor lists** so that each Arcane Node (or ReplicationChannelManager) knows which clusters to subscribe to for replication. Neighbor list is derived from the spatial index and the partition; stored in SpacetimeDB or pushed via a dedicated channel (see Open Questions).
 - When a cluster is dissolved (merge or empty), **tear down replication subscriptions** that reference that cluster’s server, then call **IServerPool.release(server_id)**.
 - Expose **Prometheus metrics** (active clusters, players, join/leave rate, merge/split rate, model eval duration, pool status).
 
@@ -59,9 +63,9 @@ ArcaneManager is a long-running process. Its “API” is the **Manager WebSocke
 - **Writes:** ArcaneManager is the only writer for assignment and topology tables (e.g. cluster_assignments, cluster_topology — see SpacetimeDB schema doc). It invokes reducers or direct writes to add/update/remove player → cluster assignments and cluster → neighbor lists.
 - **Reads (subscriptions):** ArcaneManager subscribes to the tables it needs to build the live WorldStateView (assignments, player positions, cluster metadata, interaction signals, etc.). It does not poll; subscription callbacks update the in-memory view.
 
-### 4.3 Internal use of interfaces
+### 4.3 Internal use of interfaces and the partitioner
 
-- **IClusteringModel.evaluate(view) → decisions.** ArcaneManager builds the view from the live state and calls evaluate on a cadence. It applies guardrails and then executes agreed decisions by writing to SpacetimeDB and sending CLUSTER_REASSIGN.
+- **`build_partition_decisions(view) → desired assignments`.** ArcaneManager builds the WorldStateView from the live state and runs the partition on a cadence (`run_evaluation_cycle`, `manager.rs:584`). It applies guardrails and then executes accepted ownership flips by writing to SpacetimeDB and sending CLUSTER_REASSIGN. This replaces the former `IClusteringModel.evaluate(view)` seam.
 - **IServerPool.allocate() → ServerHandle.** Used when creating a new cluster (e.g. on player join when no suitable cluster exists, or when splitting). **release(server_id)** when a cluster is dissolved.
 
 ---
@@ -71,10 +75,10 @@ ArcaneManager is a long-running process. Its “API” is the **Manager WebSocke
 - **Main loop or event model:** ArcaneManager is event-driven. It has:
   - A **WebSocket server** for Manager connections; each client connection is tracked (player_id, connection state, current cluster_id).
   - **SpacetimeDB subscription handlers** that update the in-memory view (assignments, positions, topology, signals).
-  - A **timer or tick** that fires at the evaluation cadence (e.g. every 50–200 ms). On tick: build WorldStateView from the live view, call IClusteringModel.evaluate(view), apply guardrails, for each agreed decision execute the merge or split (write SpacetimeDB, send CLUSTER_REASSIGN, tear down replication for dissolved cluster, release server if applicable).
+  - A **timer or tick** that fires at the evaluation cadence (e.g. every 50–200 ms). On tick: build WorldStateView from the live view, run `build_partition_decisions` (global partition of the interaction graph), apply guardrails, and for each accepted ownership flip execute the merge or split (write SpacetimeDB, send CLUSTER_REASSIGN, tear down replication for dissolved cluster, release server if applicable).
   - Optional: a **notification path** to Arcane Nodes (“drop these players/entities at end of tick”). If Arcane Nodes learn purely from SpacetimeDB subscriptions, they see the assignment change and drop players/entities without an explicit message; otherwise ArcaneManager sends a message (e.g. over a control channel or via a SpacetimeDB reducer that Arcane Nodes subscribe to). See Open Questions.
 
-- **Spatial index:** ArcaneManager maintains a structure (e.g. 2D grid or spatial hash) that maps world regions or cluster centroids to cluster_ids. This is updated from the live view (player positions, cluster bounds). It is used to build the neighbor list (which clusters are “near” each other) and to feed the WorldStateView for the clustering model. The spatial index may be implemented inline in ArcaneManager or delegated to a separate SpatialIndex component (IN-03); the ArcaneManager is the owner of the logic that derives “who are my neighbors” from the index.
+- **Spatial index:** ArcaneManager maintains a structure (a 3D sparse spatial hash — see IN-03) that maps world regions or cluster centroids to cluster_ids. This is updated from the live view (player positions, cluster bounds). It is used to build the neighbor list (which clusters are “near” each other) and to snapshot the WorldStateView fed into the partition. The spatial index is delegated to the SpatialIndex component (IN-03); the ArcaneManager is the owner of the logic that derives “who are my neighbors” from the index.
 
 - **No blocking on Arcane Nodes:** ArcaneManager does not wait for Arcane Nodes to acknowledge “drop” or “new assignment.” It writes to SpacetimeDB and sends to clients; Arcane Nodes react asynchronously via subscriptions.
 
@@ -83,7 +87,7 @@ ArcaneManager is a long-running process. Its “API” is the **Manager WebSocke
 ## 6. Data Ownership
 
 - **Owns:** In-memory live view (derived from SpacetimeDB subscriptions); spatial index (or reference to IN-03); per-client connection state (player_id, cluster_id, WebSocket); evaluation cadence timer state.
-- **Reads:** SpacetimeDB (subscriptions) for assignments, positions, topology, signals. IClusteringModel (evaluate). IServerPool (allocate, release, get_status).
+- **Reads:** SpacetimeDB (subscriptions) for assignments, positions, topology, signals. The `InteractionGraph` and predictor (`arcane-affinity`) that feed `build_partition_decisions`. IServerPool (allocate, release, get_status).
 - **Writes:** SpacetimeDB (assignment and topology tables only). Sends messages to clients over Manager WebSocket. Does not write to Redis or to Arcane Node processes except via SpacetimeDB or via a defined “notify Arcane Node” mechanism if any (see Open Questions).
 
 ---
@@ -92,7 +96,7 @@ ArcaneManager is a long-running process. Its “API” is the **Manager WebSocke
 
 | Dependency | What is used | If it changes |
 |------------|--------------|----------------|
-| IClusteringModel | evaluate(view) → merge/split decisions | ArcaneManager must apply guardrails and execute; if the interface gains new decision types, ArcaneManager must handle them. |
+| InteractionGraph + partitioner (`arcane-affinity`) | `build_partition_decisions(view)` → desired per-entity assignments (weighted edges → `GreedyGrowthPartitioner` → KL/FM `refine`) | ArcaneManager must apply guardrails and execute the resulting ownership flips; if the partition inputs (edge taxonomy, predictor) change, ArcaneManager's edge-weighting must follow. |
 | IServerPool | allocate(), release(server_id), get_status() | ArcaneManager must still assign players to clusters and release servers when clusters are dissolved. |
 | SpacetimeDB | Subscriptions (live view), reducers or tables (writes for assignments and topology) | Schema and reducer names must match; if SpacetimeDB API changes, ArcaneManager’s subscribe/write code must follow. |
 | SpatialIndex (IN-03) | If separate: API for “neighbors of cluster C” or “update index with positions.” If inline: logic lives in ArcaneManager. | Neighbor list and WorldStateView depend on this; merge/split triggers depend on spatial proximity. |
@@ -141,10 +145,10 @@ ArcaneManager writes **cluster topology** (which clusters exist, which are neigh
 |-----|---------|--------------|
 | ARCANE_MANAGER_HOST | 0.0.0.0 | Bind address for Manager WebSocket. |
 | ARCANE_MANAGER_PORT | 8081 | Port for Manager WebSocket. |
-| CLUSTERING_EVAL_CADENCE_MS | 100 | Interval in ms between IClusteringModel.evaluate() calls. |
+| CLUSTERING_EVAL_CADENCE_MS | 100 | Interval in ms between `build_partition_decisions` (partition) evaluation cycles. |
 | HANDOFF_DEADLINE_MS | 200 | Deadline sent to clients in CLUSTER_REASSIGN; client should complete handoff within this ms. |
 | SPACETIMEDB_URI | — | SpacetimeDB connection URI. |
-| (See IF-01, IF-02 for model and pool config.) | | |
+| (See IF-02 for pool config; partition/predictor tuning lives in `AffinityConfig`, `arcane-affinity/src/config.rs`. The former IF-01 model config is superseded — see ADR-004.) | | |
 
 ---
 
@@ -159,8 +163,8 @@ ArcaneManager writes **cluster topology** (which clusters exist, which are neigh
 | arcane_manager_assign_latency_ms | histogram | | Time from PLAYER_JOIN to CLUSTER_ASSIGN sent. |
 | arcane_manager_merge_total | counter | | Merge decisions executed. |
 | arcane_manager_split_total | counter | | Split decisions executed. |
-| arcane_manager_eval_duration_ms | histogram | | Time spent in IClusteringModel.evaluate() per tick. |
-| arcane_manager_eval_decisions_total | counter | type=merge\|split, reason= | Decisions returned by model (before guardrails). |
+| arcane_manager_eval_duration_ms | histogram | | Time spent in the partition evaluation cycle (`build_partition_decisions`) per tick. |
+| arcane_manager_eval_decisions_total | counter | type=merge\|split, reason= | Ownership flips proposed by the partition (before guardrails). |
 | arcane_manager_guardrail_rejected_total | counter | reason= | Decisions rejected by guardrails. |
 | arcane_manager_pool_available | gauge | | IServerPool.get_status().available (for visibility). |
 
@@ -171,7 +175,7 @@ ArcaneManager writes **cluster topology** (which clusters exist, which are neigh
 | Failure | Detection | Response |
 |---------|-----------|----------|
 | SpacetimeDB unreachable | Connection or subscription error | Retry with backoff; do not accept new PLAYER_JOIN until reconnected. Existing assignments remain in SpacetimeDB; Arcane Nodes may keep running. |
-| IClusteringModel.evaluate() throws or times out | Exception or wall-clock timeout | Log; skip this evaluation cycle; do not execute any decision. Next cycle runs on cadence. Optional: fallback to static rules if ML fails repeatedly. |
+| Partition evaluation cycle throws or times out | Exception or wall-clock timeout | Log; skip this evaluation cycle; do not execute any decision. Next cycle runs on cadence. The `HeuristicPredictor` rule-based baseline is always available as the deterministic fallback. |
 | IServerPool.allocate() fails (pool exhausted) | PoolError returned | Do not create new cluster; reject or queue PLAYER_JOIN (implementation choice). Emit metric; alert. |
 | Manager WebSocket client disconnect | Connection close | Treat as PLAYER_LEAVE if not already; update SpacetimeDB; optionally release cluster if empty. |
 | ArcaneManager process crash | — | No in-memory state; all authoritative state is in SpacetimeDB. Warm standby or new process can start, subscribe to SpacetimeDB, and resume. Clients that lost Manager connection reconnect and send PLAYER_JOIN; get CLUSTER_ASSIGN. |

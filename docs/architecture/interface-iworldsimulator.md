@@ -1,6 +1,8 @@
 # IF-04 — IWorldSimulator
 **Unobserved Entity State Interface**
 
+> **Status: REMOVED (2026-07, arcane#291/#292).** No implementer ever existed; the trait and world_simulator module were deleted. This spec is retained as design history.
+
 ---
 
 | | |

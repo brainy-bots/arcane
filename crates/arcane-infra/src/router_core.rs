@@ -260,6 +260,18 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
     let mut sorted_clusters: Vec<_> = clusters.into_iter().collect();
     sorted_clusters.sort();
 
+    // Bucket owner -> its owned entities ONCE (O(N)) instead of rescanning the
+    // whole assignments map for every cluster (which made this O(clusters x
+    // entities) — the dominant cost on the #289 every-cluster-every-cycle path).
+    // Each cluster's owned list is then read directly and sorted once.
+    let mut owned_by_cluster: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (entity_id, owner) in input.assignments {
+        owned_by_cluster.entry(*owner).or_default().push(*entity_id);
+    }
+    for owned in owned_by_cluster.values_mut() {
+        owned.sort();
+    }
+
     let mut docs = Vec::new();
     for cluster_id in sorted_clusters {
         let flips: Vec<OwnershipFlip> = input
@@ -269,13 +281,15 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
             .filter(|f| f.from_cluster == cluster_id || f.to_cluster == cluster_id)
             .collect();
 
+        let owned: Vec<Uuid> = owned_by_cluster
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_default();
+
         // Interest candidates: foreign neighbors of owned entities, dedup by
         // max p. p only — tier assignment is the worker's rate-law job.
         let mut interest: HashMap<Uuid, InterestEntry> = HashMap::new();
-        for (entity_id, owner) in input.assignments {
-            if *owner != cluster_id {
-                continue;
-            }
+        for entity_id in &owned {
             for (neighbor_id, weight) in input.interaction_graph.neighbors(*entity_id) {
                 let neighbor_owner = input.assignments.get(&neighbor_id).copied();
                 if neighbor_owner == Some(cluster_id) {
@@ -321,14 +335,6 @@ pub fn build_routing_docs(input: &RouterInput) -> Vec<(Uuid, crate::routing_tabl
         }
         let mut interest: Vec<InterestEntry> = interest.into_values().collect();
         interest.sort_by_key(|e| e.entity_id);
-
-        let mut owned: Vec<Uuid> = input
-            .assignments
-            .iter()
-            .filter(|(_, owner)| **owner == cluster_id)
-            .map(|(id, _)| *id)
-            .collect();
-        owned.sort();
 
         docs.push((
             cluster_id,
