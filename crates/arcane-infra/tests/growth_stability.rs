@@ -35,15 +35,20 @@ impl SeededRandom {
         ((self.seed as f64) / (u32::MAX as f64)).clamp(0.0, 1.0)
     }
 
-    /// Random walk step in a shared arena (±5 units per dimension).
-    fn walk_step(&mut self, current: Vec3) -> Vec3 {
+    /// Random walk step (±5 units per dimension) INSIDE the entity's group
+    /// arena: positions clamp to ±40 around the group center, so groups stay
+    /// spatially coherent and distinct (proximity radius 50 covers a group,
+    /// never the 2000-unit gap between groups). The original [-100,100]
+    /// world-clamp teleported every entity into one origin blob after one
+    /// step, destroying the structure the test is about.
+    fn walk_step(&mut self, current: Vec3, center: Vec3) -> Vec3 {
         let dx = (self.next() - 0.5) * 10.0;
         let dy = (self.next() - 0.5) * 2.0;
         let dz = (self.next() - 0.5) * 10.0;
         Vec3::new(
-            (current.x + dx).clamp(-100.0, 100.0),
+            (current.x + dx).clamp(center.x - 40.0, center.x + 40.0),
             (current.y + dy).clamp(-10.0, 10.0),
-            (current.z + dz).clamp(-100.0, 100.0),
+            (current.z + dz).clamp(center.z - 40.0, center.z + 40.0),
         )
     }
 }
@@ -74,6 +79,7 @@ fn growth_stability_no_reabsorb() {
     let mut entity_positions: HashMap<Uuid, Vec3> = HashMap::new();
     let mut entity_rng: HashMap<Uuid, SeededRandom> = HashMap::new();
     let mut entity_arrival_cycle: HashMap<Uuid, usize> = HashMap::new();
+    let mut entity_group_center: HashMap<Uuid, Vec3> = HashMap::new();
 
     // Snapshot tracking for assertions.
     let mut cluster_count_history: Vec<usize> = Vec::new();
@@ -97,15 +103,12 @@ fn growth_stability_no_reabsorb() {
             let member_offset_x = (member_idx % 4) as f64 * 3.0;
             let member_offset_z = (member_idx / 4) as f64 * 3.0;
 
-            let spawn_pos = Some(Vec3::new(
-                group_x + member_offset_x,
-                0.0,
-                group_z + member_offset_z,
-            ));
+            let pos = Vec3::new(group_x + member_offset_x, 0.0, group_z + member_offset_z);
 
-            if let Some(cluster) = runtime.manager().place_new_entity(spawn_pos) {
+            if let Some(cluster) = runtime.manager().place_new_entity(Some(pos)) {
                 entity_ids.push(entity_id);
-                entity_positions.insert(entity_id, spawn_pos.unwrap());
+                entity_positions.insert(entity_id, pos);
+                entity_group_center.insert(entity_id, Vec3::new(group_x, 0.0, group_z));
                 entity_rng.insert(
                     entity_id,
                     SeededRandom::new((entity_id.as_u128() % 1000) as u32),
@@ -113,7 +116,7 @@ fn growth_stability_no_reabsorb() {
                 entity_arrival_cycle.insert(entity_id, cycle);
 
                 // Update entity in manager.
-                runtime.update_entity(entity_id, cluster, spawn_pos.unwrap());
+                runtime.update_entity(entity_id, cluster, pos);
             }
         }
 
@@ -121,8 +124,11 @@ fn growth_stability_no_reabsorb() {
         let mut new_positions: HashMap<Uuid, Vec3> = HashMap::new();
         for entity_id in &entity_ids {
             if let Some(current) = entity_positions.get(entity_id) {
-                if let Some(rng) = entity_rng.get_mut(entity_id) {
-                    let new_pos = rng.walk_step(*current);
+                if let (Some(rng), Some(center)) = (
+                    entity_rng.get_mut(entity_id),
+                    entity_group_center.get(entity_id),
+                ) {
+                    let new_pos = rng.walk_step(*current, *center);
                     new_positions.insert(*entity_id, new_pos);
                 }
             }
@@ -174,6 +180,23 @@ fn growth_stability_no_reabsorb() {
         // Check if a new cluster opened.
         if cluster_count_history.len() >= 2 {
             if let Some(&prev_count) = cluster_count_history.get(cluster_count_history.len() - 2) {
+                if cluster_count != prev_count {
+                    // Diagnostic: per-cluster sizes on every count change.
+                    let mut sizes: HashMap<Uuid, usize> = HashMap::new();
+                    for c in current_assignments.values() {
+                        *sizes.entry(*c).or_insert(0) += 1;
+                    }
+                    let mut sizes_v: Vec<(Uuid, usize)> = sizes.into_iter().collect();
+                    sizes_v.sort();
+                    eprintln!(
+                        "[diag] cycle {cycle}: count {prev_count} -> {cluster_count}, n={}, sizes={:?}",
+                        entity_ids.len(),
+                        sizes_v
+                            .iter()
+                            .map(|(c, s)| (c.as_u128(), *s))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 if cluster_count > prev_count {
                     cluster_openings.push((cycle, cluster_count));
                 }
@@ -183,9 +206,7 @@ fn growth_stability_no_reabsorb() {
         // Monotone check: cluster count should not show sustained decreases during growth.
         // Allow transient 1-cycle dips (immediate close after open from place_new_entity correction),
         // but flag persistent regressions (2+ consecutive decreases) as the reabsorb bug.
-        if entity_ids.len() > entity_ids.len().saturating_sub(ARRIVAL_INTERVAL)
-            && cluster_count_history.len() >= 3
-        {
+        if cluster_count_history.len() >= 3 {
             let curr = cluster_count_history[cluster_count_history.len() - 1];
             let prev1 = cluster_count_history[cluster_count_history.len() - 2];
             let prev2 = cluster_count_history[cluster_count_history.len() - 3];
@@ -213,18 +234,16 @@ fn growth_stability_no_reabsorb() {
             }
         }
     }
-    // Flag rapid oscillation: cluster opens, closes, reopens within 20 cycles (suspicious pattern).
-    // This catches the live symptom of failed splits, while allowing for placement corrections.
+    // Rapid oscillation (open → close → reopen within 15 cycles) IS the
+    // create-then-reabsorb symptom this test exists to prevent — hard failure.
     for i in 0..churn_windows.len().saturating_sub(1) {
         let (open1, close1) = churn_windows[i];
         let (open2, _close2) = churn_windows[i + 1];
-        let rapid_oscillation = (open2 - open1) <= 15; // Multiple opens within 15 cycles = churn
-        if rapid_oscillation {
-            eprintln!(
-                "WARN: Cluster oscillation detected: open at {}, close at {}, reopen at {} (within 15 cycles)",
-                open1, close1, open2
-            );
-        }
+        assert!(
+            (open2 - open1) > 15,
+            "create-then-reabsorb: cluster opened at cycle {open1}, closed at {close1}, \
+             reopened at {open2} (within 15 cycles) — the epic #293 live symptom"
+        );
     }
 
     // **Assertion 3: Starts at one.**
@@ -282,26 +301,30 @@ fn growth_stability_no_reabsorb() {
     }
     longest_steady = longest_steady.max(current_steady);
 
-    // In steady state, expect <5% of the window to be migrations (loose threshold, high variance okay).
-    if longest_steady > 50 {
-        let steady_migrations = if cluster_openings.is_empty() {
-            migration_count // All migrations are in a steady phase
-        } else {
-            // Rough estimate: migrations in the longest steady window.
-            // For a tighter assertion, we'd track per-window migrations.
-            // Here we just verify the global ratio is not pathological.
-            migration_count / 2 // Conservative: assume worst-case half are in steady state
-        };
+    // **Assertion 7: the count actually GROWS (the epic's headline).**
+    // With the calibrated onset s* ≈ (β/(1.5α))² ≈ 64 and N=100 grouped
+    // arrivals, at least one split must have happened and held.
+    assert!(
+        !cluster_openings.is_empty(),
+        "no cluster ever opened across {} arrivals — count never emerged from load",
+        N
+    );
+    let final_count = cluster_count_history.last().copied().unwrap_or(0);
+    assert!(
+        final_count >= 2,
+        "final cluster count {} — the growth scenario must end split (≥ 2)",
+        final_count
+    );
 
-        let max_allowed_steady_migrations = (longest_steady / 5).max(1); // 20% threshold (relaxed)
-                                                                         // Allow for test variance; focus on catastrophic churn only
-        if steady_migrations > max_allowed_steady_migrations * 3 {
-            eprintln!(
-                "WARN: Steady-state phase (longest window: {} cycles) had significant migrations ({})",
-                longest_steady, steady_migrations
-            );
-        }
-    }
+    // A long steady window existing at all is itself the stability signal:
+    // the final configuration must HOLD (no open/close flapping at the end).
+    // The per-window migration-rate assertion needs per-window tracking to be
+    // honest; the global migration bound (assertion 5) covers pathology.
+    assert!(
+        longest_steady >= 50,
+        "no steady window ≥ 50 cycles in {} cycles of history — the partition never settled",
+        cluster_count_history.len()
+    );
 
     eprintln!(
         "✓ Growth stability test passed:\n  \
