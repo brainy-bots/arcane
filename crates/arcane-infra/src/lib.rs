@@ -20,6 +20,7 @@ pub mod manager;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
 pub mod node;
+pub mod parking;
 pub mod redis_channel;
 pub mod replication_channel_manager;
 pub mod rpc_handler;
