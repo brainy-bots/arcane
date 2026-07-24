@@ -325,7 +325,7 @@ fn build_partition_decisions(
     } else {
         std::collections::HashSet::new()
     };
-    let refined_partition = refine(
+    let mut refined_partition = refine(
         &partition,
         &input.edges,
         num_partitions,
@@ -337,6 +337,27 @@ fn build_partition_decisions(
             moved_in_seed,
         },
     );
+
+    // Split pass (epic #293 follow-up): the global move single-entity
+    // refinement cannot make. A consolidated blob above the split onset is a
+    // LOCAL minimum for per-entity moves (the first mover pays cut + β + μ
+    // for ~√n relief); this pass bisects the crowded partition's subgraph
+    // and adopts the bisection iff the REAL ΔJ (cut created + β + μ·movers
+    // − crowding saved) is strictly negative. One split per cycle; the
+    // migration guardrails pace the resulting flip wave. Live-observed
+    // failure this fixes: 100% of ~300 mingled players ratcheted onto one
+    // cluster and no per-entity move could ever leave.
+    if let Some(report) = arcane_affinity::split::split_pass(
+        &mut refined_partition,
+        &input.edges,
+        num_partitions,
+        &config.objective,
+    ) {
+        eprintln!(
+            "[split] partition {} -> {}: {} movers, dJ={:.1}",
+            report.source, report.target, report.movers, report.delta_j
+        );
+    }
 
     // Map partition indices to cluster ids deterministically and INJECTIVELY:
     // two partitions must never map to the same cluster (the old plurality-only
