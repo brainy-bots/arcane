@@ -451,6 +451,14 @@ on an already-replicating node — no in-process `ServerPool` shuffle (the old
 Guardrails (cooldown, rate limit, CPU cap, max in-flight) gate the flip. See the
 migration executor epic (#207).
 
+### 8.1 Session end as first-class lifecycle (added 2026-07-24)
+
+**Implementation status:** Entity session lifecycle (epic #305) formalizes connect/disconnect/reconnect/leave paths as platform primitives. Session end (the leave transition) is now first-class in the control layer: when a client explicitly ends a session or the server times out an idle connection, the entity is released from its owning cluster and may be recovered (L2+) or expired (L0/L1). The player entity transitions from "owned and replicated" to "released," freeing the entity slot in the cluster and notifying SpacetimeDB (if L2+) that recovery state is final.
+
+**Anti-resurrection guarantee:** Once session-end fires for a player entity, replication to that entity stops and the entity is no longer owned by any cluster. A reconnecting client cannot "resurrect" an old entity; instead, they receive a fresh entity loaded from SpacetimeDB (L2+) or cold-start from L0 defaults (L0/L1). This prevents the "invisible ghost player" failure mode where a stale entity remains partially replicated to old clusters after the real entity has moved on.
+
+**SpacetimeDB's cold-restart role formalized:** SpacetimeDB is the `IPersistence` backend for L2+ games. It serves a single, focused role: when a cluster starts from cold (after a crash or full restart), SpacetimeDB answers "which entities belong in my region?" The entities returned are hydrated into the cluster as owned state. Bucket 4 is read *once* at cold-start, never on the hot path. Live state flows through Redis (bucket 1/2); SpacetimeDB is a crash-recovery snapshot, not a live coordinator. This role is now explicitly contractual between the control layer and the persistence layer via the `IPersistence` trait.
+
 ---
 
 ## 9. Cluster lifecycle (Plane 2) — orthogonal, infra-driven
