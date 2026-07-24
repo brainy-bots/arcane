@@ -806,30 +806,21 @@ impl NodeCore {
             // parked key is still valid (within ARCANE_RECONNECT_TTL_SECS) should
             // still rehydrate and enter spawn-grace.
             //
-            // Only probe Redis on first contact (this id absent from
-            // `client_driven_last_seen`, cleared on leave) — never on steady-state
-            // per-tick updates. `drain_inputs` is documented non-blocking/sans-IO;
-            // calling `unpark_entity` (fresh Redis connection) unconditionally here
-            // would turn every client update, every tick, into a blocking network
-            // round-trip.
-            let is_first_contact = !self.client_driven_last_seen.contains_key(&entity_id);
-            if is_first_contact {
-                if let Some(parked_snapshot) =
-                    crate::parking::unpark_entity(&self.redis_url, entity_id)
-                {
-                    self.spawn_grace.insert(entity_id, self.tick_count);
-                    if let Some(parked_user_data) = parked_snapshot.get("user_data") {
-                        entry.user_data = parked_user_data.clone();
-                        eprintln!(
-                            "[rehydrate] entity {} user_data restored from parked snapshot",
-                            entity_id
-                        );
-                    }
-                } else if was_departed {
-                    // Tombstone was present but no parked snapshot (TTL expired).
-                    // Treat as fresh spawn.
-                    self.spawn_grace.insert(entity_id, self.tick_count);
-                }
+            // Only probe Redis on first contact (`should_probe_parking`) — never on
+            // steady-state per-tick updates. `drain_inputs` is documented
+            // non-blocking/sans-IO; calling `unpark_entity` (fresh Redis connection)
+            // unconditionally here would turn every client update, every tick, into
+            // a blocking network round-trip.
+            if should_probe_parking(&self.client_driven_last_seen, entity_id) {
+                let parked_snapshot = crate::parking::unpark_entity(&self.redis_url, entity_id);
+                apply_parked_snapshot(
+                    &mut entry,
+                    &mut self.spawn_grace,
+                    entity_id,
+                    self.tick_count,
+                    was_departed,
+                    parked_snapshot,
+                );
             }
             self.client_driven_last_seen
                 .insert(entity_id, self.tick_count);
@@ -1361,6 +1352,52 @@ impl NodeCore {
     }
 }
 
+/// L1 rehydration gate (epic #305, issue #321): should this client update probe
+/// the Redis parked-key for `entity_id`? Only on first contact — this id absent
+/// from `client_driven_last_seen` (cleared on leave). `drain_inputs` is
+/// documented non-blocking/sans-IO; probing on every steady-state per-tick
+/// update would turn a per-reconnect Redis touch into a per-entity-per-tick
+/// blocking network round-trip.
+#[cfg(feature = "migration")]
+fn should_probe_parking(client_driven_last_seen: &HashMap<Uuid, u64>, entity_id: Uuid) -> bool {
+    !client_driven_last_seen.contains_key(&entity_id)
+}
+
+/// L1 rehydration outcome (epic #305, issue #321): given the result of probing
+/// the parked key (already fetched by the caller — this function does no I/O),
+/// decide whether to restore `user_data` and/or admit into spawn-grace.
+/// Decoupled from `was_departed` (the anti-resurrection tombstone) — a parked
+/// snapshot rehydrates regardless of tombstone state; the tombstone only
+/// covers the fallback fresh-spawn-grace case when no snapshot remains.
+#[cfg(feature = "migration")]
+fn apply_parked_snapshot(
+    entry: &mut EntityStateEntry,
+    spawn_grace: &mut HashMap<Uuid, u64>,
+    entity_id: Uuid,
+    tick_count: u64,
+    was_departed: bool,
+    parked_snapshot: Option<serde_json::Value>,
+) {
+    match parked_snapshot {
+        Some(snapshot) => {
+            spawn_grace.insert(entity_id, tick_count);
+            if let Some(parked_user_data) = snapshot.get("user_data") {
+                entry.user_data = parked_user_data.clone();
+                eprintln!(
+                    "[rehydrate] entity {} user_data restored from parked snapshot",
+                    entity_id
+                );
+            }
+        }
+        None if was_departed => {
+            // Tombstone was present but no parked snapshot (TTL expired).
+            // Treat as fresh spawn.
+            spawn_grace.insert(entity_id, tick_count);
+        }
+        None => {}
+    }
+}
+
 /// D1 forwarding invariant (epic #287), #289 record-based: decide where an
 /// inbound client input for `entity_id` must go — from the RECORDS this node
 /// holds, not from a folded event map.
@@ -1623,6 +1660,8 @@ mod tests {
     #[cfg(feature = "migration")]
     use super::apply_inbox_frame;
     use super::merge_with_neighbor_latest;
+    #[cfg(feature = "migration")]
+    use super::{apply_parked_snapshot, should_probe_parking};
     #[cfg(feature = "migration")]
     use crate::node_inbox::NodeInboxFrame;
     use arcane_core::replication_channel::{EntityStateDelta, EntityStateEntry};
@@ -1969,6 +2008,106 @@ mod tests {
         drop(rx);
         let (_tx2, _rx2) = std::sync::mpsc::channel::<()>();
         let _ = _tx2.send(()); // Immediate return, no Future, no .await possible.
+    }
+
+    /// Issue #321: `unpark_entity` (Redis I/O) must be probed only on first
+    /// contact — never on steady-state per-tick updates for an id already in
+    /// `client_driven_last_seen`. This is the exact defect that shipped in
+    /// PR #323's first commit (01332d2): the gate was removed entirely, so
+    /// every client update, every tick, opened a fresh Redis connection.
+    #[cfg(feature = "migration")]
+    #[test]
+    fn should_probe_parking_only_on_first_contact() {
+        let entity_id = Uuid::from_u128(1);
+        let empty: HashMap<Uuid, u64> = HashMap::new();
+        assert!(
+            should_probe_parking(&empty, entity_id),
+            "an id never seen before must probe (join / reconnect path)"
+        );
+
+        let mut seen: HashMap<Uuid, u64> = HashMap::new();
+        seen.insert(entity_id, 42u64);
+        assert!(
+            !should_probe_parking(&seen, entity_id),
+            "an id already in client_driven_last_seen is steady-state and must NOT re-probe Redis"
+        );
+    }
+
+    /// A parked snapshot rehydrates `user_data` and admits into spawn-grace,
+    /// regardless of `was_departed` (the anti-resurrection tombstone is a
+    /// separate, decoupled lifetime — issue #321's core fix).
+    #[cfg(feature = "migration")]
+    #[test]
+    fn apply_parked_snapshot_rehydrates_regardless_of_tombstone_state() {
+        let entity_id = Uuid::from_u128(2);
+        let cluster_id = Uuid::from_u128(20);
+        let mut spawn_grace: HashMap<Uuid, u64> = HashMap::new();
+        let mut entry = mk_entry(entity_id, cluster_id, 1.0);
+        let snapshot = serde_json::json!({ "user_data": { "level": 7 } });
+
+        // Tombstone already pruned (was_departed = false) — the exact gap #321
+        // reported: reconnect after tombstone expiry but within the parked TTL.
+        apply_parked_snapshot(
+            &mut entry,
+            &mut spawn_grace,
+            entity_id,
+            10u64,
+            false,
+            Some(snapshot),
+        );
+
+        assert_eq!(
+            entry.user_data["level"].as_i64().unwrap(),
+            7,
+            "user_data must be restored from the parked snapshot"
+        );
+        assert!(
+            spawn_grace.contains_key(&entity_id),
+            "rehydrated entity must be admitted into spawn-grace"
+        );
+    }
+
+    /// No parked snapshot but the tombstone was present: TTL has definitively
+    /// expired — treat as a fresh spawn (admit into spawn-grace, no rehydrate).
+    #[cfg(feature = "migration")]
+    #[test]
+    fn apply_parked_snapshot_fresh_spawn_when_departed_but_unparked() {
+        let entity_id = Uuid::from_u128(3);
+        let cluster_id = Uuid::from_u128(30);
+        let mut spawn_grace: HashMap<Uuid, u64> = HashMap::new();
+        let mut entry = mk_entry(entity_id, cluster_id, 1.0);
+        let original_user_data = entry.user_data.clone();
+
+        apply_parked_snapshot(&mut entry, &mut spawn_grace, entity_id, 10u64, true, None);
+
+        assert_eq!(
+            entry.user_data, original_user_data,
+            "no snapshot to restore from"
+        );
+        assert!(
+            spawn_grace.contains_key(&entity_id),
+            "tombstoned-but-unparked reconnect still admits into spawn-grace as a fresh spawn"
+        );
+    }
+
+    /// Neither parked nor previously departed: an ordinary first-sight update
+    /// for an id nobody has a record of — no-op (the new-spawn path in
+    /// `forward_target` handles genuinely new entities; this function must
+    /// not spuriously admit them into spawn-grace).
+    #[cfg(feature = "migration")]
+    #[test]
+    fn apply_parked_snapshot_noop_when_neither_parked_nor_departed() {
+        let entity_id = Uuid::from_u128(4);
+        let cluster_id = Uuid::from_u128(40);
+        let mut spawn_grace: HashMap<Uuid, u64> = HashMap::new();
+        let mut entry = mk_entry(entity_id, cluster_id, 1.0);
+
+        apply_parked_snapshot(&mut entry, &mut spawn_grace, entity_id, 10u64, false, None);
+
+        assert!(
+            !spawn_grace.contains_key(&entity_id),
+            "must not admit into spawn-grace with no parked snapshot and no prior departure"
+        );
     }
 
     #[cfg(feature = "migration")]
