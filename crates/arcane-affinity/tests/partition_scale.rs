@@ -117,9 +117,9 @@ fn partition_assigns_every_entity_once() {
 /// NOTE ON DESIGN: with `capacity = 0` (unbounded) the greedy partitioner deliberately **packs
 /// everything into one partition** — this is the design's "pack maximally, then split only under
 /// resource pressure" policy (`meta-control-layer.md` §5), NOT a bug. Balance/spread across nodes
-/// is therefore driven by capacity (the resource ceiling), which is what this test exercises.
-/// (The Manager currently passes `capacity = 0`; wiring a real per-node capacity so multi-node
-/// spread actually happens is tracked as follow-on work — see the test module docs.)
+/// is now driven by the objective function (epic #293) — `J = cut + α·Σ|S|^γ + β·open + μ·moves` —
+/// where the cost terms `β·open` (instance cost) and `α·Σ|S|^γ` (crowding penalty) encode the packing
+/// and resource-pressure split decisions. This test exercises the capacity-constrained case.
 #[test]
 fn partition_is_balanced_under_capacity() {
     let n = 4000;
