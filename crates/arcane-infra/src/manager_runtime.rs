@@ -603,16 +603,21 @@ mod tests {
         RouterConfig::default()
     }
 
-    /// Founder-observed in the viz crossing scenario: TWO parked groups
-    /// 1800u apart (no cross-group interaction at all while parked) ended
-    /// with ALL EIGHT entities on one cluster. Two spatially separate
-    /// communities must land on two clusters — total consolidation of
-    /// non-interacting groups is a partitioning failure regardless of any
-    /// cohesion-vs-balance policy. Groups of FOUR matter: the 6-player
-    /// matrix `cluster` phase (groups of 3, capacity 3) passes; groups of
-    /// 4 exceed the derived capacity and hit the repair/refinement paths.
+    /// HISTORY: this test originally asserted the OPPOSITE — that two parked
+    /// groups of four 1800u apart must land on two clusters. That was correct
+    /// under the pre-#293 design (imposed k, population-relative capacity,
+    /// balance-toward-mean): consolidation was a partitioning failure because
+    /// nothing else priced load. Epic #293 replaces that policy with explicit
+    /// economics: an instance costs β, and 8 total players are far below the
+    /// split onset s* ≈ (β/(1.5α))² ≈ 64 — splitting 8 into 4+4 saves
+    /// α·(8^1.5−2·4^1.5) ≈ 8.3 crowding but costs β = 15. One cluster for 8
+    /// players IS the designed outcome now ("never boot a UE5 instance for a
+    /// trivial group"). The anti-consolidation guarantee moved to the growth
+    /// property: `emergent_cluster_count_monotone` (arcane-affinity) pins the
+    /// split onset in [20, 120], so real crowds DO spread. This test now pins
+    /// the economics floor: sub-onset populations consolidate and STAY.
     #[test]
-    fn two_parked_groups_of_four_do_not_collapse_onto_one_cluster() {
+    fn two_parked_groups_of_four_stay_on_one_cluster_below_instance_economics() {
         let bus = InMemoryInboxBus::new();
         let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
         runtime.set_observation_radius(500.0);
@@ -689,10 +694,12 @@ mod tests {
 
         assert_eq!(east_owners.len(), 1, "east group should co-locate");
         assert_eq!(west_owners.len(), 1, "west group should co-locate");
-        assert!(
-            all_owners.len() >= 2,
-            "two non-interacting groups 1800u apart must NOT share one cluster \
-             (founder-observed total consolidation)"
+        assert_eq!(
+            all_owners.len(),
+            1,
+            "8 players are below the instance-opening economics (s* ≈ 64 with \
+             default α/β): they must consolidate onto ONE cluster, not pay β \
+             for a second instance"
         );
     }
 

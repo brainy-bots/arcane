@@ -1,14 +1,23 @@
 use crate::interaction_graph::Colocation;
+use crate::objective::{crowding_marginal, ObjectiveWeights};
 use crate::partition::{Partition, WeightedEdge};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Configuration for KL/FM-style local refinement.
-#[derive(Clone, Copy, Debug)]
+/// Configuration for KL/FM-style local refinement (epic #293).
+#[derive(Clone, Debug)]
 pub struct RefineConfig {
     pub max_passes: usize,
+    /// Legacy hard cap, still ENFORCED when > 0 (single moves refuse a full
+    /// target; swaps stay size-neutral). The objective path passes 0: with
+    /// alpha live, crowding pressure replaces the hard cap (epic #293).
     pub capacity: usize,
     pub min_gain: f64,
+    /// Objective weights: balance cut, crowding, instance cost, and churn.
+    pub weights: ObjectiveWeights,
+    /// Entities that were moved from their standing assignment during seed phase.
+    /// Refinement applies μ (move cost) only to entities not in this set.
+    pub moved_in_seed: std::collections::HashSet<Uuid>,
 }
 
 impl Default for RefineConfig {
@@ -17,6 +26,8 @@ impl Default for RefineConfig {
             max_passes: 4,
             capacity: 0,
             min_gain: 0.0,
+            weights: ObjectiveWeights::default(),
+            moved_in_seed: std::collections::HashSet::new(),
         }
     }
 }
@@ -258,7 +269,40 @@ pub fn refine(
                         continue;
                     }
 
-                    let gain = external[target_part] - internal;
+                    // Objective-driven gain (epic #293): ΔJ = Δcut + Δcrowding + Δopen − μ.
+                    // Cut gain: positive if reducing cut cost.
+                    let cut_gain = external[target_part] - internal;
+
+                    // Crowding gain: moving v from A (size a) to B (size b) saves the
+                    // a−1→a marginal at the source and pays the b→b+1 marginal at the
+                    // target: alpha·(a^γ − (a−1)^γ) − alpha·((b+1)^γ − b^γ).
+                    let crowding_gain =
+                        crowding_marginal(
+                            partition_sizes[entity_part].saturating_sub(1),
+                            &config.weights,
+                        ) - crowding_marginal(partition_sizes[target_part], &config.weights);
+
+                    // Open cost deltas: β·(change in #non-empty clusters)
+                    let open_delta = if partition_sizes[entity_part] == 1 {
+                        // Current partition becomes empty; save its open cost
+                        config.weights.beta
+                    } else {
+                        0.0
+                    } - if partition_sizes[target_part] == 0 {
+                        // Target partition becomes non-empty; incur its open cost
+                        config.weights.beta
+                    } else {
+                        0.0
+                    };
+
+                    // Move cost: μ if entity has not moved yet in seed phase
+                    let move_cost = if config.moved_in_seed.contains(entity) {
+                        0.0
+                    } else {
+                        config.weights.mu
+                    };
+
+                    let gain = cut_gain + crowding_gain + open_delta - move_cost;
                     if gain <= config.min_gain {
                         continue;
                     }
@@ -302,6 +346,10 @@ pub fn refine(
                         // A swap is size-neutral (A leaves part_a as B enters it, and vice versa),
                         // so it can never violate capacity when the starting partition is valid.
                         // No capacity check is needed here (unlike single moves).
+                        // Size-neutrality also cancels the crowding and open terms of ΔJ,
+                        // so the cut-only gain below IS the objective gain up to μ; swaps
+                        // only run for legacy constrained configs (capacity/min_gain > 0),
+                        // never on the objective path (capacity 0, min_gain 0).
                         let gain = match gain_pair_swap_adj(
                             *entity_a, part_a, *entity_b, part_b, &current, &adj,
                         ) {
@@ -662,6 +710,7 @@ mod tests {
             max_passes: 8,
             capacity: 2,
             min_gain: 0.0,
+            ..RefineConfig::default()
         };
         let refined = refine(&start, &edges, 2, &cfg);
         assert_eq!(

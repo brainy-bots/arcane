@@ -25,9 +25,6 @@ pub struct AffinityConfig {
     // Prediction gain: multiplier for predicted p when blending into edge weight.
     pub prediction_gain: f64,
 
-    // Capacity: factor applied to ceil(n/k) to get per-cluster limit.
-    pub capacity_factor: f64,
-
     // Screening: spatial convergence detection.
     pub screen_radius_factor: f64,
     pub screen_min_closing_speed: f64,
@@ -56,6 +53,10 @@ pub struct AffinityConfig {
     /// are repaired minimally before refinement. false = the old
     /// from-scratch behavior (A/B).
     pub seed_from_current: bool,
+
+    /// Partition objective weights (epic #293): the cost model that balances
+    /// cut, crowding, instance cost, and churn.
+    pub objective: super::objective::ObjectiveWeights,
 }
 
 impl Default for AffinityConfig {
@@ -70,8 +71,6 @@ impl Default for AffinityConfig {
 
             prediction_gain: 1.0,
 
-            capacity_factor: 1.5,
-
             screen_radius_factor: 4.0,
             screen_min_closing_speed: 1.0,
 
@@ -83,6 +82,8 @@ impl Default for AffinityConfig {
             pin_feature: None,
 
             seed_from_current: true,
+
+            objective: Default::default(),
         }
     }
 }

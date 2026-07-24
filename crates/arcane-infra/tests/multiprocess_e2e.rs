@@ -96,7 +96,6 @@ fn spawn_manager() -> std::io::Result<Proc> {
         .env("MANAGER_HTTP_PORT", "9091") // NOT 9081: node A's stats HTTP sits on ws_port+1
         .env("REDIS_URL", REDIS_URL)
         .env("MANAGER_CADENCE_MS", "300")
-        .env("MANAGER_JOIN_POLICY", "first-cluster")
         .env("MANAGER_CAPACITY_FACTOR", "1.0") // force even spread: with 2 clusters and 2+ entities, A cannot keep both
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
