@@ -108,7 +108,7 @@ mod tests {
             Vec3::new(0.0, 0.0, 0.0),
         );
 
-        mock.snapshot(&[entry.clone()]);
+        mock.snapshot(std::slice::from_ref(&entry));
 
         let calls = mock.snapshot_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);

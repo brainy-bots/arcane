@@ -579,7 +579,7 @@ mod tests {
         };
 
         let entry = mk_entry(Uuid::from_u128(100), 1.0, 2.0, 3.0);
-        persist.snapshot(&[entry.clone()]);
+        persist.snapshot(std::slice::from_ref(&entry));
 
         let received = rx.try_recv().unwrap();
         assert_eq!(received.len(), 1);
