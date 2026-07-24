@@ -115,6 +115,7 @@ impl SimNode {
                 &mut self.spawn_grace,
                 &mut self.neighbor_entities,
                 &mut self.neighbor_last_seen,
+                &std::collections::HashMap::new(),
                 tick,
             );
             if let Some(statement) = report.statement {
