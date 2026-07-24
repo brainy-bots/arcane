@@ -367,8 +367,7 @@ fn build_partition_decisions(
             use std::sync::atomic::{AtomicU64, Ordering};
             static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
             let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
-            if nth.is_multiple_of(40) || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1")
-            {
+            if nth.is_multiple_of(40) || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1") {
                 eprintln!(
                     "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
                     r.source,
