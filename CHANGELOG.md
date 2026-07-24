@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Platform primitive #17:** Entity session lifecycle — first-class connect/disconnect/reconnect/leave paths with configurable persistence ladder. Games choose L0 (ephemeral), L1 (short-term reconnect, Redis TTL), L2 (durable, SpacetimeDB), or L3 (game-defined bucket-4 logic) via `ARCANE_PERSISTENCE` env var. See [`docs/arcane-platform-primitives.md`](docs/arcane-platform-primitives.md) #17 and epic #305.
+- **Persistence environment surface:** `ARCANE_PERSISTENCE` (ephemeral | short-term | full), `ARCANE_RECONNECT_TTL_SECS`, `NODE_CLIENT_IDLE_TIMEOUT_SECS`. See [`docs/architecture/progressive-api.md`](docs/architecture/progressive-api.md) §2.1.
+- **Meta Control Layer §8.1:** Session end is now first-class lifecycle (leave path, anti-resurrection guarantee). SpacetimeDB's cold-restart role formalized as the `IPersistence` backend for L2+ games.
+
 ### Changed
 - **arcane-infra**: Renamed `ClusterServer` type to `ArcaneNode`; file `cluster_server.rs` → `node.rs`. "Node" is the industry-standard term for one server in a distributed fleet; "cluster" now unambiguously means the group of entities.
 - **clustering model**: The clustering decision is now a **global graph partition** (ADR-004), not a per-entity merge/split decision. `arcane_infra::manager::build_partition_decisions` derives weighted edges from the interaction graph, partitions (`GreedyGrowthPartitioner`), refines with KL/FM pair moves (`refine`), and maps partitions to cluster ids. The pluggable model seam is now `arcane_affinity::predictor::InteractionPredictor` (rule-based `HeuristicPredictor` today).

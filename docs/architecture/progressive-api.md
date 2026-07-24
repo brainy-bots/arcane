@@ -40,6 +40,28 @@ A small game lives at level 1 for its entire lifetime. A medium game adds level-
 
 ---
 
+## 2.1 Persistence and session lifecycle ladder (L0–L3)
+
+Entity persistence and session lifecycle management follow the same ladder shape as the broader persistence example above:
+
+| Level | Session lifecycle | Env surface | Recovery guarantee | Typical use |
+|-------|-------------------|-------------|------------------|---|
+| **L0** | Ephemeral — entity exists only while cluster is active; no recovery on crash. | `ARCANE_PERSISTENCE=ephemeral` (default) | None. Entity loss on crash. | Prototypes, session-only games, ammunition/visual effects |
+| **L1** | Short-term reconnect — entity parks in Redis with TTL; reconnect within window. `ARCANE_RECONNECT_TTL_SECS=300` (default 5m). | `ARCANE_PERSISTENCE=short-term` + `ARCANE_RECONNECT_TTL_SECS=<seconds>` + `NODE_CLIENT_IDLE_TIMEOUT_SECS=<seconds>` | Reconnect to same entity within TTL; loss after expiry. | Most games during development and live ops; player sessions, temporary items |
+| **L2** | Full durable — entity persists in SpacetimeDB; survives full cluster restart. | `ARCANE_PERSISTENCE=full` | Durable recovery across any cluster crash or graceful restart. | Live games, persistent player data, valuable items |
+| **L3** | Game-defined — game extends bucket 4 with custom persistence logic and triggers. | `ARCANE_PERSISTENCE=full` + custom reducer config | Custom recovery rules per entity type. | Games with genre-specific state (quest progress, faction rank, custom transactions) |
+
+All levels implement the session-lifecycle invariant: every entity has defined connect/disconnect/reconnect/leave paths (see [`four-bucket-state-model.md`](four-bucket-state-model.md)).
+
+Environment variables:
+- **`ARCANE_PERSISTENCE`**: `ephemeral` (L0, default) | `short-term` (L1) | `full` (L2+). Controls whether durable SpacetimeDB storage is enabled.
+- **`ARCANE_RECONNECT_TTL_SECS`**: How long a disconnected entity parks in Redis before expiry (L1). Default 300 (5 minutes). Ignored at L0 and L2+.
+- **`NODE_CLIENT_IDLE_TIMEOUT_SECS`**: How long a client can be idle before the server considers the session dead (L1 reconnection window closes, L2+ session ends). Default per cluster type. Interacts with reconnection TTL: a client idle longer than this window cannot reconnect, even within TTL.
+
+Note: `SPACETIMEDB_PERSIST=1` (pre-2026 env var) is honored for backwards compatibility, equivalent to `ARCANE_PERSISTENCE=full`.
+
+---
+
 ## 3. Other platform areas (ladder sketches)
 
 The same shape applies across the library. For each area, the current platform offers level 0/1 and leaves level 2+ as deferred work triggered by real use cases.
