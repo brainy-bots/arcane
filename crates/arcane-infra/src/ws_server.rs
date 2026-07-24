@@ -444,6 +444,7 @@ fn compute_visibility_masks(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_ws_server(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -456,6 +457,11 @@ pub fn run_ws_server(
     visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
     // D2 (epic #287): RECONNECT redirect directives from the node core.
     reconnect_rx: Receiver<ReconnectDirective>,
+    // Epic #305: clean-close trigger for the unified leave path. When a
+    // connection closes CLEANLY (Close frame or EOF — not an error; errors
+    // are crashes and belong to the idle timeout), the avatar entity it was
+    // driving is reported here so the node fast-forwards its idle clock.
+    session_closes_tx: Sender<Uuid>,
 ) {
     // Bound the encoding rayon pool BEFORE spawning the tokio runtime,
     // so the pool is ready by the time the first tick fires.
@@ -480,6 +486,7 @@ pub fn run_ws_server(
             stats,
             visibility_filter,
             reconnect_rx,
+            session_closes_tx,
         ));
     });
 }
@@ -487,6 +494,7 @@ pub fn run_ws_server(
 /// Global atomic counter for assigning unique subscriber IDs.
 static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
+#[allow(clippy::too_many_arguments)]
 async fn ws_loop(
     port: u16,
     state_rx: Receiver<EntityStateDelta>,
@@ -495,6 +503,7 @@ async fn ws_loop(
     stats: Arc<NodeStats>,
     visibility_filter: Option<Arc<dyn IVisibilityFilter>>,
     reconnect_rx: Receiver<ReconnectDirective>,
+    session_closes_tx: Sender<Uuid>,
 ) {
     // Broadcast carries a TickBroadcast — per-entity FlatBuffer chunks plus
     // delta header and removed-id list, plus precomputed visibility masks.
@@ -618,6 +627,7 @@ async fn ws_loop(
         let mut reconnect_recv = reconnect_btx.subscribe();
         let updates_tx = client_updates_tx.clone();
         let actions_tx = game_actions_tx.clone();
+        let closes_tx = session_closes_tx.clone();
         let stats = stats.clone();
         let avatars = subscriber_avatars.clone();
         // Whether AOI is active at all. When active, a subscriber with no mask is default-DENIED (sent the
@@ -627,6 +637,11 @@ async fn ws_loop(
         avatars.insert(subscriber_id, None);
 
         tokio::spawn(async move {
+            // Epic #305: whether this connection ended with a protocol-level
+            // close (Close frame / EOF) rather than an error. Only a clean
+            // close triggers the accelerated leave — an errored socket is a
+            // crash and stays on the full idle timeout.
+            let mut clean_close = false;
             loop {
                 tokio::select! {
                     result = recv.recv() => {
@@ -719,9 +734,15 @@ async fn ws_loop(
                                     avatars.insert(subscriber_id, Some(entity_id));
                                 }
                             }
-                            Some(Err(_)) | None => {
-                                // Subscriber disconnected; drop its AOI registration.
-                                avatars.remove(&subscriber_id);
+                            Some(Ok(Message::Close(_))) | None => {
+                                // Protocol-level close (Close frame or EOF): the
+                                // client MEANT to leave (epic #305 clean-close).
+                                clean_close = true;
+                                break;
+                            }
+                            Some(Err(_)) => {
+                                // Errored socket: a crash, not a leave. The idle
+                                // timeout owns this session's end.
                                 break;
                             },
                             // Text and other frame types are not part of the
@@ -729,6 +750,15 @@ async fn ws_loop(
                             _ => {}
                         }
                     }
+                }
+            }
+            // Epic #305: on a CLEAN close, report the avatar this connection
+            // was driving so the node fast-forwards its idle clock (the leave
+            // itself runs on the node's unified leave path). Best-effort: if
+            // the node loop is gone the whole process is ending anyway.
+            if clean_close {
+                if let Some(Some(avatar)) = avatars.get(&subscriber_id).map(|v| *v) {
+                    let _ = closes_tx.send(avatar);
                 }
             }
             // Drop this subscriber's AOI registration on task exit.

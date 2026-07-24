@@ -33,8 +33,12 @@ use arcane_infra::manager_runtime::ManagerRuntime;
 use arcane_infra::node_inbox::RedisInboxBus;
 use arcane_infra::router_core::RouterConfig;
 use arcane_infra::state_keys::RedisStateSource;
-use axum::{extract::State, routing::get, Json, Router};
-use serde::Serialize;
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -43,6 +47,12 @@ struct JoinResponse {
     cluster_id: String,
     server_host: String,
     server_port: u16,
+    #[serde(skip_serializing_if = "is_false")]
+    parked: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Parsed cluster registration.
@@ -77,6 +87,7 @@ struct ManagerState {
     policy: JoinPolicy,
     join_state: Arc<Mutex<JoinState>>,
     rr_counter: Arc<AtomicUsize>,
+    redis_url: String,
 }
 
 fn parse_clusters(s: &str) -> Result<Vec<ClusterReg>, String> {
@@ -118,6 +129,13 @@ fn parse_join_policy(s: &str) -> JoinPolicy {
 }
 
 /// Select join cluster based on policy.
+/// Query parameters for /join endpoint.
+#[derive(Debug, Deserialize)]
+struct JoinParams {
+    #[serde(default)]
+    entity_id: Option<String>,
+}
+
 fn select_join_cluster(
     policy: &JoinPolicy,
     join_state: &JoinState,
@@ -171,17 +189,32 @@ fn select_join_cluster(
     }
 }
 
-async fn join_handler(State(s): State<ManagerState>) -> Json<JoinResponse> {
+async fn join_handler(
+    State(s): State<ManagerState>,
+    Query(params): Query<JoinParams>,
+) -> Json<JoinResponse> {
     let join_state = s.join_state.lock().unwrap();
     let cluster_id = select_join_cluster(&s.policy, &join_state, &s.clusters, &s.rr_counter)
         .and_then(|id| s.clusters.iter().find(|c| c.id == id).cloned())
         .unwrap_or_else(|| s.clusters[0].clone());
     drop(join_state);
 
+    // Check if entity was parked (L1 short-term persistence, epic #305).
+    let parked = if let Some(entity_id_str) = params.entity_id {
+        if let Ok(entity_id) = Uuid::parse_str(&entity_id_str) {
+            arcane_infra::parking::is_entity_parked(&s.redis_url, entity_id)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     Json(JoinResponse {
         cluster_id: cluster_id.id.to_string(),
         server_host: cluster_id.host,
         server_port: cluster_id.port,
+        parked,
     })
 }
 
@@ -314,6 +347,10 @@ async fn control_loop(
         // Warm spares count as partitions: without this, an everyone-on-one-cluster
         // world has k=1 and can never spread.
         runtime.set_known_clusters(cluster_ids.clone());
+        // Epic #305: the binary feeds a complete snapshot every cycle, so
+        // flips for feed-absent (departed) entities are cancelled instead of
+        // actuated — the manager-side anti-resurrection guarantee.
+        runtime.enable_feed_liveness();
         let mut stale_tracker = StaleTracker::new();
         let mut last_stale: HashSet<Uuid> = HashSet::new();
 
@@ -456,10 +493,11 @@ async fn main() -> Result<(), String> {
     // Spawn control loop in background.
     let loop_join_state = join_state.clone();
     let loop_clusters = clusters.clone();
+    let loop_redis_url = redis_url.clone();
     tokio::spawn(async move {
         control_loop(
             loop_clusters,
-            redis_url,
+            loop_redis_url,
             cadence_ms,
             capacity_factor,
             stale_limit_ms,
@@ -474,6 +512,7 @@ async fn main() -> Result<(), String> {
         policy,
         join_state,
         rr_counter: Arc::new(AtomicUsize::new(0)),
+        redis_url,
     };
 
     let app = Router::new()

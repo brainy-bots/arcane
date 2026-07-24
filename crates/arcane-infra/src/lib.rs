@@ -20,6 +20,7 @@ pub mod manager;
 #[cfg(feature = "cluster-ws")]
 pub mod neighbor_subscriber;
 pub mod node;
+pub mod parking;
 pub mod redis_channel;
 pub mod replication_channel_manager;
 pub mod rpc_handler;
@@ -51,6 +52,8 @@ pub mod manager_runtime;
 pub mod node_inbox;
 #[cfg(feature = "migration")]
 pub mod ownership_migration;
+#[cfg(feature = "migration")]
+pub mod persistence_config;
 #[cfg(feature = "migration")]
 pub mod replication_gate;
 #[cfg(feature = "migration")]

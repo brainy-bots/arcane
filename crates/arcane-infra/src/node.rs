@@ -94,6 +94,17 @@ impl ArcaneNode {
         entities.insert(entry.entity_id, entry);
     }
 
+    /// Read one entity's current state (cloned). Used by the leave path to
+    /// capture the final snapshot BEFORE removal (the "remember" step of the
+    /// unified leave sequence, epic #305).
+    pub fn get_entity(&self, entity_id: Uuid) -> Option<EntityStateEntry> {
+        self.entities
+            .lock()
+            .expect("entities lock")
+            .get(&entity_id)
+            .cloned()
+    }
+
     /// Mark an entity for removal. It will appear in the next tick's delta as removed, then be dropped from local state.
     pub fn remove_entity(&self, entity_id: Uuid) {
         let mut entities = self.entities.lock().expect("entities lock");
