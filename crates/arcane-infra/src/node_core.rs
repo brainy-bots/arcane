@@ -421,6 +421,15 @@ pub struct NodeCore {
     /// cancels the fast-forward) falls out for free.
     #[cfg_attr(not(feature = "migration"), allow(dead_code))]
     session_closes_rx: std::sync::mpsc::Receiver<Uuid>,
+    /// Entities that just LEFT (unified leave path) and must also leave the
+    /// DRIVER's world map. Model B: the driver owns the authoritative world
+    /// and re-submits it as the spine every tick — removing an entity from
+    /// the server map alone is NOT enough (the next submit re-adds it, the
+    /// state key keeps carrying it, the manager keeps stating it, and the
+    /// ghost self-sustains; live-verified in the #306 acceptance run).
+    /// Drained into `NodeInputs::lost_entities` so the driver drops them.
+    #[cfg(feature = "migration")]
+    pending_driver_releases: Vec<Uuid>,
 }
 
 impl NodeCore {
@@ -658,6 +667,8 @@ impl NodeCore {
             #[cfg(feature = "migration")]
             departed: HashMap::new(),
             session_closes_rx,
+            #[cfg(feature = "migration")]
+            pending_driver_releases: Vec::new(),
         })
     }
 
@@ -710,6 +721,9 @@ impl NodeCore {
         self.reconnect_last_hint.remove(&id);
         self.spawn_grace.remove(&id);
         self.departed.insert(id, self.tick_count);
+        // Model B: the driver's world map must drop it too, or its next
+        // spine submit resurrects the entity locally (see field docs).
+        self.pending_driver_releases.push(id);
     }
 
     /// Attach an inbox bus and spawn a thread to subscribe to frames.
@@ -948,6 +962,9 @@ impl NodeCore {
                 }
                 // §8 adoption: hand gained entities to the driver so it starts
                 // simulating them from their replicated state.
+                // A departed (tombstoned) id must not be re-adopted into the
+                // driver world even here — apply_inbox_frame already filters,
+                // this is belt-and-braces for the drain path.
                 out.adopted_entities.extend(report.adopted);
                 for id in &report.lost {
                     // Purge the stale authoritative copy WITHOUT a client-facing
@@ -959,6 +976,10 @@ impl NodeCore {
                 out.lost_entities.extend(report.lost);
             }
         }
+        // Epic #305: entities that just left hand their driver-world release
+        // to the driver here (independent of any inbox frame arriving).
+        #[cfg(feature = "migration")]
+        out.lost_entities.append(&mut self.pending_driver_releases);
         const PRUNE_INTERVAL_TICKS: u64 = 60;
         if self.tick_count.is_multiple_of(PRUNE_INTERVAL_TICKS) {
             self.neighbor_last_seen.retain(|id, last_seen| {
@@ -1031,6 +1052,15 @@ impl NodeCore {
             let mut graced_this_batch = 0;
             for entry in spine {
                 let id = entry.entity_id;
+                // Departed tombstone: a just-left entity must not re-enter the
+                // server map from a stale driver spine — not even as "ours"
+                // (owned_view lags the leave until the manager's absence grace
+                // prunes it; re-adding here is what kept the ghost alive in
+                // the live #306 acceptance run). The driver drops it from its
+                // world via lost_entities within a tick.
+                if self.departed.contains_key(&id) {
+                    continue;
+                }
                 let ours = self.owned_view.contains(&id) || self.spawn_grace.contains_key(&id);
                 if !ours {
                     // The record says another cluster owns it? Then the driver
@@ -1046,11 +1076,9 @@ impl NodeCore {
                     // Unknown everywhere: a NEW local spawn. Provisionally
                     // ours under spawn grace until the control plane speaks
                     // to it (#289 replacement for first-sight claiming).
-                    // Skip if id is in the departed tombstone (stale driver spine).
-                    if !self.departed.contains_key(&id) {
-                        self.spawn_grace.insert(id, self.tick_count);
-                        graced_this_batch += 1;
-                    }
+                    // (Departed ids never reach here — filtered at loop top.)
+                    self.spawn_grace.insert(id, self.tick_count);
+                    graced_this_batch += 1;
                 }
                 let mut e = entry.clone();
                 e.cluster_id = self.cluster_id;

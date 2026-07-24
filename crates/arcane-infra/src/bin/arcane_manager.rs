@@ -314,6 +314,10 @@ async fn control_loop(
         // Warm spares count as partitions: without this, an everyone-on-one-cluster
         // world has k=1 and can never spread.
         runtime.set_known_clusters(cluster_ids.clone());
+        // Epic #305: the binary feeds a complete snapshot every cycle, so
+        // flips for feed-absent (departed) entities are cancelled instead of
+        // actuated — the manager-side anti-resurrection guarantee.
+        runtime.enable_feed_liveness();
         let mut stale_tracker = StaleTracker::new();
         let mut last_stale: HashSet<Uuid> = HashSet::new();
 
