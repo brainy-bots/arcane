@@ -247,7 +247,14 @@ async fn control_loop(
 
         let mut manager = ArcaneManager::with_model("affinity");
 
-        // Apply operator config: pin feature.
+        // Apply operator config — ALWAYS. The env-derived affinity config
+        // (objective weights incl. cap/kappa, sanitized at startup) must reach
+        // the manager unconditionally; a previous version only applied it
+        // inside the pin-feature branch, so without MANAGER_PIN_FEATURE every
+        // MANAGER_OBJECTIVE_* override was silently ignored and the manager
+        // partitioned with defaults (live-observed: cap=90 logged at startup,
+        // load barrier never active).
+        //
         // MANAGER_PIN_FEATURE names the game-declared feature that anchors an
         // entity to its current cluster (nonzero value = never migrate). The
         // v1 stand-in for CLUSTER_REASSIGN: client-driven entities stay on the
@@ -255,13 +262,10 @@ async fn control_loop(
         let pin_feature = env::var("MANAGER_PIN_FEATURE")
             .ok()
             .filter(|s| !s.is_empty());
-        if pin_feature.is_some() {
-            let config = arcane_affinity::config::AffinityConfig {
-                pin_feature: pin_feature.clone(),
-                ..affinity_config.clone()
-            };
-            manager.set_affinity_config(config);
-        }
+        manager.set_affinity_config(arcane_affinity::config::AffinityConfig {
+            pin_feature: pin_feature.clone(),
+            ..affinity_config.clone()
+        });
         if let Some(ref pf) = pin_feature {
             eprintln!("arcane-manager: pin feature '{pf}' — pinned entities never migrate");
         }
