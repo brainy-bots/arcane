@@ -26,9 +26,7 @@ use arcane_affinity::interaction_graph::{Colocation, InteractionGraph, Interacti
 #[cfg(feature = "migration")]
 use arcane_affinity::objective::{crowding_marginal, open_cost_if_empty};
 #[cfg(feature = "migration")]
-use arcane_affinity::partition::{
-    GreedyGrowthPartitioner, IPartitioner, PartitionInput, WeightedEdge,
-};
+use arcane_affinity::partition::{PartitionInput, WeightedEdge};
 #[cfg(feature = "migration")]
 use arcane_affinity::predictor::{HeuristicPredictor, InteractionPredictor, PairContext};
 #[cfg(feature = "migration")]
@@ -144,6 +142,21 @@ struct MigrationState {
     wave_window: usize,
     /// Minimum wins within the window to adopt (0 = waves disabled).
     wave_majority: usize,
+    /// Pure-fresh candidate hold (durability gate): a fresh layout that beat
+    /// STAY is held here and re-priced against the EVOLVING graph each
+    /// cycle; adopted only after `wave_candidate_cycles` consecutive wins.
+    ///
+    /// This is what distinguishes structure from noise, live-measured
+    /// (2026-07-25): in TOWNS mode a winning layout keeps winning (the
+    /// structure is stable) — it survives the hold and adopts. In UNIFORM
+    /// mode a fresh layout wins ~1700 J at birth but the crowd keeps mixing;
+    /// its advantage decays within seconds, a DIFFERENT arbitrary layout
+    /// wins the next cycle, and instant adoption redrew ~100 players every
+    /// 250ms (317 waves, 6245 migrations in 90s). An improvement that
+    /// cannot survive 1s of graph drift was never structural.
+    pending_wave: Option<(HashMap<Uuid, Uuid>, u32)>,
+    /// Consecutive winning cycles a candidate must survive before adoption.
+    wave_candidate_cycles: u32,
     /// Ownership-flip decisions made this cycle, awaiting drain by the caller.
     /// The Manager decides but never publishes (design §3: it never talks to clusters
     /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
@@ -169,6 +182,12 @@ struct PartitionDecision {
     /// fresh diff is adopted as ONE coordinated wave and per-entity noise
     /// gates are bypassed.
     wave: bool,
+    /// Pure-fresh mode marker: the caller uses the candidate-hold gate
+    /// instead of the two-tier sliding window.
+    pure_fresh: bool,
+    /// The held candidate, re-priced on THIS cycle's graph, still beats STAY
+    /// by ≥ β (only meaningful in pure-fresh mode with a candidate held).
+    candidate_wins: bool,
 }
 
 /// Run split passes to a fixed point (bounded by k-1; each adopted split
@@ -358,6 +377,7 @@ fn build_partition_decisions(
     interaction_graph: &InteractionGraph,
     config: &AffinityConfig,
     known_clusters: &[Uuid],
+    wave_candidate: Option<&HashMap<Uuid, Uuid>>,
 ) -> PartitionDecision {
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
@@ -371,6 +391,8 @@ fn build_partition_decisions(
             j_incr: 0.0,
             movers_fresh: 0,
             wave: false,
+            pure_fresh: !config.seed_from_current,
+            candidate_wins: false,
         };
     }
 
@@ -494,6 +516,8 @@ fn build_partition_decisions(
             j_incr: 0.0,
             movers_fresh: 0,
             wave: false,
+            pure_fresh: !config.seed_from_current,
+            candidate_wins: false,
         };
     }
 
@@ -544,11 +568,26 @@ fn build_partition_decisions(
     // the interaction graph, never at current placement. μ is not charged
     // inside the solver (all entities count as moved-in-seed) — transition
     // cost is priced once, in the comparison below.
+    //
+    // MULTILEVEL (2026-07-25): coarsen by heavy-edge matching → partition
+    // the coarse graph → uncoarsen with refinement. Communities collapse
+    // into super-nodes during coarsening, so town boundaries are structural
+    // and a from-scratch solve reliably finds k communities as k groups.
+    // (Greedy growth failed exactly this: its first partition swallowed two
+    // towns through commuter edges before partition 2 started, and neither
+    // refinement nor the size-bisecting split pass could undo the blob —
+    // founder-observed: “a completely recalculated cluster cannot split 4
+    // points of interest into 4 clusters”.)
     let fresh_partition = {
-        let greedy = GreedyGrowthPartitioner::new().partition(&input);
+        let ml = arcane_affinity::multilevel::multilevel_partition(
+            &entities,
+            &input.edges,
+            num_partitions,
+            &config.objective,
+        );
         let all_moved: std::collections::HashSet<Uuid> = entities.iter().copied().collect();
         let mut refined = refine(
-            &greedy,
+            &ml,
             &input.edges,
             num_partitions,
             &RefineConfig {
@@ -575,36 +614,101 @@ fn build_partition_decisions(
     );
     let desired_fresh = to_desired(&entities, &fresh_partition, &fresh_map);
 
-    // PURE FRESH MODE (seed_from_current = false) and bootstrap: the fresh
-    // solve IS the assignment, adopted WHOLESALE every cycle (founder
-    // design, 2026-07-25): the clustering is the millisecond-window
-    // interaction structure — predictions staler than one cycle are already
-    // wrong, so there is nothing to “converge” toward. wave = true bypasses
-    // every per-entity noise gate; stability is STRUCTURAL instead:
-    //   - the solver is deterministic (same graph → same groups),
-    //   - the Hungarian label alignment maps groups onto the clusters that
-    //     minimize movers, so an unchanged structure yields a ~zero diff
-    //     naturally — no gate needed to produce “no moves”,
-    //   - the per-entity cooldown still guards handoff integrity (an entity
-    //     mid-migration is never double-flipped).
-    // The earlier “wholesale adoption degrades purity” observation was a
-    // misdiagnosis: the damage came from PARTIAL adoption — per-entity
-    // gates dribbling fragments of successive (different-optimum) solutions
-    // into the state, mixing incompatible layouts. Pure adoption never
-    // mixes: the state equals exactly one solution at all times.
-    if !config.seed_from_current || current_assignments.is_empty() {
-        let movers = desired_fresh
+    // PURE FRESH MODE (seed_from_current = false): binary solution-level
+    // hysteresis (founder design iteration 2, 2026-07-25). Each cycle
+    // compares exactly TWO complete solutions on the true objective:
+    //
+    //   STAY  = the standing assignments, untouched (new entities take
+    //           their fresh placement — they must go somewhere)
+    //   FRESH = this cycle's full unseeded recalculation, Hungarian-aligned
+    //           to minimize movers
+    //
+    // If FRESH wins by more than β: adopt it ENTIRELY — one atomic wave,
+    // per-entity gates bypassed, the founder-visible full redraw. Otherwise
+    // keep STAY exactly: ZERO moves this cycle. Never mix the two.
+    //
+    // Why not adopt fresh unconditionally (iteration 1): for a structureless
+    // crowd many partitions have near-identical J, and the solver — fed a
+    // slightly-noisy graph — picks a DIFFERENT arbitrary grouping every
+    // cycle. Hungarian alignment minimizes the diff GIVEN the groups, but
+    // the group contents themselves shuffle at the boundaries: measured
+    // 34,532 migrations (~40/cycle sustained) with zero structural change.
+    // The deadband kills that noise while leaving the real signal: a stuck
+    // layout (3 towns on one cluster) loses to fresh by far more than β and
+    // redraws in ONE cycle.
+    if !config.seed_from_current {
+        // STAY: standing assignments; fresh placement only for entities the
+        // standing state does not cover.
+        let desired_stay: HashMap<Uuid, Uuid> = entities
             .iter()
-            .filter(|(e, c)| current_assignments.get(e).is_some_and(|cur| cur != *c))
-            .count();
+            .filter_map(|e| {
+                current_assignments
+                    .get(e)
+                    .copied()
+                    .or_else(|| desired_fresh.get(e).copied())
+                    .map(|c| (*e, c))
+            })
+            .collect();
+        let (j_stay, _) = solution_cost(
+            &desired_stay,
+            &input.edges,
+            current_assignments,
+            &config.objective,
+        );
+        let (j_fresh, movers_fresh) = solution_cost(
+            &desired_fresh,
+            &input.edges,
+            current_assignments,
+            &config.objective,
+        );
+        let fresh_wins = j_fresh + config.objective.beta < j_stay;
+        // Durability check: does the HELD candidate (a fresh layout from a
+        // previous cycle) still beat STAY on TODAY's graph? Entities the
+        // candidate does not cover fall back to their standing assignment.
+        let candidate_wins = wave_candidate.is_some_and(|cand| {
+            let cand_full: HashMap<Uuid, Uuid> = entities
+                .iter()
+                .filter_map(|e| {
+                    cand.get(e)
+                        .or_else(|| desired_stay.get(e))
+                        .map(|c| (*e, *c))
+                })
+                .collect();
+            let (j_cand, _) = solution_cost(
+                &cand_full,
+                &input.edges,
+                current_assignments,
+                &config.objective,
+            );
+            j_cand + config.objective.beta < j_stay
+        });
+        // NO self-adoption: the caller's candidate-hold gate decides. The
+        // default this cycle is STAY (zero moves).
+        return PartitionDecision {
+            desired: desired_stay,
+            desired_fresh,
+            fresh_wins,
+            j_fresh,
+            j_incr: j_stay,
+            movers_fresh,
+            wave: false,
+            pure_fresh: true,
+            candidate_wins,
+        };
+    }
+
+    // Bootstrap for two-tier mode (nothing standing yet): fresh IS the state.
+    if current_assignments.is_empty() {
         return PartitionDecision {
             desired: desired_fresh.clone(),
             desired_fresh,
             fresh_wins: false,
             j_fresh: 0.0,
             j_incr: 0.0,
-            movers_fresh: movers,
+            movers_fresh: 0,
             wave: true,
+            pure_fresh: false,
+            candidate_wins: false,
         };
     }
 
@@ -686,6 +790,8 @@ fn build_partition_decisions(
         desired_fresh,
         desired: desired_incr,
         wave: false,
+        pure_fresh: false,
+        candidate_wins: false,
     }
 }
 
@@ -1297,6 +1403,11 @@ impl ArcaneManager {
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
         let t_pre_part = t0.elapsed();
+        let held_candidate = self
+            .migration_state
+            .pending_wave
+            .as_ref()
+            .map(|(d, _)| d.clone());
         let decision = build_partition_decisions(
             &view,
             &current_assignments,
@@ -1304,13 +1415,57 @@ impl ArcaneManager {
             &self.interaction_graph,
             &self.config,
             &self.known_clusters,
+            held_candidate.as_ref(),
         );
 
-        // Wave adoption gate: sliding-window MAJORITY (see wave_wins docs).
-        // Both solvers ran this cycle regardless — recalculation is never
-        // gated; only wholesale layout adoption is.
+        // Wave adoption. Recalculation is never gated — both solutions were
+        // computed this cycle; only wholesale layout adoption is gated.
+        //
+        // PURE-FRESH mode: candidate-hold durability gate. A winning fresh
+        // layout is HELD (not adopted) and re-priced against the evolving
+        // graph each cycle; only a layout that keeps beating STAY for
+        // wave_candidate_cycles is real structure — transient uniform-crowd
+        // optima decay within a second and are dropped silently.
+        //
+        // TWO-TIER mode: sliding-window majority over fresh-vs-incumbent.
         let mut decision = decision;
-        {
+        if decision.pure_fresh {
+            let ms = &mut self.migration_state;
+            match ms.pending_wave.take() {
+                Some((cand, age)) if decision.candidate_wins => {
+                    let age = age + 1;
+                    if age >= ms.wave_candidate_cycles {
+                        eprintln!(
+                            "[wave] candidate survived {age} cycles of graph drift — atomic redraw ({} entities re-priced J {:.1} vs stay {:.1})",
+                            cand.len(),
+                            decision.j_fresh,
+                            decision.j_incr
+                        );
+                        // Adopt the HELD layout (fill gaps from stay = decision.desired).
+                        let mut adopted = decision.desired.clone();
+                        for (e, c) in &cand {
+                            adopted.insert(*e, *c);
+                        }
+                        decision.desired = adopted;
+                        decision.wave = true;
+                    } else {
+                        ms.pending_wave = Some((cand, age));
+                    }
+                }
+                Some(_) => {
+                    // Candidate stopped winning: it was transient. Replace it
+                    // with today's fresh layout if THAT wins, else drop.
+                    if decision.fresh_wins {
+                        ms.pending_wave = Some((decision.desired_fresh.clone(), 1));
+                    }
+                }
+                None => {
+                    if decision.fresh_wins {
+                        ms.pending_wave = Some((decision.desired_fresh.clone(), 1));
+                    }
+                }
+            }
+        } else {
             let ms = &mut self.migration_state;
             ms.wave_wins.push_back(decision.fresh_wins);
             while ms.wave_wins.len() > ms.wave_window {
@@ -1562,6 +1717,12 @@ impl MigrationState {
             // breathing that wins only transient cycles never reaches 75%.
             wave_window: 12,
             wave_majority: 9,
+            pending_wave: None,
+            // 4 cycles = 1s at demo cadence: a structural improvement loses
+            // nothing measurable in 1s; a uniform-crowd transient decays
+            // visibly (graph half-life ~3s, and the specific layout's edge
+            // alignment decays faster).
+            wave_candidate_cycles: 4,
         }
     }
 

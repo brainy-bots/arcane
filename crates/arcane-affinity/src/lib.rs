@@ -3,6 +3,7 @@ pub mod cold_pair;
 pub mod config;
 pub mod feature_map;
 pub mod interaction_graph;
+pub mod multilevel;
 pub mod objective;
 pub mod partition;
 pub mod predictor;
