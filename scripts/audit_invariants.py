@@ -119,10 +119,25 @@ check(
     "MANAGER_PREDICTED_GRAPH=1",
     '"MANAGER_PREDICTED_GRAPH": "1"' in launch,
 )
+
+# --- 6. ONE code path: no toggles, no superseded implementation kept alive.
+sk = read(rf"{ARC}\arcane-infra\src\state_keys.rs")
 check(
-    "demo runs entity keys",
-    "ARCANE_ENTITY_KEYS=1",
-    '"ARCANE_ENTITY_KEYS": "1"' in launch,
+    "no entity-keys toggle anywhere",
+    "git is the reversibility mechanism - never a runtime flag",
+    "ARCANE_ENTITY_KEYS" not in nc
+    and "ARCANE_ENTITY_KEYS" not in sk
+    and "ARCANE_ENTITY_KEYS" not in launch,
+)
+check(
+    "blob state docs are not written",
+    "one source of truth: per-entity owner-gated records",
+    "ClusterStateDoc {" not in nc and "StatePublisher" not in nc,
+)
+check(
+    "blob reader deleted",
+    "readers consume ONLY per-entity records",
+    "merge_fetch" not in sk and "fetch_all_entities" in sk,
 )
 
 print()

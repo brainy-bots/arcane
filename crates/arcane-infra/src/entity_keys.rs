@@ -231,11 +231,33 @@ pub fn fetch_all_entities(
             for k in &keys {
                 pipe.cmd("HGET").arg(k).arg("doc");
             }
-            if let Ok(docs) = pipe.query::<Vec<Option<String>>>(conn) {
-                for doc in docs.into_iter().flatten() {
-                    if let Ok(rec) = serde_json::from_str::<EntityRecord>(&doc) {
-                        records.push(rec);
+            match pipe.query::<Vec<Option<String>>>(conn) {
+                Ok(docs) => {
+                    for doc in docs.into_iter().flatten() {
+                        match serde_json::from_str::<EntityRecord>(&doc) {
+                            Ok(rec) => records.push(rec),
+                            Err(e) => {
+                                // NEVER swallow this: a decode mismatch here
+                                // empties the manager's whole world view and
+                                // looks like “all entities on one cluster,
+                                // no migrations” (live-hit 2026-07-25 when
+                                // records serialized without optional fields
+                                // failed to deserialize).
+                                use std::sync::atomic::{AtomicU64, Ordering};
+                                static DECODE_FAILS: AtomicU64 = AtomicU64::new(0);
+                                let n = DECODE_FAILS.fetch_add(1, Ordering::Relaxed);
+                                if n.is_multiple_of(200) {
+                                    eprintln!(
+                                        "entity-keys reader: record decode FAILED ({e}); doc={}",
+                                        &doc[..doc.len().min(200)]
+                                    );
+                                }
+                            }
+                        }
                     }
+                }
+                Err(e) => {
+                    eprintln!("entity-keys reader: HGET pipeline failed: {e}");
                 }
             }
         }

@@ -96,35 +96,14 @@ impl StatePublisher {
     }
 }
 
-/// Pure merge logic for fetch results + cache. Tests this without Redis.
-fn merge_fetch(
-    results: Vec<(Uuid, Option<ClusterStateDoc>)>,
-    cache: &mut std::collections::HashMap<Uuid, ClusterStateDoc>,
-) -> Vec<EntityRecord> {
-    let mut records = Vec::new();
-    for (cluster_id, doc_opt) in results {
-        let doc = match doc_opt {
-            Some(doc) => {
-                cache.insert(cluster_id, doc.clone());
-                doc
-            }
-            None => match cache.get(&cluster_id) {
-                Some(cached) => cached.clone(),
-                None => continue,
-            },
-        };
-        records.extend(doc.entities);
-    }
-    records
-}
-
 /// Pulls cluster state from Redis keys (pull-only, no pub/sub).
 /// Implements `IEntityStateSource` for the Manager to fetch state.
 pub struct RedisStateSource {
     redis_url: String,
     cluster_ids: Vec<Uuid>,
-    cache: std::sync::Mutex<std::collections::HashMap<Uuid, ClusterStateDoc>>,
     last_observed_edges: std::sync::Mutex<Vec<(Uuid, Uuid, f64)>>,
+    /// Heartbeat ticks per cluster from the last fetch.
+    last_ticks: std::sync::Mutex<Vec<(Uuid, u64)>>,
 }
 
 impl RedisStateSource {
@@ -138,71 +117,26 @@ impl RedisStateSource {
             .get_connection()
             .map_err(|e| format!("Redis connection failed: {}", e))?;
 
+        eprintln!("state source: per-entity records (arcane:entity:*)");
         Ok(Self {
             redis_url: redis_url.to_string(),
             cluster_ids,
-            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_observed_edges: std::sync::Mutex::new(Vec::new()),
+            last_ticks: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     /// Fetch all entity records from cluster state keys.
     /// Returns concatenated records; uses cache on missing/error.
     pub fn fetch_all(&self) -> Vec<EntityRecord> {
-        let client = match redis::Client::open(self.redis_url.as_str()) {
-            Ok(c) => c,
-            Err(_) => {
-                // Connection error: fall back to cache
-                let cache = self.cache.lock().unwrap();
-                let records: Vec<EntityRecord> = cache
-                    .values()
-                    .flat_map(|doc| doc.entities.clone())
-                    .collect();
-                return records;
-            }
+        let Ok(client) = redis::Client::open(self.redis_url.as_str()) else {
+            return Vec::new();
         };
-
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(_) => {
-                // Connection error: fall back to cache
-                let cache = self.cache.lock().unwrap();
-                let records: Vec<EntityRecord> = cache
-                    .values()
-                    .flat_map(|doc| doc.entities.clone())
-                    .collect();
-                return records;
-            }
+        let Ok(mut conn) = client.get_connection() else {
+            return Vec::new();
         };
-
-        let mut results = Vec::new();
-        let mut edges = Vec::new();
-
-        for cluster_id in &self.cluster_ids {
-            let key = state_key(*cluster_id);
-            let payload: Result<String, redis::RedisError> =
-                redis::cmd("GET").arg(&key).query(&mut conn);
-
-            let doc_opt = match payload {
-                Ok(p) => match decode(&p) {
-                    Ok(doc) => {
-                        edges.extend(doc.observed_edges.clone());
-                        Some(doc)
-                    }
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            };
-
-            results.push((*cluster_id, doc_opt));
-        }
-
-        let mut cache = self.cache.lock().unwrap();
-        let records = merge_fetch(results, &mut cache);
-
-        let mut last_edges = self.last_observed_edges.lock().unwrap();
-        *last_edges = edges;
-
+        let (records, ticks) = crate::entity_keys::fetch_all_entities(&mut conn, &self.cluster_ids);
+        *self.last_ticks.lock().unwrap() = ticks;
         records
     }
 
@@ -216,8 +150,7 @@ impl RedisStateSource {
     /// it still has cached entities; an EMPTY cluster that keeps publishing
     /// (advancing tick, zero entities — a warm spare) is NOT stale.
     pub fn last_docs(&self) -> Vec<(Uuid, u64)> {
-        let cache = self.cache.lock().unwrap();
-        let mut out: Vec<(Uuid, u64)> = cache.iter().map(|(id, doc)| (*id, doc.tick)).collect();
+        let mut out = self.last_ticks.lock().unwrap().clone();
         out.sort_by_key(|(id, _)| *id);
         out
     }
@@ -299,82 +232,6 @@ mod tests {
 
         let decoded = decode(&encoded).expect("decode");
         assert_eq!(decoded.entities[0], record);
-    }
-
-    #[test]
-    fn merge_fetch_fresh_replaces_cache() {
-        let mut cache = std::collections::HashMap::new();
-
-        let cid1 = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let old_doc = ClusterStateDoc {
-            cluster_id: cid1,
-            tick: 1,
-            entities: vec![],
-            observed_edges: vec![],
-        };
-        cache.insert(cid1, old_doc);
-
-        let record = EntityRecord {
-            entity_id: Uuid::nil(),
-            cluster_id: cid1,
-            position: Vec2::new(1.0, 2.0),
-            velocity: Vec2::new(0.0, 0.0),
-            features: FeatureMap::new(),
-            user_data: serde_json::Value::Null,
-        };
-
-        let new_doc = ClusterStateDoc {
-            cluster_id: cid1,
-            tick: 2,
-            entities: vec![record.clone()],
-            observed_edges: vec![],
-        };
-
-        let results = vec![(cid1, Some(new_doc))];
-        let records = merge_fetch(results, &mut cache);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0], record);
-        assert_eq!(cache.get(&cid1).unwrap().tick, 2);
-    }
-
-    #[test]
-    fn merge_fetch_missing_key_uses_cache() {
-        let mut cache = std::collections::HashMap::new();
-
-        let cid1 = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let cached_doc = ClusterStateDoc {
-            cluster_id: cid1,
-            tick: 1,
-            entities: vec![EntityRecord {
-                entity_id: Uuid::nil(),
-                cluster_id: cid1,
-                position: Vec2::new(1.0, 2.0),
-                velocity: Vec2::new(0.0, 0.0),
-                features: FeatureMap::new(),
-                user_data: serde_json::Value::Null,
-            }],
-            observed_edges: vec![],
-        };
-        cache.insert(cid1, cached_doc.clone());
-
-        let results = vec![(cid1, None)];
-        let records = merge_fetch(results, &mut cache);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(cache.get(&cid1).unwrap().tick, 1);
-    }
-
-    #[test]
-    fn merge_fetch_never_seen_cluster_contributes_nothing() {
-        let mut cache = std::collections::HashMap::new();
-
-        let cid1 = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let results = vec![(cid1, None)];
-        let records = merge_fetch(results, &mut cache);
-
-        assert_eq!(records.len(), 0);
-        assert!(!cache.contains_key(&cid1));
     }
 
     #[test]

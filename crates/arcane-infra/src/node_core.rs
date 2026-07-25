@@ -363,10 +363,8 @@ pub struct NodeCore {
     #[cfg(feature = "migration")]
     inbox_rx: Option<std::sync::mpsc::Receiver<NodeInboxFrame>>,
     #[cfg(feature = "migration")]
-    state_publisher: Option<crate::state_keys::StatePublisher>,
-    /// Per-entity owner-gated writes (issue #331; ARCANE_ENTITY_KEYS=1).
-    /// When set, publishes entity records as individual owner-gated keys IN
-    /// ADDITION to the blob doc (transition period: readers may use either).
+    /// Per-entity owner-gated state writes (#331): the ONLY state write path.
+    /// One record per entity, `owner` inside it, enforced by Redis.
     entity_key_publisher: Option<crate::entity_keys::EntityKeyPublisher>,
     #[cfg(feature = "migration")]
     state_publish_interval: u64,
@@ -536,36 +534,23 @@ impl NodeCore {
         // statement replaces it wholesale.
 
         #[cfg(feature = "migration")]
-        let entity_key_publisher = if std::env::var("ARCANE_ENTITY_KEYS").as_deref() == Ok("1") {
-            match crate::entity_keys::EntityKeyPublisher::new(&cfg.redis_url, cfg.cluster_id) {
-                Ok(p) => {
-                    eprintln!("entity-keys mode ON: per-entity owner-gated writes");
-                    Some(p)
-                }
-                Err(e) => {
-                    eprintln!("entity-keys init failed ({e}); blob-only publishing");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(feature = "migration")]
-        let (state_publisher, state_publish_interval) = {
+        let (entity_key_publisher, state_publish_interval) = {
             let interval = std::env::var("NODE_STATE_PUBLISH_TICKS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30);
-            let publisher = match crate::state_keys::StatePublisher::new(&cfg.redis_url) {
+            let publisher = match crate::entity_keys::EntityKeyPublisher::new(
+                &cfg.redis_url,
+                cfg.cluster_id,
+            ) {
                 Ok(p) => {
-                    eprintln!("state publisher initialized (interval={} ticks)", interval);
+                    eprintln!(
+                            "entity state publisher initialized (interval={interval} ticks, owner-gated per-entity records)"
+                        );
                     Some(p)
                 }
                 Err(e) => {
-                    eprintln!(
-                        "state publisher init failed ({}); continuing without state publication",
-                        e
-                    );
+                    eprintln!("entity state publisher init failed ({e}); no state publication");
                     None
                 }
             };
@@ -666,8 +651,6 @@ impl NodeCore {
             owner_hints: HashMap::new(),
             #[cfg(feature = "migration")]
             inbox_rx: None,
-            #[cfg(feature = "migration")]
-            state_publisher,
             #[cfg(feature = "migration")]
             entity_key_publisher,
             #[cfg(feature = "migration")]
@@ -1096,7 +1079,7 @@ impl NodeCore {
                 // nothing on its hot path. Captured BEFORE purge_entity below
                 // (the state must still exist to be handed over).
                 #[cfg(feature = "migration")]
-                if let Some(ref ek) = self.entity_key_publisher {
+                if let Some(ek) = self.entity_key_publisher.as_ref() {
                     let tick = self.tick_count;
                     let ops: Vec<crate::entity_keys::EntityWriteOp> = report
                         .lost
@@ -1381,7 +1364,7 @@ impl NodeCore {
             let departed_cutoff = self.tick_count.saturating_sub(DEPARTED_TTL_TICKS);
             self.departed.retain(|_, at| *at >= departed_cutoff);
 
-            if let Some(ref publisher) = self.state_publisher {
+            if let Some(ref publisher) = self.entity_key_publisher {
                 // Pin liveness: an entity counts as client-driven while updates arrived
                 // within the last PIN_LIVENESS_TICKS. Prune stale records so entities
                 // whose client disconnected become migratable again.
@@ -1433,38 +1416,25 @@ impl NodeCore {
                     })
                     .collect();
 
-                // Entity-keys mode (#331): per-entity owner-gated writes.
-                // Same records, one op per entity + one heartbeat. The Lua
-                // owner gate makes stale post-flip writes bounce at Redis.
-                if let Some(ref ek) = self.entity_key_publisher {
-                    let tick = self.server.current_tick();
-                    let mut ops: Vec<crate::entity_keys::EntityWriteOp> = entities
-                        .iter()
-                        .filter_map(|rec| {
-                            crate::entity_keys::encode_record(rec).ok().map(|doc_json| {
-                                crate::entity_keys::EntityWriteOp::Write {
-                                    entity_id: rec.entity_id,
-                                    doc_json,
-                                    tick,
-                                }
-                            })
+                // Per-entity owner-gated writes (#331): one record per
+                // entity + one heartbeat. The Lua owner gate makes stale
+                // post-flip writes bounce at Redis.
+                let tick = self.server.current_tick();
+                let mut ops: Vec<crate::entity_keys::EntityWriteOp> = entities
+                    .iter()
+                    .filter_map(|rec| {
+                        crate::entity_keys::encode_record(rec).ok().map(|doc_json| {
+                            crate::entity_keys::EntityWriteOp::Write {
+                                entity_id: rec.entity_id,
+                                doc_json,
+                                tick,
+                            }
                         })
-                        .collect();
-                    ops.push(crate::entity_keys::EntityWriteOp::Heartbeat { tick });
-                    if let Err(e) = ek.publish(ops) {
-                        eprintln!("entity-keys publish error: {e}");
-                    }
-                }
-
-                let doc = crate::state_keys::ClusterStateDoc {
-                    cluster_id: self.cluster_id,
-                    tick: self.server.current_tick(),
-                    entities,
-                    observed_edges: vec![],
-                };
-
-                if let Err(e) = publisher.publish(&doc) {
-                    eprintln!("state doc publish error: {}", e);
+                    })
+                    .collect();
+                ops.push(crate::entity_keys::EntityWriteOp::Heartbeat { tick });
+                if let Err(e) = publisher.publish(ops) {
+                    eprintln!("entity state publish error: {e}");
                 }
             }
         }
