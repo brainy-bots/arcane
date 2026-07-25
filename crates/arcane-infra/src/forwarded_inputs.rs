@@ -166,51 +166,22 @@ pub fn spawn_forwarded_inputs_subscriber(
     self_cluster_id: Uuid,
     tx: Sender<ForwardedInputBatch>,
 ) {
-    thread::spawn(move || {
-        let client = match redis::Client::open(redis_url.as_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("forwarded inputs subscriber: Redis open failed: {}", e);
-                return;
-            }
-        };
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "forwarded inputs subscriber: Redis connection failed: {}",
-                    e
-                );
-                return;
-            }
-        };
-        let mut pubsub = conn.as_pubsub();
-        let topic = format!("{}:{}", FWD_INPUTS_TOPIC_PREFIX, self_cluster_id);
-        if pubsub.subscribe(&topic).is_err() {
-            eprintln!("forwarded inputs subscriber: subscribe {} failed", topic);
-            return;
-        }
-        eprintln!("subscribed to forwarded inputs topic {}", topic);
-        loop {
-            match pubsub.get_message() {
-                Ok(msg) => {
-                    let payload: String = match msg.get_payload() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if let Ok(batch) = serde_json::from_str::<ForwardedInputBatch>(&payload) {
-                        if tx.send(batch).is_err() {
-                            break; // node core dropped its receiver
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("forwarded inputs subscriber: get_message error: {}", e);
-                    break;
+    let topic = format!("{}:{}", FWD_INPUTS_TOPIC_PREFIX, self_cluster_id);
+    // Resilient loop (arcane#204): inputs re-send at client rate (10-20Hz),
+    // so a reconnect gap loses at most a few frames of one entity's input.
+    crate::pubsub_util::spawn_resilient_subscriber(
+        "forwarded inputs subscriber",
+        redis_url,
+        vec![topic],
+        move |payload| {
+            if let Ok(batch) = serde_json::from_str::<ForwardedInputBatch>(&payload) {
+                if tx.send(batch).is_err() {
+                    return std::ops::ControlFlow::Break(()); // receiver gone
                 }
             }
-        }
-    });
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ pub mod manager;
 pub mod neighbor_subscriber;
 pub mod node;
 pub mod parking;
+pub mod pubsub_util;
 pub mod redis_channel;
 pub mod replication_channel_manager;
 pub mod rpc_handler;

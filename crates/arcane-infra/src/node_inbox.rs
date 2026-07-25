@@ -174,46 +174,22 @@ impl InboxBus for RedisInboxBus {
         let (tx, rx) = mpsc::channel();
         let redis_url = self.redis_url.clone();
 
-        thread::spawn(move || {
-            let client = match redis::Client::open(redis_url.as_str()) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("node inbox subscriber: Redis open failed: {}", e);
-                    return;
-                }
-            };
-            let mut conn = match client.get_connection() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("node inbox subscriber: Redis connection failed: {}", e);
-                    return;
-                }
-            };
-            let mut pubsub = conn.as_pubsub();
-            let topic = format!("{}:{}", NODE_INBOX_TOPIC_PREFIX, cluster_id);
-            if pubsub.subscribe(&topic).is_err() {
-                eprintln!("node inbox subscriber: subscribe {} failed", topic);
-                return;
-            }
-            eprintln!("subscribed to node inbox topic {}", topic);
-            loop {
-                match pubsub.get_message() {
-                    Ok(msg) => {
-                        let payload: String = match msg.get_payload() {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        if let Ok(frame) = serde_json::from_str::<NodeInboxFrame>(&payload) {
-                            let _ = tx.send(frame);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("node inbox subscriber: get_message error: {}", e);
-                        break;
+        let topic = format!("{}:{}", NODE_INBOX_TOPIC_PREFIX, cluster_id);
+        // Resilient loop (arcane#204): frames are re-published every router
+        // tick, so a reconnect gap self-heals within one tick.
+        crate::pubsub_util::spawn_resilient_subscriber(
+            "node inbox subscriber",
+            redis_url,
+            vec![topic],
+            move |payload| {
+                if let Ok(frame) = serde_json::from_str::<NodeInboxFrame>(&payload) {
+                    if tx.send(frame).is_err() {
+                        return std::ops::ControlFlow::Break(());
                     }
                 }
-            }
-        });
+                std::ops::ControlFlow::Continue(())
+            },
+        );
 
         rx
     }

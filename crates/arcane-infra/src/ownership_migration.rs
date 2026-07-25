@@ -10,7 +10,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::thread;
 use uuid::Uuid;
 
 const OWNERSHIP_TOPIC_PREFIX: &str = "arcane:ownership-flip";
@@ -109,50 +108,25 @@ pub fn spawn_ownership_flip_subscriber(
     cluster_id: Uuid,
     ownership_map: OwnershipMap,
 ) {
-    thread::spawn(move || {
-        let client = match redis::Client::open(redis_url.as_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("ownership flip subscriber: Redis open failed: {}", e);
-                return;
+    let topic = format!("{}:{}", OWNERSHIP_TOPIC_PREFIX, cluster_id);
+    // Resilient loop (arcane#204): a flip missed during a reconnect gap is
+    // re-derived by the manager's next evaluation cycle (the desired vs
+    // current diff persists until actuated).
+    crate::pubsub_util::spawn_resilient_subscriber(
+        "ownership flip subscriber",
+        redis_url,
+        vec![topic],
+        move |payload| {
+            if let Ok(flip) = serde_json::from_str::<OwnershipFlip>(&payload) {
+                eprintln!(
+                    "OwnershipFlip received: entity={}, from={}, to={}, effective_tick={}",
+                    flip.entity_id, flip.from_cluster, flip.to_cluster, flip.effective_tick
+                );
+                ownership_map.set_owner(flip.entity_id, flip.to_cluster);
             }
-        };
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("ownership flip subscriber: Redis connection failed: {}", e);
-                return;
-            }
-        };
-        let mut pubsub = conn.as_pubsub();
-        let topic = format!("{}:{}", OWNERSHIP_TOPIC_PREFIX, cluster_id);
-        if pubsub.subscribe(&topic).is_err() {
-            eprintln!("ownership flip subscriber: subscribe {} failed", topic);
-            return;
-        }
-        eprintln!("subscribed to ownership flip topic {}", topic);
-        loop {
-            match pubsub.get_message() {
-                Ok(msg) => {
-                    let payload: String = match msg.get_payload() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if let Ok(flip) = serde_json::from_str::<OwnershipFlip>(&payload) {
-                        eprintln!(
-                            "OwnershipFlip received: entity={}, from={}, to={}, effective_tick={}",
-                            flip.entity_id, flip.from_cluster, flip.to_cluster, flip.effective_tick
-                        );
-                        ownership_map.set_owner(flip.entity_id, flip.to_cluster);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("ownership flip subscriber: get_message error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 /// Ownership map — tracks which cluster owns each entity.

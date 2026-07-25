@@ -7,8 +7,8 @@
 //!
 //! This module is intentionally narrow: no topology decisions and no state merging.
 
+use std::ops::ControlFlow;
 use std::sync::mpsc::Sender;
-use std::thread;
 
 use arcane_core::replication_channel::EntityStateDelta;
 use uuid::Uuid;
@@ -22,50 +22,26 @@ pub fn spawn_neighbor_subscriber(
     neighbor_ids: Vec<Uuid>,
     neighbor_tx: Sender<EntityStateDelta>,
 ) {
-    if neighbor_ids.is_empty() {
-        return;
-    }
-    thread::spawn(move || {
-        let client = match redis::Client::open(redis_url.as_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("neighbor subscriber: Redis open failed: {}", e);
-                return;
-            }
-        };
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("neighbor subscriber: Redis connection failed: {}", e);
-                return;
-            }
-        };
-        let mut pubsub = conn.as_pubsub();
-        for nid in &neighbor_ids {
-            let topic = format!("arcane:replication:{}", nid);
-            if pubsub.subscribe(&topic).is_err() {
-                eprintln!("neighbor subscriber: subscribe {} failed", topic);
-            }
-        }
-        eprintln!("subscribed to {} neighbor topic(s)", neighbor_ids.len());
-        loop {
-            match pubsub.get_message() {
-                Ok(msg) => {
-                    let payload: String = match msg.get_payload() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if let Some(delta) = parse_delta_payload(&payload) {
-                        let _ = neighbor_tx.send(delta);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("neighbor subscriber: get_message error: {}", e);
-                    break;
+    let topics: Vec<String> = neighbor_ids
+        .iter()
+        .map(|nid| format!("arcane:replication:{}", nid))
+        .collect();
+    // Resilient loop (arcane#204): reconnect with backoff instead of dying on
+    // the first dropped connection. Missed deltas are healed by the
+    // publisher's continuous resync cadence.
+    crate::pubsub_util::spawn_resilient_subscriber(
+        "neighbor subscriber",
+        redis_url,
+        topics,
+        move |payload| {
+            if let Some(delta) = parse_delta_payload(&payload) {
+                if neighbor_tx.send(delta).is_err() {
+                    return ControlFlow::Break(()); // node dropped its receiver
                 }
             }
-        }
-    });
+            ControlFlow::Continue(())
+        },
+    );
 }
 
 #[cfg(test)]

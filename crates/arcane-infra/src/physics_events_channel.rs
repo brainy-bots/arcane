@@ -7,7 +7,6 @@
 //! subscribes to its own topic).
 
 use std::sync::mpsc::Sender;
-use std::thread;
 
 use arcane_core::physics_events::{PhysicsEvent, PhysicsEventBatch};
 use uuid::Uuid;
@@ -101,46 +100,23 @@ pub fn spawn_physics_events_subscriber(
     self_cluster_id: Uuid,
     tx: Sender<PhysicsEventBatch>,
 ) {
-    thread::spawn(move || {
-        let client = match redis::Client::open(redis_url.as_str()) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("physics events subscriber: Redis open failed: {}", e);
-                return;
-            }
-        };
-        let mut conn = match client.get_connection() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("physics events subscriber: Redis connection failed: {}", e);
-                return;
-            }
-        };
-        let mut pubsub = conn.as_pubsub();
-        let topic = format!("arcane:physics_events:{}", self_cluster_id);
-        if pubsub.subscribe(&topic).is_err() {
-            eprintln!("physics events subscriber: subscribe {} failed", topic);
-            return;
-        }
-        eprintln!("subscribed to physics events topic {}", topic);
-        loop {
-            match pubsub.get_message() {
-                Ok(msg) => {
-                    let payload: String = match msg.get_payload() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-                    if let Ok(batch) = serde_json::from_str::<PhysicsEventBatch>(&payload) {
-                        let _ = tx.send(batch);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("physics events subscriber: get_message error: {}", e);
-                    break;
+    let topic = format!("arcane:physics_events:{}", self_cluster_id);
+    // Resilient loop (arcane#204): physics events are per-tick ops; a gap
+    // loses transient impulses only, and the authoritative state stream
+    // corrects positions immediately after.
+    crate::pubsub_util::spawn_resilient_subscriber(
+        "physics events subscriber",
+        redis_url,
+        vec![topic],
+        move |payload| {
+            if let Ok(batch) = serde_json::from_str::<PhysicsEventBatch>(&payload) {
+                if tx.send(batch).is_err() {
+                    return std::ops::ControlFlow::Break(());
                 }
             }
-        }
-    });
+            std::ops::ControlFlow::Continue(())
+        },
+    );
 }
 
 #[cfg(test)]
