@@ -30,6 +30,10 @@
 //!     12 / 9. Two-tier mode only: the FRESH unseeded global solve is adopted
 //!     wholesale when it beat the incumbent by ≥ β in ≥ MAJORITY of the last
 //!     WINDOW cycles including the current one. Majority 0 disables waves.
+//!   MANAGER_PREDICTED_GRAPH — optional; default 0. Set 1: the interaction
+//!     graph holds ONLY the predictor's current p(a,b) (edge = 3.3·p,
+//!     assignment semantics, no accrual/decay; pairs update at the
+//!     attention-scaled re-prediction cadence, 1/p cycles capped at 16).
 //!   MANAGER_SEED_FROM_CURRENT — optional; default 1. Set 0 for PURE FRESH
 //!     mode: the unseeded global solve is adopted WHOLESALE every cycle
 //!     (per-entity noise gates bypassed; the Hungarian label alignment keeps
@@ -108,6 +112,12 @@ struct JoinState {
     registration_order: Vec<Uuid>,
     entity_data: Vec<(Uuid, Uuid, Vec3)>,
     affinity_config: arcane_affinity::config::AffinityConfig,
+    /// Joins accepted since the last control cycle: (entity, cluster).
+    /// The control loop drains these into the runtime's assignment ledger
+    /// FIRST thing each cycle — join IS owner assignment (founder model);
+    /// the routing pass then delivers the record to every node before the
+    /// client's first updates matter.
+    pending_joins: Vec<(Uuid, Uuid)>,
 }
 
 /// Handler state: clusters, join state.
@@ -183,16 +193,21 @@ async fn join_handler(
     .unwrap_or_else(|| s.clusters[0].clone());
     drop(join_state);
 
-    // Check if entity was parked (L1 short-term persistence, epic #305).
-    let parked = if let Some(entity_id_str) = params.entity_id {
+    // Ownership is assigned AT JOIN (founder model): the ledger entry is
+    // queued here, applied to the runtime at the top of the next control
+    // cycle, and delivered to nodes via owned statements — before the
+    // client's WS session settles. Also: parked check for reconnects.
+    let mut parked = false;
+    if let Some(entity_id_str) = params.entity_id {
         if let Ok(entity_id) = Uuid::parse_str(&entity_id_str) {
-            arcane_infra::parking::is_entity_parked(&s.redis_url, entity_id)
-        } else {
-            false
+            s.join_state
+                .lock()
+                .unwrap()
+                .pending_joins
+                .push((entity_id, cluster_id.id));
+            parked = arcane_infra::parking::is_entity_parked(&s.redis_url, entity_id);
         }
-    } else {
-        false
-    };
+    }
 
     Json(JoinResponse {
         cluster_id: cluster_id.id.to_string(),
@@ -559,6 +574,13 @@ async fn main() -> Result<(), String> {
     if let Ok(s) = env::var("MANAGER_SEED_FROM_CURRENT") {
         affinity_config.seed_from_current = !matches!(s.as_str(), "0" | "false" | "off" | "no");
     }
+    // Graph mode: MANAGER_PREDICTED_GRAPH=1 makes the interaction graph hold
+    // ONLY the predictor's current p(a,b) (edge = scale*p, assignment
+    // semantics, no accrual, no decay; updated at the attention-scaled
+    // re-prediction cadence).
+    if let Ok(s) = env::var("MANAGER_PREDICTED_GRAPH") {
+        affinity_config.predicted_graph = matches!(s.as_str(), "1" | "true" | "on" | "yes");
+    }
     if let Ok(pr_str) = env::var("MANAGER_PROXIMITY_RADIUS") {
         if let Ok(pr) = pr_str.parse::<f64>() {
             if pr.is_finite() && pr > 0.0 {
@@ -601,6 +623,7 @@ async fn main() -> Result<(), String> {
     // Initialize join state.
     let join_state = Arc::new(Mutex::new(JoinState {
         assignments: HashMap::new(),
+        pending_joins: Vec::new(),
         stale_clusters: HashSet::new(),
         registration_order: clusters.iter().map(|c| c.id).collect(),
         entity_data: Vec::new(),

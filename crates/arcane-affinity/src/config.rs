@@ -57,6 +57,20 @@ pub struct AffinityConfig {
     /// Partition objective weights (epic #293): the cost model that balances
     /// cut, crowding, instance cost, and churn.
     pub objective: super::objective::ObjectiveWeights,
+
+    /// PREDICTED GRAPH mode (founder design, 2026-07-25): the interaction
+    /// graph holds exactly ONE thing — the predictor's current p(a,b)
+    /// scaled to edge units — and is updated ONLY by new predictions (at
+    /// the attention-scaled re-prediction cadence). No accrual, no decay,
+    /// no summing of measurement channels: history is an INPUT to the
+    /// predictor, not a parallel term, and a standing prediction remains
+    /// the best estimate until re-examined — degrading it over time would
+    /// be destroying information. false = legacy accrual+decay graph.
+    pub predicted_graph: bool,
+
+    /// Edge weight for p = 1.0 in predicted-graph mode. 3.3 matches the
+    /// legacy equilibrium weight, so α/β/μ calibration carries over.
+    pub prediction_edge_scale: f64,
 }
 
 impl Default for AffinityConfig {
@@ -84,6 +98,9 @@ impl Default for AffinityConfig {
             seed_from_current: true,
 
             objective: Default::default(),
+
+            predicted_graph: false,
+            prediction_edge_scale: 3.3,
         }
     }
 }

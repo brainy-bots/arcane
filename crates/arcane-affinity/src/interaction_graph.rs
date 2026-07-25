@@ -94,6 +94,45 @@ impl InteractionGraph {
         edge.kinds.insert(kind);
     }
 
+    /// SET the edge weight for a pair (assignment semantics — predicted-graph
+    /// mode). The edge weight becomes exactly `weight`; the kind is recorded.
+    /// Unlike `record_interaction` (accrual), repeated calls do not grow the
+    /// edge: the graph holds the predictor's CURRENT estimate, nothing else.
+    pub fn set_edge(&mut self, a: Uuid, b: Uuid, weight: f64, kind: InteractionKind) {
+        if a == b {
+            return;
+        }
+        let pair = EntityPair::new(a, b);
+        if !self.weights.contains_key(&pair) {
+            self.adjacency.entry(a).or_default().insert(b);
+            self.adjacency.entry(b).or_default().insert(a);
+        }
+        let edge = self.weights.entry(pair).or_insert_with(|| PairEdge {
+            weight: 0.0,
+            kinds: HashSet::new(),
+        });
+        edge.weight = weight;
+        edge.kinds.insert(kind);
+    }
+
+    /// Remove a pair's edge entirely (predicted-graph mode: prediction fell
+    /// below the floor — the pair no longer exists for the partitioner).
+    /// Hard (Joint) edges are preserved: constraints outrank predictions.
+    pub fn clear_edge(&mut self, a: Uuid, b: Uuid) {
+        let pair = EntityPair::new(a, b);
+        if let Some(edge) = self.weights.get(&pair) {
+            if edge
+                .kinds
+                .iter()
+                .any(|k| k.colocation() == Colocation::Hard)
+            {
+                return; // never drop a joint constraint
+            }
+            self.weights.remove(&pair);
+            Self::unindex_pair(&mut self.adjacency, &pair);
+        }
+    }
+
     /// Apply exponential decay to all weights. Every gc_interval ticks, prune entries below gc_threshold.
     pub fn tick(&mut self, decay_factor: f64, gc_threshold: f64, gc_interval: u32) {
         self.tick_count = self.tick_count.wrapping_add(1);
@@ -257,6 +296,32 @@ mod tests {
         g.record_interaction(uuid(1), uuid(2), 1.0, InteractionKind::Proximity);
         assert_eq!(g.get_weight(uuid(2), uuid(1)), 1.0);
         assert_eq!(g.pair_count(), 1);
+    }
+
+    #[test]
+    fn set_edge_is_assignment_not_accrual() {
+        // Predicted-graph semantics: repeated set_edge holds the LAST value.
+        let mut g = InteractionGraph::new();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        g.set_edge(a, b, 2.0, InteractionKind::Proximity);
+        g.set_edge(a, b, 3.3, InteractionKind::Proximity);
+        g.set_edge(a, b, 0.5, InteractionKind::Proximity);
+        assert_eq!(g.get_weight(a, b), 0.5, "assignment, not accumulation");
+    }
+
+    #[test]
+    fn clear_edge_removes_soft_but_keeps_hard() {
+        let mut g = InteractionGraph::new();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        g.set_edge(a, b, 3.3, InteractionKind::Proximity);
+        g.clear_edge(a, b);
+        assert_eq!(g.get_weight(a, b), 0.0, "soft edge dropped");
+        assert_eq!(g.neighbors(a).count(), 0, "adjacency cleaned");
+
+        // A jointed pair survives clear_edge: constraints beat predictions.
+        g.record_interaction(a, b, 1.0, InteractionKind::Joint);
+        g.clear_edge(a, b);
+        assert!(g.is_uncuttable(a, b), "joint constraint preserved");
     }
 
     #[test]

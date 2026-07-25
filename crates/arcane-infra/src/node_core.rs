@@ -364,6 +364,10 @@ pub struct NodeCore {
     inbox_rx: Option<std::sync::mpsc::Receiver<NodeInboxFrame>>,
     #[cfg(feature = "migration")]
     state_publisher: Option<crate::state_keys::StatePublisher>,
+    /// Per-entity owner-gated writes (issue #331; ARCANE_ENTITY_KEYS=1).
+    /// When set, publishes entity records as individual owner-gated keys IN
+    /// ADDITION to the blob doc (transition period: readers may use either).
+    entity_key_publisher: Option<crate::entity_keys::EntityKeyPublisher>,
     #[cfg(feature = "migration")]
     state_publish_interval: u64,
     /// Game-declared pin feature name (NODE_PIN_FEATURE env). When set, entities
@@ -532,6 +536,21 @@ impl NodeCore {
         // statement replaces it wholesale.
 
         #[cfg(feature = "migration")]
+        let entity_key_publisher = if std::env::var("ARCANE_ENTITY_KEYS").as_deref() == Ok("1") {
+            match crate::entity_keys::EntityKeyPublisher::new(&cfg.redis_url, cfg.cluster_id) {
+                Ok(p) => {
+                    eprintln!("entity-keys mode ON: per-entity owner-gated writes");
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("entity-keys init failed ({e}); blob-only publishing");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "migration")]
         let (state_publisher, state_publish_interval) = {
             let interval = std::env::var("NODE_STATE_PUBLISH_TICKS")
                 .ok()
@@ -649,6 +668,8 @@ impl NodeCore {
             inbox_rx: None,
             #[cfg(feature = "migration")]
             state_publisher,
+            #[cfg(feature = "migration")]
+            entity_key_publisher,
             #[cfg(feature = "migration")]
             state_publish_interval,
             #[cfg(feature = "migration")]
@@ -1064,6 +1085,46 @@ impl NodeCore {
                 // A departed (tombstoned) id must not be re-adopted into the
                 // driver world even here — apply_inbox_frame already filters,
                 // this is belt-and-braces for the drain path.
+                // Entity-keys mode (#331): CLAIM ownership at adoption. The
+                // manager's owned statement named us; the claim write flips
+                // the record's owner field atomically — from this instant the
+                // old owner's writes bounce off the Lua gate. Seeded with the
+                // adopted state so the record never goes partial.
+                if let Some(ref ek) = self.entity_key_publisher {
+                    let tick = self.tick_count;
+                    let ops: Vec<crate::entity_keys::EntityWriteOp> = report
+                        .adopted
+                        .iter()
+                        .filter_map(|entry| {
+                            let rec = arcane_affinity::feature_map::EntityRecord {
+                                entity_id: entry.entity_id,
+                                cluster_id: self.cluster_id,
+                                position: arcane_core::types::Vec2::new(
+                                    entry.position.x,
+                                    entry.position.z,
+                                ),
+                                velocity: arcane_core::types::Vec2::new(
+                                    entry.velocity.x,
+                                    entry.velocity.z,
+                                ),
+                                features: arcane_affinity::feature_map::FeatureMap::new(),
+                                user_data: entry.user_data.clone(),
+                            };
+                            crate::entity_keys::encode_record(&rec)
+                                .ok()
+                                .map(|doc_json| crate::entity_keys::EntityWriteOp::Claim {
+                                    entity_id: entry.entity_id,
+                                    doc_json,
+                                    tick,
+                                })
+                        })
+                        .collect();
+                    if !ops.is_empty() {
+                        if let Err(e) = ek.publish(ops) {
+                            eprintln!("entity-keys claim error: {e}");
+                        }
+                    }
+                }
                 out.adopted_entities.extend(report.adopted);
                 for id in &report.lost {
                     // Purge the stale authoritative copy WITHOUT a client-facing
@@ -1351,6 +1412,29 @@ impl NodeCore {
                         }
                     })
                     .collect();
+
+                // Entity-keys mode (#331): per-entity owner-gated writes.
+                // Same records, one op per entity + one heartbeat. The Lua
+                // owner gate makes stale post-flip writes bounce at Redis.
+                if let Some(ref ek) = self.entity_key_publisher {
+                    let tick = self.server.current_tick();
+                    let mut ops: Vec<crate::entity_keys::EntityWriteOp> = entities
+                        .iter()
+                        .filter_map(|rec| {
+                            crate::entity_keys::encode_record(rec).ok().map(|doc_json| {
+                                crate::entity_keys::EntityWriteOp::Write {
+                                    entity_id: rec.entity_id,
+                                    doc_json,
+                                    tick,
+                                }
+                            })
+                        })
+                        .collect();
+                    ops.push(crate::entity_keys::EntityWriteOp::Heartbeat { tick });
+                    if let Err(e) = ek.publish(ops) {
+                        eprintln!("entity-keys publish error: {e}");
+                    }
+                }
 
                 let doc = crate::state_keys::ClusterStateDoc {
                     cluster_id: self.cluster_id,

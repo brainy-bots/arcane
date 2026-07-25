@@ -139,13 +139,29 @@ impl<B: InboxBus> ManagerRuntime<B> {
         }
     }
 
-    /// Feed entity position and cluster. On first sighting, establishes ownership.
-    /// On re-sighting, keeps the runner's assignments in sync with the driver's
-    /// cluster (after a flip, the manager must see the entity on its new cluster).
+    /// ASSIGN ownership (founder model, 2026-07-25): ownership is ONE field,
+    /// written HERE — at join/reconnect — before the client ever reaches a
+    /// node. The entire join process IS assigning an owner; a client entity
+    /// is never “unowned but simulated”. The next routing pass delivers the
+    /// record to every node (owned statements), so authorship follows the
+    /// ledger, never simulation facts.
+    pub fn assign_entity(&mut self, entity_id: Uuid, cluster_id: Uuid) {
+        self.assignments.insert(entity_id, cluster_id);
+        self.seen_clusters.insert(cluster_id);
+        // Touch liveness so absence-pruning cannot reap the assignment
+        // before the entity's first state report arrives.
+        self.last_seen.insert(entity_id, self.tick);
+    }
+
+    /// Feed entity position and cluster. The LEDGER is authoritative for
+    /// ownership: a sighting never overrides an existing assignment (after a
+    /// flip the old owner's stale reports must not flap the record back).
+    /// First-sighting fallback (or_insert) remains ONLY for sim-spawned
+    /// entities that never pass through /join — client entities are assigned
+    /// at join via `assign_entity` and hit the ledger here.
     pub fn update_entity(&mut self, entity_id: Uuid, cluster_id: Uuid, position: Vec3) {
         self.seen_clusters.insert(cluster_id);
         self.last_seen.insert(entity_id, self.tick);
-        // Establish ownership on first sighting, or use current assignment on re-sighting.
         let current_cluster = *self.assignments.entry(entity_id).or_insert(cluster_id);
         self.manager
             .update_entity(entity_id, current_cluster, position);

@@ -142,21 +142,6 @@ struct MigrationState {
     wave_window: usize,
     /// Minimum wins within the window to adopt (0 = waves disabled).
     wave_majority: usize,
-    /// Pure-fresh candidate hold (durability gate): a fresh layout that beat
-    /// STAY is held here and re-priced against the EVOLVING graph each
-    /// cycle; adopted only after `wave_candidate_cycles` consecutive wins.
-    ///
-    /// This is what distinguishes structure from noise, live-measured
-    /// (2026-07-25): in TOWNS mode a winning layout keeps winning (the
-    /// structure is stable) — it survives the hold and adopts. In UNIFORM
-    /// mode a fresh layout wins ~1700 J at birth but the crowd keeps mixing;
-    /// its advantage decays within seconds, a DIFFERENT arbitrary layout
-    /// wins the next cycle, and instant adoption redrew ~100 players every
-    /// 250ms (317 waves, 6245 migrations in 90s). An improvement that
-    /// cannot survive 1s of graph drift was never structural.
-    pending_wave: Option<(HashMap<Uuid, Uuid>, u32)>,
-    /// Consecutive winning cycles a candidate must survive before adoption.
-    wave_candidate_cycles: u32,
     /// Ownership-flip decisions made this cycle, awaiting drain by the caller.
     /// The Manager decides but never publishes (design §3: it never talks to clusters
     /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
@@ -185,9 +170,6 @@ struct PartitionDecision {
     /// Pure-fresh mode marker: the caller uses the candidate-hold gate
     /// instead of the two-tier sliding window.
     pure_fresh: bool,
-    /// The held candidate, re-priced on THIS cycle's graph, still beats STAY
-    /// by ≥ β (only meaningful in pure-fresh mode with a candidate held).
-    candidate_wins: bool,
 }
 
 /// Run split passes to a fixed point (bounded by k-1; each adopted split
@@ -377,7 +359,6 @@ fn build_partition_decisions(
     interaction_graph: &InteractionGraph,
     config: &AffinityConfig,
     known_clusters: &[Uuid],
-    wave_candidate: Option<&HashMap<Uuid, Uuid>>,
 ) -> PartitionDecision {
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
@@ -392,7 +373,6 @@ fn build_partition_decisions(
             movers_fresh: 0,
             wave: false,
             pure_fresh: !config.seed_from_current,
-            candidate_wins: false,
         };
     }
 
@@ -517,7 +497,6 @@ fn build_partition_decisions(
             movers_fresh: 0,
             wave: false,
             pure_fresh: !config.seed_from_current,
-            candidate_wins: false,
         };
     }
 
@@ -637,63 +616,37 @@ fn build_partition_decisions(
     // layout (3 towns on one cluster) loses to fresh by far more than β and
     // redraws in ONE cycle.
     if !config.seed_from_current {
-        // STAY: standing assignments; fresh placement only for entities the
-        // standing state does not cover.
-        let desired_stay: HashMap<Uuid, Uuid> = entities
+        // PURE FRESH (founder design, stated twice and now final): every
+        // cycle's fresh clustering is the best prediction available with
+        // the data at that moment — ADOPT IT, ALWAYS. There is no “stay”,
+        // no incumbent, no deadband, no candidate hold, and no μ·movers
+        // bias in any comparison (pricing the transition is just another
+        // way of caring about the previous setup). The state must EQUAL
+        // the newest prediction at all times. Stability is the solver's
+        // job (multilevel coarsening + Hungarian minimum-migration label
+        // alignment produce consistent groups from consistent data); where
+        // the data genuinely has no structure, migrations happen — and
+        // that is correct, not churn to be suppressed.
+        //
+        // History of what NOT to do here, all live-measured 2026-07-25:
+        // deadbands and candidate holds froze visitors inside foreign
+        // towns (47/300 misplaced with 11 foreign neighbors each) and
+        // showed an unrealistic zero-migration uniform crowd. The earlier
+        // per-entity-gate thrash (34k migrations) was caused by MIXING
+        // fragments of different solutions — which adopt-always never does.
+        let movers_fresh = desired_fresh
             .iter()
-            .filter_map(|e| {
-                current_assignments
-                    .get(e)
-                    .copied()
-                    .or_else(|| desired_fresh.get(e).copied())
-                    .map(|c| (*e, c))
-            })
-            .collect();
-        let (j_stay, _) = solution_cost(
-            &desired_stay,
-            &input.edges,
-            current_assignments,
-            &config.objective,
-        );
-        let (j_fresh, movers_fresh) = solution_cost(
-            &desired_fresh,
-            &input.edges,
-            current_assignments,
-            &config.objective,
-        );
-        let fresh_wins = j_fresh + config.objective.beta < j_stay;
-        // Durability check: does the HELD candidate (a fresh layout from a
-        // previous cycle) still beat STAY on TODAY's graph? Entities the
-        // candidate does not cover fall back to their standing assignment.
-        let candidate_wins = wave_candidate.is_some_and(|cand| {
-            let cand_full: HashMap<Uuid, Uuid> = entities
-                .iter()
-                .filter_map(|e| {
-                    cand.get(e)
-                        .or_else(|| desired_stay.get(e))
-                        .map(|c| (*e, *c))
-                })
-                .collect();
-            let (j_cand, _) = solution_cost(
-                &cand_full,
-                &input.edges,
-                current_assignments,
-                &config.objective,
-            );
-            j_cand + config.objective.beta < j_stay
-        });
-        // NO self-adoption: the caller's candidate-hold gate decides. The
-        // default this cycle is STAY (zero moves).
+            .filter(|(e, c)| current_assignments.get(e).is_some_and(|cur| cur != *c))
+            .count();
         return PartitionDecision {
-            desired: desired_stay,
+            desired: desired_fresh.clone(),
             desired_fresh,
-            fresh_wins,
-            j_fresh,
-            j_incr: j_stay,
+            fresh_wins: true,
+            j_fresh: 0.0,
+            j_incr: 0.0,
             movers_fresh,
-            wave: false,
+            wave: true,
             pure_fresh: true,
-            candidate_wins,
         };
     }
 
@@ -708,7 +661,6 @@ fn build_partition_decisions(
             movers_fresh: 0,
             wave: true,
             pure_fresh: false,
-            candidate_wins: false,
         };
     }
 
@@ -791,7 +743,6 @@ fn build_partition_decisions(
         desired: desired_incr,
         wave: false,
         pure_fresh: false,
-        candidate_wins: false,
     }
 }
 
@@ -1168,12 +1119,17 @@ impl ArcaneManager {
 
         self.migration_state.advance_tick();
 
-        // Decay + GC the interaction graph using config values.
-        self.interaction_graph.tick(
-            self.config.decay_factor,
-            self.config.gc_threshold,
-            self.config.gc_interval,
-        );
+        // Legacy graph: decay + GC. Predicted-graph mode has NO decay — a
+        // standing prediction is the best estimate until the predictor
+        // re-examines the pair (founder: “the only time we update the graph
+        // is with a new prediction, nothing else”).
+        if !self.config.predicted_graph {
+            self.interaction_graph.tick(
+                self.config.decay_factor,
+                self.config.gc_threshold,
+                self.config.gc_interval,
+            );
+        }
 
         // Record this cycle's signals into the graph. Proximity via a
         // uniform grid (cell = proximity_radius, 3x3 neighborhood): O(N·k)
@@ -1185,6 +1141,7 @@ impl ArcaneManager {
         let radius = self.config.proximity_radius;
         let radius_sq = radius * radius;
         let cell = radius.max(1.0);
+        let accrual_graph = !self.config.predicted_graph;
         let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, p) in players.iter().enumerate() {
             let key = (
@@ -1213,17 +1170,19 @@ impl ArcaneManager {
                         if dx * dx + dy * dy > radius_sq {
                             continue;
                         }
-                        let rvx = a.velocity.x - b.velocity.x;
-                        let rvy = a.velocity.y - b.velocity.y;
-                        let rel_speed = (rvx * rvx + rvy * rvy).sqrt();
-                        // Half-weight at 60 u/s relative (walking speed).
-                        let speed_scale = 1.0 / (1.0 + rel_speed / 60.0);
-                        self.interaction_graph.record_interaction(
-                            a.player_id,
-                            b.player_id,
-                            self.config.proximity_weight * speed_scale,
-                            InteractionKind::Proximity,
-                        );
+                        if accrual_graph {
+                            let rvx = a.velocity.x - b.velocity.x;
+                            let rvy = a.velocity.y - b.velocity.y;
+                            let rel_speed = (rvx * rvx + rvy * rvy).sqrt();
+                            // Half-weight at 60 u/s relative (walking speed).
+                            let speed_scale = 1.0 / (1.0 + rel_speed / 60.0);
+                            self.interaction_graph.record_interaction(
+                                a.player_id,
+                                b.player_id,
+                                self.config.proximity_weight * speed_scale,
+                                InteractionKind::Proximity,
+                            );
+                        }
                     }
                 }
             }
@@ -1243,16 +1202,20 @@ impl ArcaneManager {
                 }
             }
 
-            // Record pairwise edges within each group.
-            for group in feature_groups.values() {
-                for i in 0..group.len() {
-                    for j in (i + 1)..group.len() {
-                        self.interaction_graph.record_interaction(
-                            group[i],
-                            group[j],
-                            edge_rule.weight,
-                            InteractionKind::GameAction,
-                        );
+            // Record pairwise edges within each group (legacy accrual). In
+            // predicted-graph mode feature affinity reaches the graph through
+            // the predictor (features are PairContext inputs), not directly.
+            if accrual_graph {
+                for group in feature_groups.values() {
+                    for i in 0..group.len() {
+                        for j in (i + 1)..group.len() {
+                            self.interaction_graph.record_interaction(
+                                group[i],
+                                group[j],
+                                edge_rule.weight,
+                                InteractionKind::GameAction,
+                            );
+                        }
                     }
                 }
             }
@@ -1359,26 +1322,41 @@ impl ArcaneManager {
                 use arcane_affinity::predictor::InteractionPredictor as _;
                 let p = predictor.predict(&ctx);
                 self.prediction_memo.insert(key, (p, self.eval_cycle));
+                // PREDICTED GRAPH: the edge IS the prediction. Assignment,
+                // not accumulation; updated only when the predictor re-runs
+                // this pair (attention cadence); below-floor p drops the
+                // edge entirely.
+                if self.config.predicted_graph {
+                    let w = self.config.prediction_edge_scale * p;
+                    if w >= self.config.gc_threshold.max(0.05) {
+                        self.interaction_graph
+                            .set_edge(c.a, c.b, w, InteractionKind::Proximity);
+                    } else {
+                        self.interaction_graph.clear_edge(c.a, c.b);
+                    }
+                }
             }
 
-            let promotions = sweep_cold_pairs(
-                &due_candidates,
-                &predictor,
-                &feature_lookup,
-                &arcane_affinity::cold_pair::SweepConfig {
-                    horizon_secs: self.config.horizon_secs,
-                    promote_threshold: 0.1,
-                },
-            );
-
-            for promotion in promotions {
-                // Promoted pairs write with scaled weight
-                self.interaction_graph.record_interaction(
-                    promotion.a,
-                    promotion.b,
-                    self.config.promotion_weight_scale * promotion.p,
-                    InteractionKind::GameAction,
+            if accrual_graph {
+                let promotions = sweep_cold_pairs(
+                    &due_candidates,
+                    &predictor,
+                    &feature_lookup,
+                    &arcane_affinity::cold_pair::SweepConfig {
+                        horizon_secs: self.config.horizon_secs,
+                        promote_threshold: 0.1,
+                    },
                 );
+
+                for promotion in promotions {
+                    // Promoted pairs write with scaled weight
+                    self.interaction_graph.record_interaction(
+                        promotion.a,
+                        promotion.b,
+                        self.config.promotion_weight_scale * promotion.p,
+                        InteractionKind::GameAction,
+                    );
+                }
             }
         }
 
@@ -1403,11 +1381,6 @@ impl ArcaneManager {
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
         let t_pre_part = t0.elapsed();
-        let held_candidate = self
-            .migration_state
-            .pending_wave
-            .as_ref()
-            .map(|(d, _)| d.clone());
         let decision = build_partition_decisions(
             &view,
             &current_assignments,
@@ -1415,7 +1388,6 @@ impl ArcaneManager {
             &self.interaction_graph,
             &self.config,
             &self.known_clusters,
-            held_candidate.as_ref(),
         );
 
         // Wave adoption. Recalculation is never gated — both solutions were
@@ -1430,40 +1402,13 @@ impl ArcaneManager {
         // TWO-TIER mode: sliding-window majority over fresh-vs-incumbent.
         let mut decision = decision;
         if decision.pure_fresh {
-            let ms = &mut self.migration_state;
-            match ms.pending_wave.take() {
-                Some((cand, age)) if decision.candidate_wins => {
-                    let age = age + 1;
-                    if age >= ms.wave_candidate_cycles {
-                        eprintln!(
-                            "[wave] candidate survived {age} cycles of graph drift — atomic redraw ({} entities re-priced J {:.1} vs stay {:.1})",
-                            cand.len(),
-                            decision.j_fresh,
-                            decision.j_incr
-                        );
-                        // Adopt the HELD layout (fill gaps from stay = decision.desired).
-                        let mut adopted = decision.desired.clone();
-                        for (e, c) in &cand {
-                            adopted.insert(*e, *c);
-                        }
-                        decision.desired = adopted;
-                        decision.wave = true;
-                    } else {
-                        ms.pending_wave = Some((cand, age));
-                    }
-                }
-                Some(_) => {
-                    // Candidate stopped winning: it was transient. Replace it
-                    // with today's fresh layout if THAT wins, else drop.
-                    if decision.fresh_wins {
-                        ms.pending_wave = Some((decision.desired_fresh.clone(), 1));
-                    }
-                }
-                None => {
-                    if decision.fresh_wins {
-                        ms.pending_wave = Some((decision.desired_fresh.clone(), 1));
-                    }
-                }
+            // Adopt-always: nothing to gate. Log the redraw size when it
+            // actually moves anyone (diagnostics only).
+            if decision.movers_fresh > 0 {
+                eprintln!(
+                    "[wave] fresh prediction adopted: {} coordinated moves",
+                    decision.movers_fresh
+                );
             }
         } else {
             let ms = &mut self.migration_state;
@@ -1717,12 +1662,6 @@ impl MigrationState {
             // breathing that wins only transient cycles never reaches 75%.
             wave_window: 12,
             wave_majority: 9,
-            pending_wave: None,
-            // 4 cycles = 1s at demo cadence: a structural improvement loses
-            // nothing measurable in 1s; a uniform-crowd transient decays
-            // visibly (graph half-life ~3s, and the specific layout's edge
-            // alignment decays faster).
-            wave_candidate_cycles: 4,
         }
     }
 
