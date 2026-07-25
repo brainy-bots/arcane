@@ -815,15 +815,14 @@ impl NodeCore {
             // (`ARCANE_RECONNECT_TTL_SECS`), not the tombstone's lifetime.
             let entity_id = entry.entity_id;
             let mut entry = entry; // mutable so we can rehydrate user_data
+            let tick = self.tick_count;
             let action = revival_action(
                 entity_id,
                 &mut self.departed,
                 &self.owned_view,
-                &self.spawn_grace,
+                &mut self.spawn_grace,
+                tick,
             );
-            if action.revived {
-                self.spawn_grace.insert(entity_id, self.tick_count);
-            }
             if action.try_rehydrate {
                 // L1: parked snapshot (fresher, consume-once, TTL-bounded).
                 let rehydrated = if let Some(parked_snapshot) =
@@ -1450,17 +1449,28 @@ pub fn revival_action(
     entity_id: Uuid,
     departed: &mut HashMap<Uuid, u64>,
     owned_view: &HashSet<Uuid>,
-    spawn_grace: &HashMap<Uuid, u64>,
+    spawn_grace: &mut HashMap<Uuid, u64>,
+    current_tick: u64,
 ) -> RevivalOutcome {
     let revived = departed.remove(&entity_id).is_some();
     // First contact = we do not currently represent this entity. Covers:
     // tombstoned (just left, reconnect before manager forgot), tombstone
     // EXPIRED but parked key still live (the #321 gap), and fresh joins
-    // (no parked key; the probe is one GET on a brand-new session, not per
-    // update — after this tick the entity is in spawn_grace and never
-    // probes again).
+    // (no parked key).
     let try_rehydrate =
         revived || (!owned_view.contains(&entity_id) && !spawn_grace.contains_key(&entity_id));
+    // Probe-once is STRUCTURAL: any first-contact admission immediately
+    // enters spawn grace, so the same session's next update can never probe
+    // again. (The former contract said “after this tick the entity is in
+    // spawn_grace” but relied on submit_entities to do it — which SKIPS
+    // entities carrying a stale owner hint, e.g. a self-hint left by a
+    // migration bounce. Those stayed unowned+ungraced forever and probed
+    // Redis at the full client update rate: 300 players x 10Hz x a fresh
+    // TCP connection each = ephemeral-port exhaustion (WinError 10048),
+    // which then broke the WS reconnects that complete migrations.)
+    if try_rehydrate {
+        spawn_grace.insert(entity_id, current_tick);
+    }
     RevivalOutcome {
         revived,
         try_rehydrate,
@@ -1574,7 +1584,7 @@ mod revival_tests {
         // attempt the restore (both mechanisms fire).
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = [(e, 100u64)].into();
-        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        let out = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
         assert_eq!(
             out,
             RevivalOutcome {
@@ -1595,7 +1605,7 @@ mod revival_tests {
         // first contact must still try to rehydrate.
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
-        let out = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        let out = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
         assert!(!out.revived, "no tombstone to clear");
         assert!(
             out.try_rehydrate,
@@ -1611,7 +1621,7 @@ mod revival_tests {
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new();
         let owned: HashSet<Uuid> = [e].into();
-        let out = revival_action(e, &mut departed, &owned, &HashMap::new());
+        let out = revival_action(e, &mut departed, &owned, &mut HashMap::new(), 1);
         assert_eq!(
             out,
             RevivalOutcome {
@@ -1627,14 +1637,41 @@ mod revival_tests {
         // rehydrated, if a snapshot existed) on its first contact.
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new();
-        let grace: HashMap<Uuid, u64> = [(e, 7u64)].into();
-        let out = revival_action(e, &mut departed, &HashSet::new(), &grace);
+        let mut grace: HashMap<Uuid, u64> = [(e, 7u64)].into();
+        let out = revival_action(e, &mut departed, &HashSet::new(), &mut grace, 1);
         assert_eq!(
             out,
             RevivalOutcome {
                 revived: false,
                 try_rehydrate: false
             }
+        );
+    }
+
+    /// The ephemeral-port-exhaustion regression (2026-07-25): an entity that
+    /// is neither owned nor graced but carries a stale owner hint naming OUR
+    /// cluster falls through the self-forward guard into local admission —
+    /// and used to STAY unowned+ungraced (submit_entities skips hint-carrying
+    /// ids), probing Redis with a fresh TCP connection on EVERY 10Hz update
+    /// until Windows ran out of ephemeral ports (10048) and unrelated WS
+    /// reconnects — the ones that complete migrations — started failing.
+    /// Probe-once must be STRUCTURAL: the first revival_action call admits
+    /// the id into spawn grace itself, so the second call never probes.
+    #[test]
+    fn first_contact_probes_once_then_grace_blocks_reprobe() {
+        let e = Uuid::from_u128(11);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new();
+        let owned: HashSet<Uuid> = HashSet::new();
+        let mut grace: HashMap<Uuid, u64> = HashMap::new();
+
+        let first = revival_action(e, &mut departed, &owned, &mut grace, 5);
+        assert!(first.try_rehydrate, "first contact probes");
+        assert_eq!(grace.get(&e), Some(&5), "admission into grace is immediate");
+
+        let second = revival_action(e, &mut departed, &owned, &mut grace, 6);
+        assert!(
+            !second.try_rehydrate,
+            "same session's next update must NOT probe again — this loop is              what exhausted the OS port table live"
         );
     }
 
@@ -1734,7 +1771,7 @@ mod revival_tests {
             !old_gate_rehydrates,
             "old gate skips the restore in the gap state"
         );
-        let new_gate = revival_action(e, &mut departed, &HashSet::new(), &HashMap::new());
+        let new_gate = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
         assert!(new_gate.try_rehydrate, "new gate restores in the gap state");
     }
 }

@@ -12,7 +12,42 @@
 //! - `arcane:parked:{entity_id}` — parked entity snapshot, expires after TTL.
 
 use arcane_core::replication_channel::EntityStateEntry;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use uuid::Uuid;
+
+/// Process-wide cache of persistent Redis connections, one per URL.
+///
+/// Parking I/O used to open a NEW TCP connection per call. At the designed
+/// rate (one park per player leave) that was tolerable; combined with a hot
+/// loop it exhausted the OS ephemeral port table (Windows error 10048: every
+/// port in TIME_WAIT), which then broke UNRELATED connects — including the
+/// WS reconnects that complete migrations. Live-observed as “entities stuck
+/// mid-migration”. A cached connection makes parking I/O O(process), not
+/// O(calls); on any Redis error the connection is dropped and rebuilt next
+/// call (Redis auto-reconnect semantics).
+static CONNECTIONS: Mutex<Option<HashMap<String, redis::Connection>>> = Mutex::new(None);
+
+/// Run `f` on the cached connection for `redis_url`, creating it if needed.
+/// On error the cached connection is discarded so the next call reconnects.
+fn with_connection<T>(
+    redis_url: &str,
+    f: impl FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
+) -> redis::RedisResult<T> {
+    let mut guard = CONNECTIONS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if !map.contains_key(redis_url) {
+        let client = redis::Client::open(redis_url)?;
+        let conn = client.get_connection()?;
+        map.insert(redis_url.to_string(), conn);
+    }
+    let conn = map.get_mut(redis_url).expect("just inserted");
+    let result = f(conn);
+    if result.is_err() {
+        map.remove(redis_url); // poisoned/broken: rebuild on next call
+    }
+    result
+}
 
 /// Configuration for parking behavior.
 #[derive(Clone, Debug)]
@@ -55,23 +90,6 @@ pub fn park_entity(
         return;
     }
 
-    // Connect to Redis (blocking call at leave time is acceptable).
-    let client = match redis::Client::open(redis_url) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("parking: Redis open failed for {}: {}", entity_id, e);
-            return;
-        }
-    };
-
-    let mut conn = match client.get_connection() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("parking: Redis connection failed for {}: {}", entity_id, e);
-            return;
-        }
-    };
-
     // Serialize: spine (id, cluster_id, position, velocity) + user_data.
     // Create a minimal snapshot (don't serialize local_data).
     let snapshot = serde_json::json!({
@@ -104,13 +122,15 @@ pub fn park_entity(
     let key = parked_key(entity_id);
     let ttl_secs = config.reconnect_ttl_secs;
 
-    // SET key value EX ttl_secs
-    let res: Result<(), redis::RedisError> = redis::cmd("SET")
-        .arg(&key)
-        .arg(&json_str)
-        .arg("EX")
-        .arg(ttl_secs)
-        .query(&mut conn);
+    // SET key value EX ttl_secs (pooled connection; see CONNECTIONS).
+    let res: Result<(), redis::RedisError> = with_connection(redis_url, |conn| {
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(&json_str)
+            .arg("EX")
+            .arg(ttl_secs)
+            .query(conn)
+    });
 
     match res {
         Ok(()) => {
@@ -127,50 +147,32 @@ pub fn park_entity(
 
 /// Check if an entity is parked in Redis without consuming it.
 pub fn is_entity_parked(redis_url: &str, entity_id: Uuid) -> bool {
-    let client = match redis::Client::open(redis_url) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    let mut conn = match client.get_connection() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
     let key = parked_key(entity_id);
-    let exists: i32 = redis::cmd("EXISTS").arg(&key).query(&mut conn).unwrap_or(0);
-    exists > 0
+    with_connection(redis_url, |conn| {
+        redis::cmd("EXISTS").arg(&key).query::<i32>(conn)
+    })
+    .map(|exists| exists > 0)
+    .unwrap_or(false)
 }
 
 /// Retrieve and consume a parked entity snapshot from Redis.
 /// Returns the snapshot JSON if found and deleted; None if expired or missing.
 pub fn unpark_entity(redis_url: &str, entity_id: Uuid) -> Option<serde_json::Value> {
-    let client = match redis::Client::open(redis_url) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("unpark: Redis open failed for {}: {}", entity_id, e);
-            return None;
-        }
-    };
-
-    let mut conn = match client.get_connection() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("unpark: Redis connection failed for {}: {}", entity_id, e);
-            return None;
-        }
-    };
-
     let key = parked_key(entity_id);
 
-    // GET key and DELETE atomically via a Lua script or just GET then DEL.
-    // For simplicity, GET then DEL (slight race window but acceptable for this use case).
-    let json_str: Option<String> = redis::cmd("GET").arg(&key).query(&mut conn).unwrap_or(None);
+    // GETDEL: atomic consume-once (replaces the old GET-then-DEL pair — one
+    // round trip, no race window). Pooled connection; errors log once and
+    // return None (caller treats it as “no snapshot”).
+    let json_str: Option<String> =
+        match with_connection(redis_url, |conn| redis::cmd("GETDEL").arg(&key).query(conn)) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("unpark: Redis error for {}: {}", entity_id, e);
+                return None;
+            }
+        };
 
     let json_str = json_str?;
-
-    // Delete the key (consume-once).
-    let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap_or(());
 
     // Deserialize the snapshot.
     match serde_json::from_str::<serde_json::Value>(&json_str) {
