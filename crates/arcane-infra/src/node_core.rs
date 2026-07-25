@@ -816,12 +816,19 @@ impl NodeCore {
             let entity_id = entry.entity_id;
             let mut entry = entry; // mutable so we can rehydrate user_data
             let tick = self.tick_count;
+            // Records naming this entity (a proxy or hint). If one named a
+            // DIFFERENT owner we forwarded above and never reach here, so a
+            // record at this point is the stale-self transient — the exact
+            // state that must NOT be re-claimed (see revival_action docs).
+            let has_record = self.neighbor_entities.contains_key(&entity_id)
+                || self.owner_hints.contains_key(&entity_id);
             let action = revival_action(
                 entity_id,
                 &mut self.departed,
                 &self.owned_view,
                 &mut self.spawn_grace,
                 tick,
+                has_record,
             );
             if action.try_rehydrate {
                 // L1: parked snapshot (fresher, consume-once, TTL-bounded).
@@ -1451,23 +1458,36 @@ pub fn revival_action(
     owned_view: &HashSet<Uuid>,
     spawn_grace: &mut HashMap<Uuid, u64>,
     current_tick: u64,
+    has_foreign_record: bool,
 ) -> RevivalOutcome {
     let revived = departed.remove(&entity_id).is_some();
-    // First contact = we do not currently represent this entity. Covers:
-    // tombstoned (just left, reconnect before manager forgot), tombstone
-    // EXPIRED but parked key still live (the #321 gap), and fresh joins
-    // (no parked key).
-    let try_rehydrate =
-        revived || (!owned_view.contains(&entity_id) && !spawn_grace.contains_key(&entity_id));
+    // First contact = we do not currently represent this entity AND no
+    // ownership record (neighbor proxy / owner hint) speaks for it. The
+    // record check is the SPLIT-BRAIN guard: after a migration away, this
+    // node's records still name the entity (usually the new owner — then
+    // forwarding handled it before we got here — but transiently OUR OWN
+    // cluster via an in-flight pre-flip router frame; the self-forward
+    // guard falls through to here). Granting spawn grace in that state
+    // re-CLAIMS the entity (grace = authorship in submit_entities +
+    // should_author) while the real owner also authors it: two nodes
+    // publishing the same id at different positions (live-observed desync,
+    // 2026-07-25) and systematically oscillating ownership that no noise
+    // filter can fix (it is contradiction, not noise). A previous version
+    // of this function ignored the records — that was the regression.
+    //
+    // Tombstone revival intentionally BYPASSES the record check: a departed
+    // id arriving on a real client update left FROM US; any record naming
+    // it is stale by construction (the leave happened after).
+    let try_rehydrate = revived
+        || (!owned_view.contains(&entity_id)
+            && !spawn_grace.contains_key(&entity_id)
+            && !has_foreign_record);
     // Probe-once is STRUCTURAL: any first-contact admission immediately
     // enters spawn grace, so the same session's next update can never probe
-    // again. (The former contract said “after this tick the entity is in
-    // spawn_grace” but relied on submit_entities to do it — which SKIPS
-    // entities carrying a stale owner hint, e.g. a self-hint left by a
-    // migration bounce. Those stayed unowned+ungraced forever and probed
-    // Redis at the full client update rate: 300 players x 10Hz x a fresh
-    // TCP connection each = ephemeral-port exhaustion (WinError 10048),
-    // which then broke the WS reconnects that complete migrations.)
+    // again (the record-carrying transient above probes ZERO times — it is
+    // not a session first-contact, it is a migration in flight; the old
+    // code probed Redis for it on every 10Hz update with a fresh TCP
+    // connection each = ephemeral-port exhaustion, WinError 10048).
     if try_rehydrate {
         spawn_grace.insert(entity_id, current_tick);
     }
@@ -1584,7 +1604,14 @@ mod revival_tests {
         // attempt the restore (both mechanisms fire).
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = [(e, 100u64)].into();
-        let out = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
+        let out = revival_action(
+            e,
+            &mut departed,
+            &HashSet::new(),
+            &mut HashMap::new(),
+            1,
+            false,
+        );
         assert_eq!(
             out,
             RevivalOutcome {
@@ -1605,7 +1632,14 @@ mod revival_tests {
         // first contact must still try to rehydrate.
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new(); // pruned
-        let out = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
+        let out = revival_action(
+            e,
+            &mut departed,
+            &HashSet::new(),
+            &mut HashMap::new(),
+            1,
+            false,
+        );
         assert!(!out.revived, "no tombstone to clear");
         assert!(
             out.try_rehydrate,
@@ -1621,7 +1655,7 @@ mod revival_tests {
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new();
         let owned: HashSet<Uuid> = [e].into();
-        let out = revival_action(e, &mut departed, &owned, &mut HashMap::new(), 1);
+        let out = revival_action(e, &mut departed, &owned, &mut HashMap::new(), 1, false);
         assert_eq!(
             out,
             RevivalOutcome {
@@ -1638,7 +1672,7 @@ mod revival_tests {
         let e = Uuid::from_u128(1);
         let mut departed: HashMap<Uuid, u64> = HashMap::new();
         let mut grace: HashMap<Uuid, u64> = [(e, 7u64)].into();
-        let out = revival_action(e, &mut departed, &HashSet::new(), &mut grace, 1);
+        let out = revival_action(e, &mut departed, &HashSet::new(), &mut grace, 1, false);
         assert_eq!(
             out,
             RevivalOutcome {
@@ -1646,6 +1680,49 @@ mod revival_tests {
                 try_rehydrate: false
             }
         );
+    }
+
+    /// THE split-brain regression (2026-07-25, founder-observed desync): an
+    /// entity that migrated away but whose client still sends here, with a
+    /// stale record naming OUR OWN cluster (in-flight pre-flip router frame
+    /// → self-forward guard falls through to local admission). Granting
+    /// spawn grace here re-claims the entity while the REAL owner authors
+    /// it too — two positions for one id on screen, and systematically
+    /// oscillating ownership no noise filter can fix. The record must veto
+    /// the grace AND the probe.
+    #[test]
+    fn stale_self_record_never_regains_authorship() {
+        let e = Uuid::from_u128(21);
+        let mut departed: HashMap<Uuid, u64> = HashMap::new(); // no tombstone
+        let owned: HashSet<Uuid> = HashSet::new(); // migrated away
+        let mut grace: HashMap<Uuid, u64> = HashMap::new();
+
+        let out = revival_action(e, &mut departed, &owned, &mut grace, 5, true);
+        assert!(!out.revived);
+        assert!(
+            !out.try_rehydrate,
+            "record-carrying transient must not probe"
+        );
+        assert!(
+            grace.is_empty(),
+            "and must NOT be re-claimed — grace grants authorship; the real              owner is publishing this entity right now"
+        );
+    }
+
+    /// Tombstone revival bypasses the record veto: the id left FROM US (a
+    /// client leave), so any record naming it is stale by construction. A
+    /// returning session must revive + rehydrate even if a stale proxy/hint
+    /// still exists.
+    #[test]
+    fn tombstone_revival_beats_stale_record() {
+        let e = Uuid::from_u128(22);
+        let mut departed: HashMap<Uuid, u64> = [(e, 42u64)].into();
+        let mut grace: HashMap<Uuid, u64> = HashMap::new();
+
+        let out = revival_action(e, &mut departed, &HashSet::new(), &mut grace, 5, true);
+        assert!(out.revived, "tombstone cleared");
+        assert!(out.try_rehydrate, "parked snapshot restored");
+        assert_eq!(grace.get(&e), Some(&5), "re-graced at home");
     }
 
     /// The ephemeral-port-exhaustion regression (2026-07-25): an entity that
@@ -1664,11 +1741,11 @@ mod revival_tests {
         let owned: HashSet<Uuid> = HashSet::new();
         let mut grace: HashMap<Uuid, u64> = HashMap::new();
 
-        let first = revival_action(e, &mut departed, &owned, &mut grace, 5);
+        let first = revival_action(e, &mut departed, &owned, &mut grace, 5, false);
         assert!(first.try_rehydrate, "first contact probes");
         assert_eq!(grace.get(&e), Some(&5), "admission into grace is immediate");
 
-        let second = revival_action(e, &mut departed, &owned, &mut grace, 6);
+        let second = revival_action(e, &mut departed, &owned, &mut grace, 6, false);
         assert!(
             !second.try_rehydrate,
             "same session's next update must NOT probe again — this loop is              what exhausted the OS port table live"
@@ -1771,7 +1848,14 @@ mod revival_tests {
             !old_gate_rehydrates,
             "old gate skips the restore in the gap state"
         );
-        let new_gate = revival_action(e, &mut departed, &HashSet::new(), &mut HashMap::new(), 1);
+        let new_gate = revival_action(
+            e,
+            &mut departed,
+            &HashSet::new(),
+            &mut HashMap::new(),
+            1,
+            false,
+        );
         assert!(new_gate.try_rehydrate, "new gate restores in the gap state");
     }
 }

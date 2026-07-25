@@ -104,6 +104,25 @@ struct MigrationState {
     max_in_flight: usize,
     /// Current tick counter for cooldown tracking.
     current_tick: u64,
+    /// Persistence gate: per entity, the (destination, consecutive-cycles)
+    /// streak of the partitioner WANTING that destination. A flip is emitted
+    /// only when the same destination has been desired for
+    /// `persistence_cycles` consecutive evaluation cycles. This filters
+    /// MEASUREMENT noise (interaction-graph weights on a fast-decay clock
+    /// oscillate with amplitude comparable to μ, so single-cycle ΔJ can
+    /// change sign cycle-to-cycle) without touching the economics: a real
+    /// regime change is persistent by definition and pays only
+    /// (persistence_cycles − 1) × cadence of latency; symmetric noise almost
+    /// never survives N consecutive same-direction cycles. Live-measured
+    /// before this gate (2026-07-25): 291/299 entities had immediate
+    /// A→B→A ping-pongs, worst 18 migrations — with matching position
+    /// desync while ownership oscillated.
+    desired_streak: HashMap<Uuid, (Uuid, u32)>,
+    /// Consecutive cycles a destination must persist before flipping.
+    persistence_cycles: u32,
+    /// Residence-hysteresis window (evaluation cycles): entities that
+    /// migrated within this window need 4× the persistence to move again.
+    residence_ticks: u64,
     /// Ownership-flip decisions made this cycle, awaiting drain by the caller.
     /// The Manager decides but never publishes (design §3: it never talks to clusters
     /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
@@ -578,6 +597,14 @@ impl ArcaneManager {
     pub fn set_migration_pacing(&mut self, max_in_flight: usize, cooldown_ticks: u64) {
         self.migration_state.max_in_flight = max_in_flight.max(1);
         self.migration_state.cooldown_ticks = cooldown_ticks.max(1);
+    }
+
+    /// Configure the flip persistence gate: consecutive evaluation cycles a
+    /// destination must persist before a flip is emitted. 1 = gate off
+    /// (previous behavior). Clamped ≥ 1.
+    #[cfg(feature = "migration")]
+    pub fn set_flip_persistence(&mut self, cycles: u32) {
+        self.migration_state.persistence_cycles = cycles.max(1);
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
@@ -1106,6 +1133,15 @@ impl ArcaneManager {
                             continue;
                         }
                     }
+                    // Persistence gate + residence hysteresis: only flip
+                    // when this destination has been desired for the required
+                    // number of consecutive cycles — base for settled
+                    // entities, 4× for recent movers (Schmitt trigger; see
+                    // required_streak docs).
+                    let required = self.migration_state.required_streak(entity_id);
+                    if self.migration_state.note_desire(entity_id, desired_cluster) < required {
+                        continue;
+                    }
                     // Decision is to migrate this entity.
                     if self.migration_state.can_migrate(entity_id) {
                         let flip = OwnershipFlip {
@@ -1115,6 +1151,8 @@ impl ArcaneManager {
                             effective_tick: self.migration_state.current_tick,
                         };
                         self.migration_state.record_migration(flip);
+                        // Fresh start for the next decision at the new home.
+                        self.migration_state.clear_desire(entity_id);
                         eprintln!(
                             "Migration initiated for entity {} from {} to {}",
                             entity_id, current_cluster, desired_cluster
@@ -1129,6 +1167,10 @@ impl ArcaneManager {
                         };
                         self.migration_state.log_declined(entity_id, reason);
                     }
+                } else {
+                    // Desire matches the standing assignment: any pending
+                    // streak was noise that resolved itself — reset it.
+                    self.migration_state.clear_desire(entity_id);
                 }
             }
         }
@@ -1235,7 +1277,63 @@ impl MigrationState {
             max_in_flight: 5,
             current_tick: 1,
             pending_flips: Vec::new(),
+            desired_streak: HashMap::new(),
+            persistence_cycles: 3,
+            // 40 cycles = 10s at the 250ms demo cadence: comfortably longer
+            // than the graph-breathing oscillation period (2–8s), so a limit
+            // cycle cannot complete a round trip inside the window.
+            residence_ticks: 40,
         }
+    }
+
+    /// Record this cycle's desired destination for an entity; returns the
+    /// consecutive-cycle streak for that destination. A changed desire
+    /// resets the streak to 1. The caller compares against its threshold
+    /// (base persistence, or the raised residence-hysteresis threshold for
+    /// recently-migrated entities).
+    fn note_desire(&mut self, entity_id: Uuid, desired: Uuid) -> u32 {
+        let entry = self
+            .desired_streak
+            .entry(entity_id)
+            .and_modify(|(dst, streak)| {
+                if *dst == desired {
+                    *streak = streak.saturating_add(1);
+                } else {
+                    *dst = desired;
+                    *streak = 1;
+                }
+            })
+            .or_insert((desired, 1));
+        entry.1
+    }
+
+    /// Residence hysteresis (Schmitt trigger): how many consecutive cycles a
+    /// desire must persist for THIS entity right now. Base persistence for
+    /// settled entities; 4× for entities that migrated within
+    /// `residence_ticks` — a recent mover needs much stronger sustained
+    /// evidence to move again. This breaks limit cycles that plain
+    /// persistence cannot: the live oscillation (2026-07-25: 435 immediate
+    /// ping-pongs in 4 min) had a 2–8s period — the interaction graph's
+    /// decay timescale — so each direction of the swing was individually
+    /// “persistent” for 3+ cycles. Asymmetric thresholds are the classic
+    /// fix for high-gain feedback (the κ barrier near its hinge) + loop
+    /// delay (handoff latency): moving is easy, moving BACK is hard.
+    fn required_streak(&self, entity_id: Uuid) -> u32 {
+        let recently_moved = self
+            .last_migrated
+            .get(&entity_id)
+            .is_some_and(|&t| self.current_tick.saturating_sub(t) < self.residence_ticks);
+        if recently_moved {
+            self.persistence_cycles.saturating_mul(4)
+        } else {
+            self.persistence_cycles
+        }
+    }
+
+    /// Clear the streak for an entity whose desire matches its standing
+    /// assignment again (stopped wanting to move) or that has left.
+    fn clear_desire(&mut self, entity_id: Uuid) {
+        self.desired_streak.remove(&entity_id);
     }
 
     fn advance_tick(&mut self) {
@@ -1290,6 +1388,86 @@ mod migration_tests {
             to_cluster: Uuid::from_u128(0xB),
             effective_tick: 1,
         }
+    }
+
+    #[test]
+    fn persistence_gate_blocks_transient_desires() {
+        // A destination that flickers (A this cycle, back to standing next)
+        // must never open the gate at persistence 3; a persistent desire
+        // opens it on the 3rd consecutive cycle. This pins the anti-flap
+        // behavior that the live 2026-07-25 session lacked (291/299 entities
+        // ping-ponged when single-cycle ΔJ sign flips drove flips directly).
+        let mut state = MigrationState::new();
+        state.persistence_cycles = 3;
+        let e = Uuid::from_u128(1);
+        let a = Uuid::from_u128(100);
+        let b = Uuid::from_u128(200);
+
+        let req = state.persistence_cycles;
+        assert!(state.note_desire(e, a) < req, "cycle 1: streak 1 < 3");
+        assert!(state.note_desire(e, a) < req, "cycle 2: streak 2 < 3");
+        // Noise: desire flips to B — streak resets.
+        assert!(
+            state.note_desire(e, b) < req,
+            "changed desire resets streak"
+        );
+        assert!(state.note_desire(e, a) < req, "back to A: streak 1 again");
+        assert!(state.note_desire(e, a) < req, "streak 2");
+        assert!(
+            state.note_desire(e, a) >= req,
+            "3 consecutive cycles: gate opens"
+        );
+
+        // clear_desire resets (entity migrated or stopped wanting to move).
+        state.clear_desire(e);
+        assert!(
+            state.note_desire(e, a) < req,
+            "after clear: streak restarts at 1"
+        );
+    }
+
+    #[test]
+    fn persistence_gate_off_at_one_cycle() {
+        // persistence_cycles = 1 must reproduce the old immediate behavior.
+        let mut state = MigrationState::new();
+        state.persistence_cycles = 1;
+        let e = Uuid::from_u128(1);
+        assert!(
+            state.note_desire(e, Uuid::from_u128(100)) >= state.persistence_cycles,
+            "gate open immediately"
+        );
+    }
+
+    #[test]
+    fn residence_hysteresis_raises_threshold_for_recent_movers() {
+        // Schmitt trigger: a settled entity needs `persistence_cycles`; an
+        // entity that migrated within residence_ticks needs 4x. This is what
+        // breaks the slow (2-8s period) limit cycle that plain persistence
+        // passed: each swing direction was individually persistent.
+        let mut state = MigrationState::new();
+        let e = Uuid::from_u128(1);
+        assert_eq!(
+            state.required_streak(e),
+            state.persistence_cycles,
+            "settled: base"
+        );
+
+        state.record_migration(mk_flip(e));
+        assert_eq!(
+            state.required_streak(e),
+            state.persistence_cycles * 4,
+            "recent mover: 4x threshold"
+        );
+
+        // Advance past the residence window: back to base.
+        for _ in 0..state.residence_ticks {
+            state.advance_tick();
+        }
+        assert_eq!(
+            state.required_streak(e),
+            state.persistence_cycles,
+            "residence window elapsed: base threshold again"
+        );
     }
 
     #[test]

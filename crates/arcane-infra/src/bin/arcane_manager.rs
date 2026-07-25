@@ -23,6 +23,9 @@
 //!   MANAGER_MIGRATION_COOLDOWN_TICKS — optional int; default 10. Evaluation
 //!     cycles an entity waits between re-migrations (handoff-settle guard;
 //!     flapping is prevented economically by μ + sticky seeding, not by this).
+//!   MANAGER_FLIP_PERSISTENCE_CYCLES — optional int; default 3. Consecutive
+//!     evaluation cycles the SAME destination must be desired before a flip
+//!     is emitted (noise filter on the interaction-graph estimate; 1 = off).
 //!   MANAGER_DECAY_FACTOR — optional float in (0,1); default 0.97. Interaction
 //!     graph memory per cycle. Half-life = ln(0.5)/ln(d) cycles (0.97 ≈ 23
 //!     cycles ≈ 5.7s at 250ms cadence). Lower = the graph forgets old
@@ -31,6 +34,15 @@
 //!     of a proximity edge. Equilibrium weight = w/(1−decay); if you lower the
 //!     decay factor, raise this to keep equilibrium ≈ 3.3, which the
 //!     objective's α/β/μ calibration assumes.
+//!   MANAGER_PROXIMITY_RADIUS — optional float; default 50. Interaction radius
+//!     in world units: how far apart two players can be and still accrue an
+//!     edge. THE community-vs-load balance knob: the per-entity cut signal is
+//!     (concurrent contacts × equilibrium weight), and contacts scale with
+//!     radius² × local density. Too small ⇒ a player in a dense community has
+//!     ~2 contacts (≈6.6 cut signal), which LOSES to the crowding
+//!     differential between a large and small cluster (≈5–8) + μ —
+//!     stragglers stay on far-away clusters indefinitely (live-observed
+//!     2026-07-25). Size it to “players who can see each other interact”.
 //!   MANAGER_STALE_LIMIT_MS — optional; default 3 * cadence. Staleness window for clusters.
 //!   /join endpoint: accepts optional `?x=&y=&z=` spawn position hint query params.
 //!     Joins are placed by the partition objective (epic #293).
@@ -293,10 +305,16 @@ async fn control_loop(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10u64);
             manager.set_migration_pacing(max_in_flight, cooldown_ticks);
+            let persistence: u32 = env::var("MANAGER_FLIP_PERSISTENCE_CYCLES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            manager.set_flip_persistence(persistence);
             eprintln!(
-                "arcane-manager: migration pacing — max_in_flight={}, cooldown_ticks={}",
+                "arcane-manager: migration pacing — max_in_flight={}, cooldown_ticks={}, flip_persistence={}",
                 max_in_flight.max(1),
-                cooldown_ticks.max(1)
+                cooldown_ticks.max(1),
+                persistence.max(1)
             );
         }
         if let Some(ref pf) = pin_feature {
@@ -512,13 +530,25 @@ async fn main() -> Result<(), String> {
             }
         }
     }
+    if let Ok(pr_str) = env::var("MANAGER_PROXIMITY_RADIUS") {
+        if let Ok(pr) = pr_str.parse::<f64>() {
+            if pr.is_finite() && pr > 0.0 {
+                affinity_config.proximity_radius = pr;
+            } else {
+                eprintln!(
+                    "arcane-manager: invalid MANAGER_PROXIMITY_RADIUS={pr} (need > 0); keeping {}",
+                    affinity_config.proximity_radius
+                );
+            }
+        }
+    }
     // Operator-error guard: negative/NaN weights invert the objective
     // (crowding becomes a reward, churn becomes free); γ ≤ 1 kills the
     // emergent-split property. Invalid values fall back to defaults, loudly.
     affinity_config.objective = arcane_affinity::objective::sanitize(affinity_config.objective);
 
     eprintln!(
-        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}, graph={{decay={}, prox_w={}, eq_w≈{:.2}}}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}, graph={{decay={}, prox_w={}, prox_r={}, eq_w≈{:.2}}}",
         clusters.len(),
         cadence_ms,
         redis_url,
@@ -530,6 +560,7 @@ async fn main() -> Result<(), String> {
         affinity_config.objective.kappa,
         affinity_config.decay_factor,
         affinity_config.proximity_weight,
+        affinity_config.proximity_radius,
         affinity_config.proximity_weight / (1.0 - affinity_config.decay_factor)
     );
 
