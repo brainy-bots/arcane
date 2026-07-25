@@ -36,9 +36,8 @@ fn uuid(i: u8) -> Uuid {
 
 /// Affinity manager configured with the TEST-declared "party"/"guild" vocabulary
 /// (ordinary feature names + edge rules; the library knows neither word — #272).
-fn affinity_manager() -> ArcaneManager {
-    let mut mgr = ArcaneManager::with_model("affinity");
-    mgr.set_affinity_config(AffinityConfig {
+fn affinity_config() -> AffinityConfig {
+    AffinityConfig {
         edge_rules: vec![
             EdgeRule {
                 feature: "party".to_string(),
@@ -50,7 +49,12 @@ fn affinity_manager() -> ArcaneManager {
             },
         ],
         ..AffinityConfig::default()
-    });
+    }
+}
+
+fn affinity_manager() -> ArcaneManager {
+    let mut mgr = ArcaneManager::with_model("affinity");
+    mgr.set_affinity_config(affinity_config());
     mgr
 }
 
@@ -221,10 +225,20 @@ fn full_loop_two_nodes_converge_with_exactly_once() {
     }
 }
 
-/// Boundary interest: two 3-entity cliques stay split (capacity), with a guild edge
-/// across the cut. Each node must receive the OTHER side's boundary entity as a
-/// foreign proxy through its inbox — the R2→R5 replication path, not the legacy
-/// all-pairs neighbor channel (which does not exist in this test).
+/// Boundary interest: two 3-entity cliques stay split, with a guild edge across
+/// the cut. Each node must receive the OTHER side's boundary entity as a foreign
+/// proxy through its inbox — the R2→R5 replication path, not the legacy all-pairs
+/// neighbor channel (which does not exist in this test).
+///
+/// What keeps the cliques split is the LOAD BARRIER (`objective.cap`) — the only
+/// mechanism that expresses capacity since epic #293 deleted `capacity_factor`.
+/// Without it these six entities correctly CONSOLIDATE onto one cluster, and
+/// that is not a bug: at alpha = 1.25 the crowding relief of splitting 6
+/// entities (~2.8) never pays the beta = 15 instance cost, so one cluster is
+/// genuinely the cheaper layout (the epic's designed "consolidate below s*"
+/// behavior). A test asserting "stays split" must therefore MAKE the split
+/// cheaper on the objective: cap = 3 puts each clique exactly at capacity, so
+/// co-locating all six pays the barrier and the split wins on merit.
 #[test]
 fn full_loop_boundary_proxies_flow_to_nodes() {
     let c1 = uuid(1);
@@ -240,7 +254,16 @@ fn full_loop_boundary_proxies_flow_to_nodes() {
     let mut node1 = SimNode::new(c1, &bus, &[a, a2, a3]);
     let mut node2 = SimNode::new(c2, &bus, &[b, b2, b3]);
 
-    let mut runtime = ManagerRuntime::new(affinity_manager(), bus, Default::default());
+    // Capacity pressure through the load barrier: 3 per cluster = exactly one
+    // clique each. kappa is raised so crossing capacity is decisively worse
+    // than the guild edge being cut.
+    let mut mgr = affinity_manager();
+    let mut cfg = affinity_config();
+    cfg.objective.cap = 3.0;
+    cfg.objective.kappa = 20.0;
+    mgr.set_affinity_config(cfg);
+
+    let mut runtime = ManagerRuntime::new(mgr, bus, Default::default());
     runtime.set_observation_radius(500.0);
     for (e, x) in [(a, 0.0), (a2, 5.0), (a3, 10.0)] {
         runtime.update_entity(e, c1, Vec3::new(x, 0.0, 0.0));

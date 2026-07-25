@@ -15,7 +15,6 @@
 
 #[cfg(feature = "cluster-ws")]
 pub mod broadcast_channel_cap;
-pub mod entity_keys;
 pub mod fixed_timestep;
 pub mod manager;
 #[cfg(feature = "cluster-ws")]
@@ -46,6 +45,8 @@ pub mod ws_server;
 #[cfg(feature = "rapier-cluster")]
 pub mod rapier_cluster;
 
+#[cfg(feature = "migration")]
+pub mod entity_keys;
 #[cfg(feature = "migration")]
 pub mod forwarded_inputs;
 #[cfg(feature = "migration")]
