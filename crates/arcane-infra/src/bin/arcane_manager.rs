@@ -26,6 +26,15 @@
 //!   MANAGER_FLIP_PERSISTENCE_CYCLES — optional int; default 3. Consecutive
 //!     evaluation cycles the SAME destination must be desired before a flip
 //!     is emitted (noise filter on the interaction-graph estimate; 1 = off).
+//!   MANAGER_WAVE_WINDOW / MANAGER_WAVE_MAJORITY — optional ints; defaults
+//!     12 / 9. Two-tier mode only: the FRESH unseeded global solve is adopted
+//!     wholesale when it beat the incumbent by ≥ β in ≥ MAJORITY of the last
+//!     WINDOW cycles including the current one. Majority 0 disables waves.
+//!   MANAGER_SEED_FROM_CURRENT — optional; default 1. Set 0 for PURE FRESH
+//!     mode: the unseeded global solve is adopted WHOLESALE every cycle
+//!     (per-entity noise gates bypassed; the Hungarian label alignment keeps
+//!     the diff ~zero when the structure is unchanged, and the per-entity
+//!     cooldown still guards handoff integrity).
 //!   MANAGER_DECAY_FACTOR — optional float in (0,1); default 0.97. Interaction
 //!     graph memory per cycle. Half-life = ln(0.5)/ln(d) cycles (0.97 ≈ 23
 //!     cycles ≈ 5.7s at 250ms cadence). Lower = the graph forgets old
@@ -310,6 +319,19 @@ async fn control_loop(
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
             manager.set_flip_persistence(persistence);
+            // Wave adoption gate: sliding window + majority. Defaults 12/9
+            // (fresh must win 9 of the last 12 cycles). Majority 0 = off.
+            {
+                let window: usize = env::var("MANAGER_WAVE_WINDOW")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12);
+                let majority: usize = env::var("MANAGER_WAVE_MAJORITY")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(9);
+                manager.set_wave_gate(window, majority);
+            }
             eprintln!(
                 "arcane-manager: migration pacing — max_in_flight={}, cooldown_ticks={}, flip_persistence={}",
                 max_in_flight.max(1),
@@ -530,6 +552,13 @@ async fn main() -> Result<(), String> {
             }
         }
     }
+    // Partition mode: seeded two-tier (default) vs PURE FRESH — an unseeded
+    // global recalculation adopted wholesale every cycle (the founder's
+    // “cluster the millisecond window, instantly re-cluster” model). Set
+    // MANAGER_SEED_FROM_CURRENT=0 for pure fresh.
+    if let Ok(s) = env::var("MANAGER_SEED_FROM_CURRENT") {
+        affinity_config.seed_from_current = !matches!(s.as_str(), "0" | "false" | "off" | "no");
+    }
     if let Ok(pr_str) = env::var("MANAGER_PROXIMITY_RADIUS") {
         if let Ok(pr) = pr_str.parse::<f64>() {
             if pr.is_finite() && pr > 0.0 {
@@ -548,10 +577,15 @@ async fn main() -> Result<(), String> {
     affinity_config.objective = arcane_affinity::objective::sanitize(affinity_config.objective);
 
     eprintln!(
-        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}, graph={{decay={}, prox_w={}, prox_r={}, eq_w≈{:.2}}}",
+        "arcane-manager: started — {} cluster(s), cadence={}ms, redis={}, mode={}, objective={{alpha={}, gamma={}, beta={}, mu={}, cap={}, kappa={}}}, graph={{decay={}, prox_w={}, prox_r={}, eq_w≈{:.2}}}",
         clusters.len(),
         cadence_ms,
         redis_url,
+        if affinity_config.seed_from_current {
+            "two-tier"
+        } else {
+            "pure-fresh"
+        },
         affinity_config.objective.alpha,
         affinity_config.objective.gamma,
         affinity_config.objective.beta,

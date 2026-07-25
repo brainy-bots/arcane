@@ -123,6 +123,27 @@ struct MigrationState {
     /// Residence-hysteresis window (evaluation cycles): entities that
     /// migrated within this window need 4× the persistence to move again.
     residence_ticks: u64,
+    /// Wave adoption window: ring buffer of “fresh beat the incumbent by
+    /// ≥ margin this cycle” bits over the last `wave_window` cycles. A wave
+    /// adopts when the fresh solve won ≥ `wave_majority` of the window AND
+    /// the current cycle — sustained MAJORITY, not consecutive streak.
+    ///
+    /// Two live lessons (2026-07-25) shaped this:
+    /// - Immediate adoption: two waves fired back-to-back, each winning on J
+    ///   but landing on DIFFERENT local optima of similar quality — town
+    ///   purity degraded 88→59% from wholesale layout churn.
+    /// - Consecutive-streak gate: ZERO waves in 4 minutes — the fresh solve
+    ///   won most cycles but single losing cycles kept resetting the streak,
+    ///   while the incremental tracker's dribble migrations (1044) degraded
+    ///   purity anyway. Majority-of-window is robust to that flicker.
+    ///
+    /// Recalculation is NOT gated — both solvers run every cycle; this gates
+    /// only the wholesale adoption of a layout redraw.
+    wave_wins: std::collections::VecDeque<bool>,
+    /// Sliding window length in cycles (12 = 3s at the 250ms demo cadence).
+    wave_window: usize,
+    /// Minimum wins within the window to adopt (0 = waves disabled).
+    wave_majority: usize,
     /// Ownership-flip decisions made this cycle, awaiting drain by the caller.
     /// The Manager decides but never publishes (design §3: it never talks to clusters
     /// directly). The caller drains these via `ArcaneManager::take_pending_flips` and
@@ -130,15 +151,205 @@ struct MigrationState {
     pending_flips: Vec<OwnershipFlip>,
 }
 
+/// Outcome of one partition decision cycle (two-tier design, 2026-07-25).
+#[cfg(feature = "migration")]
+struct PartitionDecision {
+    /// Desired assignments from the INCREMENTAL tracker (the default).
+    desired: HashMap<Uuid, Uuid>,
+    /// Desired assignments from the FRESH unseeded global solve.
+    desired_fresh: HashMap<Uuid, Uuid>,
+    /// Fresh beat the incumbent by ≥ the β margin THIS cycle.
+    fresh_wins: bool,
+    /// True objective values (incl. μ·movers) for diagnostics.
+    j_fresh: f64,
+    j_incr: f64,
+    /// Movers the fresh solution would relocate.
+    movers_fresh: usize,
+    /// Set by the CALLER when the wave persistence gate opens: the whole
+    /// fresh diff is adopted as ONE coordinated wave and per-entity noise
+    /// gates are bypassed.
+    wave: bool,
+}
+
+/// Run split passes to a fixed point (bounded by k-1; each adopted split
+/// strictly decreases J so the loop terminates). Shared by both solves.
+#[cfg(feature = "migration")]
+fn run_split_passes(
+    refined_partition: &mut arcane_affinity::partition::Partition,
+    edges: &[WeightedEdge],
+    num_partitions: usize,
+    objective: &arcane_affinity::objective::ObjectiveWeights,
+) {
+    let mut splits_left = num_partitions.saturating_sub(1).max(1);
+    loop {
+        match arcane_affinity::split::split_pass(
+            refined_partition,
+            edges,
+            num_partitions,
+            objective,
+        ) {
+            arcane_affinity::split::SplitOutcome::Adopted(report) => {
+                eprintln!(
+                    "[split] partition {} -> {}: {} movers, dJ={:.1}",
+                    report.source, report.target, report.movers, report.delta_j
+                );
+                splits_left -= 1;
+                if splits_left == 0 {
+                    break;
+                }
+            }
+            arcane_affinity::split::SplitOutcome::Rejected(r) => {
+                // Priced out: visible (rate-limited) because persistent
+                // consolidation-with-rejection is a calibration signal.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
+                let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if nth.is_multiple_of(40)
+                    || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1")
+                {
+                    eprintln!(
+                        "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
+                        r.source,
+                        r.size,
+                        r.cut_created,
+                        objective.beta,
+                        r.movers,
+                        objective.mu * r.movers as f64,
+                        r.crowding_saved,
+                        r.delta_j
+                    );
+                }
+                break;
+            }
+            arcane_affinity::split::SplitOutcome::NoCandidate => break,
+        }
+    }
+}
+
+/// Map partition indices to cluster ids INJECTIVELY, minimizing migrations.
+///
+/// The partitioner's groups are label-free; which real cluster hosts which
+/// group is decided HERE, by solving the assignment problem exactly
+/// (Hungarian, O(k³)): maximize Σ agreement(group, cluster) = members
+/// already in place = minimize movers. The previous greedy labeler
+/// (largest group takes its plurality first) was suboptimal on conflict
+/// cases — e.g. X={A:60,B:40}, Y={A:45,C:5}: greedy strands Y on C for 85
+/// total moves where the optimum (X→B, Y→A) needs 65 — which under wave
+/// adoption teleports an entire community for zero objective gain
+/// (founder-identified edge case, 2026-07-25).
+#[cfg(feature = "migration")]
+fn map_partitions_to_clusters(
+    refined_partition: &arcane_affinity::partition::Partition,
+    sorted_clusters: &[Uuid],
+    num_partitions: usize,
+    current_assignments: &HashMap<Uuid, Uuid>,
+) -> HashMap<usize, Uuid> {
+    // Square agreement matrix over max(groups, clusters); zero-padded so
+    // extra group slots / clusters are freely assignable.
+    let k = num_partitions.max(sorted_clusters.len());
+    let cluster_of: HashMap<Uuid, usize> = sorted_clusters
+        .iter()
+        .enumerate()
+        .map(|(j, &c)| (c, j))
+        .collect();
+    let mut agreement = vec![vec![0u64; k]; k];
+    for (entity, &part) in refined_partition.assignment() {
+        if part >= k {
+            continue;
+        }
+        if let Some(cur) = current_assignments.get(entity) {
+            if let Some(&j) = cluster_of.get(cur) {
+                agreement[part][j] += 1;
+            }
+        }
+    }
+
+    let labels = arcane_affinity::assignment::max_agreement_labels(&agreement);
+    let mut partition_to_cluster_id: HashMap<usize, Uuid> = HashMap::new();
+    for part_idx in 0..num_partitions {
+        if let Some(&j) = labels.get(part_idx) {
+            if let Some(&cluster) = sorted_clusters.get(j) {
+                partition_to_cluster_id.insert(part_idx, cluster);
+            }
+        }
+    }
+    partition_to_cluster_id
+}
+
+/// Desired assignments from a partition + label mapping.
+#[cfg(feature = "migration")]
+fn to_desired(
+    entities: &[Uuid],
+    refined_partition: &arcane_affinity::partition::Partition,
+    partition_to_cluster_id: &HashMap<usize, Uuid>,
+) -> HashMap<Uuid, Uuid> {
+    let mut desired: HashMap<Uuid, Uuid> = HashMap::new();
+    for &entity in entities {
+        if let Some(part_idx) = refined_partition.of(entity) {
+            if let Some(&cluster_id) = partition_to_cluster_id.get(&part_idx) {
+                desired.insert(entity, cluster_id);
+            }
+        }
+    }
+    desired
+}
+
+/// TRUE total objective of a mapped solution, including the transition cost
+/// from the standing assignments: J = cut + Σ cluster_cost + β·open +
+/// μ·movers. This is the apples-to-apples comparator between the incremental
+/// tracker and the fresh global solve — “the past” (current assignments)
+/// enters ONLY here, as the transition price, never as a bias inside a
+/// solver.
+#[cfg(feature = "migration")]
+fn solution_cost(
+    desired: &HashMap<Uuid, Uuid>,
+    edges: &[WeightedEdge],
+    current_assignments: &HashMap<Uuid, Uuid>,
+    weights: &arcane_affinity::objective::ObjectiveWeights,
+) -> (f64, usize) {
+    let mut cut = 0.0;
+    for e in edges {
+        let (Some(&ca), Some(&cb)) = (desired.get(&e.a), desired.get(&e.b)) else {
+            continue;
+        };
+        if ca != cb {
+            match e.colocation {
+                Colocation::Hard => cut += 1e9, // never chosen by either solver
+                Colocation::CutFree => {}
+                Colocation::Soft => cut += e.weight,
+            }
+        }
+    }
+    let mut sizes: HashMap<Uuid, usize> = HashMap::new();
+    for c in desired.values() {
+        *sizes.entry(*c).or_insert(0) += 1;
+    }
+    let crowding: f64 = sizes
+        .values()
+        .map(|&n| arcane_affinity::objective::cluster_cost(n as f64, weights))
+        .sum();
+    let open = weights.beta * sizes.len() as f64;
+    let movers = desired
+        .iter()
+        .filter(|(e, c)| current_assignments.get(e).is_some_and(|cur| cur != *c))
+        .count();
+    (cut + crowding + open + weights.mu * movers as f64, movers)
+}
+
 /// Build partition-based migration decisions from the world view.
 ///
-/// This function:
-/// 1. Builds a weighted edge list from the persistent interaction graph
-/// 2. Blends prediction into soft edge weights (cut_cost * (1 + config.prediction_gain * p))
-/// 3. Runs the global GreedyGrowthPartitioner
-/// 4. Runs refinement
-/// 5. Maps partition indices to actual cluster ids deterministically
-/// 6. Returns the desired assignments
+/// Two-tier design (2026-07-25, founder direction): the FRESH unseeded
+/// global solve is the authority on where entities BELONG — it looks only
+/// at the interaction graph (future work), never at current placement. The
+/// SEEDED incremental solve is the between-waves tracker: cheap, sticky,
+/// keeps assignments current. Each cycle both are computed and priced with
+/// the true objective + μ·movers transition cost; if the fresh solution
+/// wins by more than β (one instance cost, the anti-flap margin at the
+/// SOLUTION level), its entire diff is adopted as one coordinated wave.
+/// Rationale: single-entity migration can never perform coordinated moves
+/// (e.g. “relabel town D onto the underloaded cluster”) — live-observed as
+/// a 3-towns-on-one-cluster state that took minutes of dribbling entity
+/// moves to fix; the wave does it in one cycle.
 #[cfg(feature = "migration")]
 fn build_partition_decisions(
     view: &WorldStateView,
@@ -147,12 +358,20 @@ fn build_partition_decisions(
     interaction_graph: &InteractionGraph,
     config: &AffinityConfig,
     known_clusters: &[Uuid],
-) -> HashMap<Uuid, Uuid> {
+) -> PartitionDecision {
     // Collect all entity ids from the view
     let entities: Vec<Uuid> = view.players.iter().map(|p| p.player_id).collect();
 
     if entities.is_empty() {
-        return HashMap::new();
+        return PartitionDecision {
+            desired: HashMap::new(),
+            desired_fresh: HashMap::new(),
+            fresh_wins: false,
+            j_fresh: 0.0,
+            j_incr: 0.0,
+            movers_fresh: 0,
+            wave: false,
+        };
     }
 
     // Build player position/velocity map for predictor
@@ -267,7 +486,15 @@ fn build_partition_decisions(
 
     // If no edges (no interactions), preserve current assignments (no reason to migrate).
     if edges.is_empty() {
-        return current_assignments.clone();
+        return PartitionDecision {
+            desired: current_assignments.clone(),
+            desired_fresh: current_assignments.clone(),
+            fresh_wins: false,
+            j_fresh: 0.0,
+            j_incr: 0.0,
+            movers_fresh: 0,
+            wave: false,
+        };
     }
 
     // Number of partitions = number of KNOWN clusters (registered topology, including
@@ -313,23 +540,85 @@ fn build_partition_decisions(
         .iter()
         .filter_map(|(e, c)| cluster_index.get(c).map(|&i| (*e, i)))
         .collect();
-    let partition = if config.seed_from_current && !current_assignments.is_empty() {
-        arcane_affinity::partition::seed_from_assignments(
+    // ---- Solve A: FRESH global (the authority). Unseeded: looks only at
+    // the interaction graph, never at current placement. μ is not charged
+    // inside the solver (all entities count as moved-in-seed) — transition
+    // cost is priced once, in the comparison below.
+    let fresh_partition = {
+        let greedy = GreedyGrowthPartitioner::new().partition(&input);
+        let all_moved: std::collections::HashSet<Uuid> = entities.iter().copied().collect();
+        let mut refined = refine(
+            &greedy,
+            &input.edges,
+            num_partitions,
+            &RefineConfig {
+                max_passes: 4,
+                capacity: 0,
+                min_gain: 0.0,
+                weights: config.objective,
+                moved_in_seed: all_moved,
+            },
+        );
+        run_split_passes(
+            &mut refined,
+            &input.edges,
+            num_partitions,
+            &config.objective,
+        );
+        refined
+    };
+    let fresh_map = map_partitions_to_clusters(
+        &fresh_partition,
+        &sorted_clusters,
+        num_partitions,
+        current_assignments,
+    );
+    let desired_fresh = to_desired(&entities, &fresh_partition, &fresh_map);
+
+    // PURE FRESH MODE (seed_from_current = false) and bootstrap: the fresh
+    // solve IS the assignment, adopted WHOLESALE every cycle (founder
+    // design, 2026-07-25): the clustering is the millisecond-window
+    // interaction structure — predictions staler than one cycle are already
+    // wrong, so there is nothing to “converge” toward. wave = true bypasses
+    // every per-entity noise gate; stability is STRUCTURAL instead:
+    //   - the solver is deterministic (same graph → same groups),
+    //   - the Hungarian label alignment maps groups onto the clusters that
+    //     minimize movers, so an unchanged structure yields a ~zero diff
+    //     naturally — no gate needed to produce “no moves”,
+    //   - the per-entity cooldown still guards handoff integrity (an entity
+    //     mid-migration is never double-flipped).
+    // The earlier “wholesale adoption degrades purity” observation was a
+    // misdiagnosis: the damage came from PARTIAL adoption — per-entity
+    // gates dribbling fragments of successive (different-optimum) solutions
+    // into the state, mixing incompatible layouts. Pure adoption never
+    // mixes: the state equals exactly one solution at all times.
+    if !config.seed_from_current || current_assignments.is_empty() {
+        let movers = desired_fresh
+            .iter()
+            .filter(|(e, c)| current_assignments.get(e).is_some_and(|cur| cur != *c))
+            .count();
+        return PartitionDecision {
+            desired: desired_fresh.clone(),
+            desired_fresh,
+            fresh_wins: false,
+            j_fresh: 0.0,
+            j_incr: 0.0,
+            movers_fresh: movers,
+            wave: true,
+        };
+    }
+
+    // ---- Solve B: INCREMENTAL tracker (seeded from standing assignments).
+    // Sticky by construction; keeps the partition current between waves.
+    let incr_partition = {
+        let seeded = arcane_affinity::partition::seed_from_assignments(
             &input.entities,
             &current_idx,
             num_partitions,
             &config.objective,
             &input.edges,
-        )
-    } else {
-        GreedyGrowthPartitioner::new().partition(&input)
-    };
-
-    // Run refinement with objective-driven gain (epic #293): cohesion beats the
-    // balance preference — a clique larger than ceil(n/k)*factor may still
-    // co-locate. Refinement evaluates moves on full ΔJ (cut + crowding + instance + move cost).
-    let moved_in_seed: std::collections::HashSet<Uuid> = if config.seed_from_current {
-        partition
+        );
+        let moved_in_seed: std::collections::HashSet<Uuid> = seeded
             .assignment()
             .iter()
             .filter(|(&e, &p)| {
@@ -340,130 +629,64 @@ fn build_partition_decisions(
                 }
             })
             .map(|(&e, _)| e)
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
-    let mut refined_partition = refine(
-        &partition,
-        &input.edges,
-        num_partitions,
-        &RefineConfig {
-            max_passes: 4,
-            capacity: 0,
-            min_gain: 0.0,
-            weights: config.objective,
-            moved_in_seed,
-        },
-    );
-
-    // Split pass (epic #293 follow-up): the global move single-entity
-    // refinement cannot make. A consolidated blob above the split onset is a
-    // LOCAL minimum for per-entity moves (the first mover pays cut + β + μ
-    // for ~√n relief); this pass bisects the crowded partition's subgraph
-    // and adopts the bisection iff the REAL ΔJ (cut created + β + μ·movers
-    // − crowding saved) is strictly negative. Runs to a FIXED POINT within
-    // the cycle (bounded by k−1, the structural maximum): a regime change
-    // that warrants 1 → 4 clusters concludes in ONE evaluation cycle instead
-    // of dripping one split per cadence tick. Each adopted split strictly
-    // decreases J, so the loop terminates. Live-observed failure this fixes:
-    // 100% of ~300 mingled players ratcheted onto one cluster and no
-    // per-entity move could ever leave.
-    let mut splits_left = num_partitions.saturating_sub(1).max(1);
-    loop {
-        match arcane_affinity::split::split_pass(
-            &mut refined_partition,
+            .collect();
+        let mut refined = refine(
+            &seeded,
+            &input.edges,
+            num_partitions,
+            &RefineConfig {
+                max_passes: 4,
+                capacity: 0,
+                min_gain: 0.0,
+                weights: config.objective,
+                moved_in_seed,
+            },
+        );
+        run_split_passes(
+            &mut refined,
             &input.edges,
             num_partitions,
             &config.objective,
-        ) {
-            arcane_affinity::split::SplitOutcome::Adopted(report) => {
-                eprintln!(
-                    "[split] partition {} -> {}: {} movers, dJ={:.1}",
-                    report.source, report.target, report.movers, report.delta_j
-                );
-                splits_left -= 1;
-                if splits_left == 0 {
-                    break;
-                }
-            }
-            arcane_affinity::split::SplitOutcome::Rejected(r) => {
-                // A blob wanted to split but the cut priced it out. This MUST
-                // be visible live (it is exactly the consolidation-ratchet
-                // signature) but must not spam: log every 40th rejection
-                // (~10s at the default cadence), or every one with
-                // ARCANE_DEBUG_SPLIT=1.
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static REJECT_COUNT: AtomicU64 = AtomicU64::new(0);
-                let nth = REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if nth.is_multiple_of(40)
-                    || std::env::var("ARCANE_DEBUG_SPLIT").as_deref() == Ok("1")
-                {
-                    eprintln!(
-                        "[split-reject] partition {} (n={}): cut {:.1} + β {:.1} + μ·{} {:.1} − crowding {:.1} = dJ {:.1}",
-                        r.source,
-                        r.size,
-                        r.cut_created,
-                        config.objective.beta,
-                        r.movers,
-                        config.objective.mu * r.movers as f64,
-                        r.crowding_saved,
-                        r.delta_j
-                    );
-                }
-                break;
-            }
-            arcane_affinity::split::SplitOutcome::NoCandidate => break,
-        }
+        );
+        refined
+    };
+    let incr_map = map_partitions_to_clusters(
+        &incr_partition,
+        &sorted_clusters,
+        num_partitions,
+        current_assignments,
+    );
+    let desired_incr = to_desired(&entities, &incr_partition, &incr_map);
+
+    // ---- Compare on the TRUE objective (incl. μ·movers transition cost).
+    // The β margin makes near-ties resolve to the incumbent. The CALLER
+    // gates adoption on a persistence streak: one cycle's win is a
+    // candidate, not a decision (live lesson 2026-07-25: two immediately-
+    // adopted waves each won on J yet degraded town alignment — the fresh
+    // solve had found a DIFFERENT local optimum of similar J, and swapping
+    // layouts wholesale on a thin margin is churn, not progress).
+    let (j_incr, _movers_incr) = solution_cost(
+        &desired_incr,
+        &input.edges,
+        current_assignments,
+        &config.objective,
+    );
+    let (j_fresh, movers_fresh) = solution_cost(
+        &desired_fresh,
+        &input.edges,
+        current_assignments,
+        &config.objective,
+    );
+    let margin = config.objective.beta;
+    PartitionDecision {
+        fresh_wins: j_fresh + margin < j_incr,
+        j_fresh,
+        j_incr,
+        movers_fresh,
+        desired_fresh,
+        desired: desired_incr,
+        wave: false,
     }
-
-    // Map partition indices to cluster ids deterministically and INJECTIVELY:
-    // two partitions must never map to the same cluster (the old plurality-only
-    // rule collapsed all partitions onto the crowded cluster, so migrations to a
-    // warm spare could never be emitted). Greedy assignment: process partitions
-    // by decreasing size; each takes its plurality cluster if still free, else
-    // the free known cluster with the most of its members, else any free known
-    // cluster (sorted for determinism).
-    let mut free_clusters: std::collections::BTreeSet<Uuid> =
-        sorted_clusters.iter().copied().collect();
-    let mut order: Vec<usize> = (0..num_partitions).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(refined_partition.members(i).len()));
-
-    let mut partition_to_cluster_id: HashMap<usize, Uuid> = HashMap::new();
-    for part_idx in order {
-        let members = refined_partition.members(part_idx);
-        // Rank this partition's preference over FREE clusters by member plurality,
-        // tie-break lowest Uuid (deterministic).
-        let mut counts: HashMap<Uuid, usize> = HashMap::new();
-        for member in &members {
-            if let Some(&c) = current_assignments.get(member) {
-                if free_clusters.contains(&c) {
-                    *counts.entry(c).or_insert(0) += 1;
-                }
-            }
-        }
-        let chosen = counts
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-            .map(|(c, _)| c)
-            .or_else(|| free_clusters.iter().next().copied());
-        if let Some(c) = chosen {
-            free_clusters.remove(&c);
-            partition_to_cluster_id.insert(part_idx, c);
-        }
-    }
-
-    // Produce final desired assignments from the partition
-    let mut desired: HashMap<Uuid, Uuid> = HashMap::new();
-    for entity in entities {
-        if let Some(part_idx) = refined_partition.of(entity) {
-            if let Some(&cluster_id) = partition_to_cluster_id.get(&part_idx) {
-                desired.insert(entity, cluster_id);
-            }
-        }
-    }
-
-    desired
 }
 
 /// Place a new entity based on cluster sizes, affinity, and the partition objective.
@@ -605,6 +828,16 @@ impl ArcaneManager {
     #[cfg(feature = "migration")]
     pub fn set_flip_persistence(&mut self, cycles: u32) {
         self.migration_state.persistence_cycles = cycles.max(1);
+    }
+
+    /// Configure the wave adoption gate: window length in cycles and the
+    /// minimum wins within it. `majority` = 0 disables waves. The window is
+    /// clamped ≥ 1; majority is clamped to the window.
+    #[cfg(feature = "migration")]
+    pub fn set_wave_gate(&mut self, window: usize, majority: usize) {
+        self.migration_state.wave_window = window.max(1);
+        self.migration_state.wave_majority = majority.min(self.migration_state.wave_window);
+        self.migration_state.wave_wins.clear();
     }
 
     /// Feed entity position into the spatial index (e.g. from SpacetimeDB or test harness).
@@ -1064,7 +1297,7 @@ impl ArcaneManager {
 
         // Use partition-based decision: build weighted edge list, partition, refine, and map to cluster ids.
         let t_pre_part = t0.elapsed();
-        let resolved = build_partition_decisions(
+        let decision = build_partition_decisions(
             &view,
             &current_assignments,
             &self.physics_edges,
@@ -1073,6 +1306,38 @@ impl ArcaneManager {
             &self.known_clusters,
         );
 
+        // Wave adoption gate: sliding-window MAJORITY (see wave_wins docs).
+        // Both solvers ran this cycle regardless — recalculation is never
+        // gated; only wholesale layout adoption is.
+        let mut decision = decision;
+        {
+            let ms = &mut self.migration_state;
+            ms.wave_wins.push_back(decision.fresh_wins);
+            while ms.wave_wins.len() > ms.wave_window {
+                ms.wave_wins.pop_front();
+            }
+            let wins = ms.wave_wins.iter().filter(|&&w| w).count();
+            if ms.wave_majority > 0
+                && decision.fresh_wins
+                && ms.wave_wins.len() >= ms.wave_window
+                && wins >= ms.wave_majority
+            {
+                eprintln!(
+                    "[wave] fresh global solve won {wins}/{} of the last {} cycles: J {:.1} vs incumbent {:.1} — adopting {} coordinated moves",
+                    ms.wave_wins.len(),
+                    ms.wave_window,
+                    decision.j_fresh,
+                    decision.j_incr,
+                    decision.movers_fresh
+                );
+                decision.desired = decision.desired_fresh.clone();
+                decision.wave = true;
+                // Reset: the fresh answer IS the incumbent now.
+                ms.wave_wins.clear();
+            }
+        }
+        let resolved = decision.desired;
+        let wave = decision.wave;
         let t_partition = t0.elapsed();
         if timing && self.eval_cycle.is_multiple_of(5) {
             eprintln!(
@@ -1137,10 +1402,17 @@ impl ArcaneManager {
                     // when this destination has been desired for the required
                     // number of consecutive cycles — base for settled
                     // entities, 4× for recent movers (Schmitt trigger; see
-                    // required_streak docs).
-                    let required = self.migration_state.required_streak(entity_id);
-                    if self.migration_state.note_desire(entity_id, desired_cluster) < required {
-                        continue;
+                    // required_streak docs). A WAVE bypasses the gate: an
+                    // adopted fresh global solution is ONE coordinated
+                    // decision that already beat the incumbent by β on the
+                    // true objective — not N independent noisy estimates.
+                    // (Cooldown still applies below: an entity mid-handoff is
+                    // never double-flipped.)
+                    if !wave {
+                        let required = self.migration_state.required_streak(entity_id);
+                        if self.migration_state.note_desire(entity_id, desired_cluster) < required {
+                            continue;
+                        }
                     }
                     // Decision is to migrate this entity.
                     if self.migration_state.can_migrate(entity_id) {
@@ -1283,6 +1555,13 @@ impl MigrationState {
             // than the graph-breathing oscillation period (2–8s), so a limit
             // cycle cannot complete a round trip inside the window.
             residence_ticks: 40,
+            wave_wins: std::collections::VecDeque::new(),
+            // 12-cycle window (3s), 9 wins (75%) to adopt: a genuinely stuck
+            // incumbent loses to the fresh solve nearly every cycle, so the
+            // redraw fires ~3s after the structural gap appears; graph
+            // breathing that wins only transient cycles never reaches 75%.
+            wave_window: 12,
+            wave_majority: 9,
         }
     }
 
@@ -1436,6 +1715,56 @@ mod migration_tests {
             state.note_desire(e, Uuid::from_u128(100)) >= state.persistence_cycles,
             "gate open immediately"
         );
+    }
+
+    #[test]
+    fn wave_gate_fires_on_majority_despite_flicker() {
+        // The consecutive-streak design failed live: single losing cycles
+        // reset the streak and ZERO waves fired in 4 minutes while the
+        // incumbent stayed structurally stuck. Majority-of-window must fire
+        // through that flicker: 3 wins, 1 loss, repeated — 75% win rate.
+        let mut state = MigrationState::new();
+        state.wave_window = 12;
+        state.wave_majority = 9;
+        let mut fired = false;
+        for cycle in 0..24 {
+            let fresh_wins = cycle % 4 != 3; // 3 of every 4 cycles
+            state.wave_wins.push_back(fresh_wins);
+            while state.wave_wins.len() > state.wave_window {
+                state.wave_wins.pop_front();
+            }
+            let wins = state.wave_wins.iter().filter(|&&w| w).count();
+            if fresh_wins
+                && state.wave_wins.len() >= state.wave_window
+                && wins >= state.wave_majority
+            {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "75% win rate must open the majority gate");
+    }
+
+    #[test]
+    fn wave_gate_stays_closed_on_transient_wins() {
+        // Graph breathing: fresh wins only ~1/3 of cycles. Must never fire.
+        let mut state = MigrationState::new();
+        state.wave_window = 12;
+        state.wave_majority = 9;
+        for cycle in 0..48 {
+            let fresh_wins = cycle % 3 == 0;
+            state.wave_wins.push_back(fresh_wins);
+            while state.wave_wins.len() > state.wave_window {
+                state.wave_wins.pop_front();
+            }
+            let wins = state.wave_wins.iter().filter(|&&w| w).count();
+            assert!(
+                !(fresh_wins
+                    && state.wave_wins.len() >= state.wave_window
+                    && wins >= state.wave_majority),
+                "transient wins must not open the gate (cycle {cycle})"
+            );
+        }
     }
 
     #[test]

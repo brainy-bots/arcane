@@ -985,7 +985,34 @@ mod tests {
     #[test]
     fn frames_carry_interest_state() {
         let bus = InMemoryInboxBus::new();
-        let mut runtime = ManagerRuntime::new(make_manager(), bus, make_config());
+        // This test NEEDS the two cliques to stay on separate clusters (the
+        // proxy assertion is about crossing a cut). At n=6 with default
+        // weights the objective genuinely prefers consolidation (crowding is
+        // tiny, closing an instance saves β, merging internalizes the guild
+        // edge) — the pre-two-tier version only stayed split because the
+        // seeded solver could not escape the local minimum, i.e. the test
+        // asserted an artifact. Its own comment says “cliques + capacity
+        // forbid a merge”: make that true through the objective — a load
+        // barrier at cap=4 prices a 6-entity cluster out (κ·(6−4)² = 80),
+        // so the split IS the global optimum and the fresh solve keeps it.
+        let mut mgr = make_manager();
+        let mut cfg = arcane_affinity::config::AffinityConfig {
+            edge_rules: vec![
+                arcane_affinity::config::EdgeRule {
+                    feature: "party".to_string(),
+                    weight: 5.0,
+                },
+                arcane_affinity::config::EdgeRule {
+                    feature: "guild".to_string(),
+                    weight: 1.0,
+                },
+            ],
+            ..arcane_affinity::config::AffinityConfig::default()
+        };
+        cfg.objective.cap = 4.0;
+        cfg.objective.kappa = 20.0;
+        mgr.set_affinity_config(cfg);
+        let mut runtime = ManagerRuntime::new(mgr, bus, make_config());
 
         let c1 = Uuid::from_u128(0x1);
         let c2 = Uuid::from_u128(0x2);
