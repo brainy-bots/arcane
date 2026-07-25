@@ -115,6 +115,21 @@ impl InteractionGraph {
         edge.kinds.insert(kind);
     }
 
+    /// Drop ALL soft edges, keeping Hard (Joint) constraints. Predicted-graph
+    /// mode rebuilds the soft graph from scratch every cycle: the graph IS the
+    /// current prediction, so anything not predicted THIS cycle does not
+    /// exist. Constraints are not predictions and survive.
+    pub fn retain_hard_only(&mut self) {
+        let adjacency = &mut self.adjacency;
+        self.weights.retain(|pair, e| {
+            let keep = e.kinds.iter().any(|k| k.colocation() == Colocation::Hard);
+            if !keep {
+                Self::unindex_pair(adjacency, pair);
+            }
+            keep
+        });
+    }
+
     /// Remove a pair's edge entirely (predicted-graph mode: prediction fell
     /// below the floor — the pair no longer exists for the partitioner).
     /// Hard (Joint) edges are preserved: constraints outrank predictions.
@@ -296,6 +311,18 @@ mod tests {
         g.record_interaction(uuid(1), uuid(2), 1.0, InteractionKind::Proximity);
         assert_eq!(g.get_weight(uuid(2), uuid(1)), 1.0);
         assert_eq!(g.pair_count(), 1);
+    }
+
+    #[test]
+    fn retain_hard_only_clears_soft_keeps_joints() {
+        let mut g = InteractionGraph::new();
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        g.set_edge(a, b, 3.3, InteractionKind::Proximity);
+        g.record_interaction(a, c, 1.0, InteractionKind::Joint);
+        g.retain_hard_only();
+        assert_eq!(g.get_weight(a, b), 0.0, "soft edge cleared");
+        assert!(g.is_uncuttable(a, c), "joint constraint kept");
+        assert_eq!(g.neighbors(a).count(), 1, "adjacency reflects the clear");
     }
 
     #[test]

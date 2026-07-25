@@ -167,8 +167,9 @@ struct PartitionDecision {
     /// fresh diff is adopted as ONE coordinated wave and per-entity noise
     /// gates are bypassed.
     wave: bool,
-    /// Pure-fresh mode marker: the caller uses the candidate-hold gate
-    /// instead of the two-tier sliding window.
+    /// Pure-fresh mode marker: the fresh solve was adopted unconditionally
+    /// (no gate). False = two-tier mode, where the caller applies the
+    /// sliding-window majority before replacing the incumbent.
     pure_fresh: bool,
 }
 
@@ -1142,6 +1143,14 @@ impl ArcaneManager {
         let radius_sq = radius * radius;
         let cell = radius.max(1.0);
         let accrual_graph = !self.config.predicted_graph;
+        // Predicted mode: the soft graph is rebuilt from scratch each cycle
+        // (it IS the current prediction). Hard constraints survive.
+        let live_predictor = HeuristicPredictor::default();
+        let empty_fm = FeatureMap::new();
+        let mut pending_predicted: Vec<(Uuid, Uuid, f64)> = Vec::new();
+        if !accrual_graph {
+            self.interaction_graph.retain_hard_only();
+        }
         let mut grid: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, p) in players.iter().enumerate() {
             let key = (
@@ -1182,10 +1191,51 @@ impl ArcaneManager {
                                 self.config.proximity_weight * speed_scale,
                                 InteractionKind::Proximity,
                             );
+                        } else {
+                            // PREDICTED GRAPH: the edge IS this cycle's
+                            // prediction, computed for EVERY currently-
+                            // interacting pair. (Screening + re-prediction
+                            // cadence are cold-pair DISCOVERY optimizations;
+                            // applying them to the live neighborhood left most
+                            // co-located pairs with no edge at all and the
+                            // partitioner clustering an empty graph —
+                            // founder-observed as “all entities pushed to the
+                            // same cluster” / evenly-mixed towns.)
+                            let dx2 = b.position.x - a.position.x;
+                            let dy2 = b.position.y - a.position.y;
+                            let distance = (dx2 * dx2 + dy2 * dy2).sqrt();
+                            let closing_speed = arcane_affinity::cold_pair::closing_speed(
+                                a.position, b.position, a.velocity, b.velocity,
+                            );
+                            let ctx = arcane_affinity::predictor::PairContext {
+                                distance,
+                                closing_speed,
+                                horizon_secs: self.config.horizon_secs,
+                                // History is an INPUT to the predictor, and in
+                                // predicted mode the standing edge IS the last
+                                // prediction — not an accumulator.
+                                history_weight: self
+                                    .interaction_graph
+                                    .get_weight(a.player_id, b.player_id),
+                                features_a: &empty_fm,
+                                features_b: &empty_fm,
+                            };
+                            use arcane_affinity::predictor::InteractionPredictor as _;
+                            let p = live_predictor.predict(&ctx);
+                            let w = self.config.prediction_edge_scale * p;
+                            if w >= 0.05 {
+                                pending_predicted.push((a.player_id, b.player_id, w));
+                            }
                         }
                     }
                 }
             }
+        }
+
+        // Predicted mode: commit this cycle's predictions as edge ASSIGNMENTS.
+        for (a, b, w) in pending_predicted.drain(..) {
+            self.interaction_graph
+                .set_edge(a, b, w, InteractionKind::Proximity);
         }
 
         // Edge accumulation from edge rules: group entities by feature values.
@@ -1390,16 +1440,11 @@ impl ArcaneManager {
             &self.known_clusters,
         );
 
-        // Wave adoption. Recalculation is never gated — both solutions were
-        // computed this cycle; only wholesale layout adoption is gated.
+        // PURE-FRESH mode: nothing is gated. The fresh clustering computed
+        // this cycle IS the decision (see build_partition_decisions).
         //
-        // PURE-FRESH mode: candidate-hold durability gate. A winning fresh
-        // layout is HELD (not adopted) and re-priced against the evolving
-        // graph each cycle; only a layout that keeps beating STAY for
-        // wave_candidate_cycles is real structure — transient uniform-crowd
-        // optima decay within a second and are dropped silently.
-        //
-        // TWO-TIER mode: sliding-window majority over fresh-vs-incumbent.
+        // TWO-TIER mode (library default, not the demo): sliding-window
+        // majority decides when the fresh solve replaces the incumbent.
         let mut decision = decision;
         if decision.pure_fresh {
             // Adopt-always: nothing to gate. Log the redraw size when it

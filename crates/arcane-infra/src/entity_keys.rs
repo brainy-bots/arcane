@@ -20,14 +20,21 @@
 //! to the node; the same async publisher-thread pattern applies, with
 //! pipelined EVALSHA batches.
 //!
-//! Ownership transfer is CLAIM-based: when a node ADOPTS an entity (its inbox
-//! frame's `owned` statement names it — the manager's word), it issues a
-//! claim write that sets `owner = me` unconditionally and seeds the record
-//! from the adopted state. From that instant the old owner's writes bounce.
-//! (The founder's original sketch had the OLD owner write the final state
-//! with `owner = new`; claim-by-the-adopter achieves the same atomic
-//! transfer and also survives an old owner that crashed mid-handoff. The
-//! trusted input is the same either way: the manager's owned statement.)
+//! Ownership transfer is a HANDOFF PERFORMED BY THE OWNER — the only party
+//! that can write. When the manager's statement releases an entity from node
+//! A to node B, A's final act for that entity is ONE atomic write: its last
+//! simulated state PLUS `owner = B`. Consequences:
+//!
+//! - The old owner's final frame is preserved (it ships WITH the transfer),
+//!   so the entity's authoritative history has no hole at the seam.
+//! - B may believe it owns the entity before the handoff lands (the manager
+//!   told it so) and will optimistically write — those writes FAIL at the
+//!   gate, which is correct and free: the check runs in Redis, never on the
+//!   node's hot path. B's writes start succeeding the instant A's handoff
+//!   sets the owner field. No claim, no negotiation, no node-side state.
+//! - Crash safety comes from the TTL below, not from a claim: if A dies
+//!   mid-handoff the record expires and B's next gated write takes it
+//!   (a fresh/absent record has no owner to reject).
 //!
 //! Departure cleanup is TTL-based: every write refreshes a short TTL, so an
 //! entity that stops being written (left the game, idle-despawned) expires
@@ -70,12 +77,17 @@ redis.call('EXPIRE', KEYS[1], ARGV[4])
 return 1
 "#;
 
-/// Ownership claim: unconditional owner set + record seed. Issued ONLY when
-/// the manager's owned statement names this node (adoption) — the trusted
-/// input is the manager's word, same as the old handoff design. From this
-/// write on, the previous owner's writes bounce.
-pub const CLAIM_SCRIPT: &str = r#"
-redis.call('HSET', KEYS[1], 'owner', ARGV[1], 'doc', ARGV[2], 'tick', ARGV[3])
+/// HANDOFF: the owner's final write for an entity it is releasing — last
+/// simulated state AND the ownership transfer, atomically. Still
+/// OWNER-GATED: only the current owner may hand off (a node that is not the
+/// owner cannot move ownership, by construction).
+/// KEYS[1] = entity key; ARGV[1] = writer (current owner), ARGV[2] = doc
+/// JSON, ARGV[3] = tick, ARGV[4] = TTL secs, ARGV[5] = NEW owner.
+/// Returns 1 = handed off, 0 = rejected (not the owner).
+pub const HANDOFF_SCRIPT: &str = r#"
+local cur = redis.call('HGET', KEYS[1], 'owner')
+if cur and cur ~= ARGV[1] then return 0 end
+redis.call('HSET', KEYS[1], 'owner', ARGV[5], 'doc', ARGV[2], 'tick', ARGV[3])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 return 1
 "#;
@@ -88,11 +100,13 @@ pub enum EntityWriteOp {
         doc_json: String,
         tick: u64,
     },
-    /// Ownership claim on adoption (manager's owned statement named us).
-    Claim {
+    /// Handoff: final state + ownership transfer, issued by the CURRENT
+    /// owner when the manager's statement releases the entity.
+    Handoff {
         entity_id: Uuid,
         doc_json: String,
         tick: u64,
+        new_owner: Uuid,
     },
     /// Cluster heartbeat (once per publish batch).
     Heartbeat { tick: u64 },
@@ -114,7 +128,7 @@ impl EntityKeyPublisher {
 
         thread::spawn(move || {
             let write_script = redis::Script::new(WRITE_SCRIPT);
-            let claim_script = redis::Script::new(CLAIM_SCRIPT);
+            let handoff_script = redis::Script::new(HANDOFF_SCRIPT);
             let mut conn: Option<redis::Connection> = client.get_connection().ok();
             let mut rejected_total: u64 = 0;
             while let Ok(batch) = rx.recv() {
@@ -136,16 +150,18 @@ impl EntityKeyPublisher {
                             .arg(*tick)
                             .arg(ENTITY_TTL_SECS)
                             .invoke(c),
-                        EntityWriteOp::Claim {
+                        EntityWriteOp::Handoff {
                             entity_id,
                             doc_json,
                             tick,
-                        } => claim_script
+                            new_owner,
+                        } => handoff_script
                             .key(entity_key(*entity_id))
                             .arg(&me)
                             .arg(doc_json)
                             .arg(*tick)
                             .arg(ENTITY_TTL_SECS)
+                            .arg(new_owner.hyphenated().to_string())
                             .invoke(c),
                         EntityWriteOp::Heartbeat { tick } => redis::cmd("SET")
                             .arg(cluster_tick_key(Uuid::parse_str(&me).unwrap_or_default()))
@@ -264,10 +280,12 @@ mod tests {
         // returns 0 on mismatch — the single-writer invariant lives HERE.
         assert!(WRITE_SCRIPT.contains("if cur and cur ~= ARGV[1] then return 0 end"));
         assert!(WRITE_SCRIPT.contains("EXPIRE"));
-        // The claim script must NOT owner-gate (manager's word transfers
-        // ownership) but must still refresh the TTL.
-        assert!(!CLAIM_SCRIPT.contains("return 0"));
-        assert!(CLAIM_SCRIPT.contains("EXPIRE"));
+        // The handoff script is ALSO owner-gated: only the current owner may
+        // transfer ownership (a non-owner cannot write, therefore cannot move
+        // the field). It sets the NEW owner from ARGV[5].
+        assert!(HANDOFF_SCRIPT.contains("if cur and cur ~= ARGV[1] then return 0 end"));
+        assert!(HANDOFF_SCRIPT.contains("'owner', ARGV[5]"));
+        assert!(HANDOFF_SCRIPT.contains("EXPIRE"));
     }
 
     #[test]

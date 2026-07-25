@@ -1085,20 +1085,40 @@ impl NodeCore {
                 // A departed (tombstoned) id must not be re-adopted into the
                 // driver world even here — apply_inbox_frame already filters,
                 // this is belt-and-braces for the drain path.
-                // Entity-keys mode (#331): CLAIM ownership at adoption. The
-                // manager's owned statement named us; the claim write flips
-                // the record's owner field atomically — from this instant the
-                // old owner's writes bounce off the Lua gate. Seeded with the
-                // adopted state so the record never goes partial.
+                out.adopted_entities.extend(report.adopted);
+                // Entity-keys mode (#331): HANDOFF on release. Ownership moves
+                // ONLY by the CURRENT owner's write — we own every id in
+                // `report.lost` right now, and the manager's statement says
+                // they belong elsewhere next. Our final act for each is ONE
+                // atomic write: last simulated state + owner = new owner.
+                // Until that lands the new owner is NOT the owner: its
+                // optimistic writes fail at the Redis gate, which costs it
+                // nothing on its hot path. Captured BEFORE purge_entity below
+                // (the state must still exist to be handed over).
+                #[cfg(feature = "migration")]
                 if let Some(ref ek) = self.entity_key_publisher {
                     let tick = self.tick_count;
                     let ops: Vec<crate::entity_keys::EntityWriteOp> = report
-                        .adopted
+                        .lost
                         .iter()
-                        .filter_map(|entry| {
+                        .filter_map(|id| {
+                            // Destination: the frame's copy of the entity names
+                            // its new cluster; else our proxy record. With
+                            // neither we cannot name a successor — skip, and
+                            // the key's TTL hands it over by expiry.
+                            let new_owner = frame
+                                .entities
+                                .iter()
+                                .find(|e| e.entry.entity_id == *id)
+                                .map(|e| e.entry.cluster_id)
+                                .or_else(|| self.neighbor_entities.get(id).map(|e| e.cluster_id))?;
+                            if new_owner == self.cluster_id {
+                                return None;
+                            }
+                            let entry = self.server.get_entity(*id)?;
                             let rec = arcane_affinity::feature_map::EntityRecord {
                                 entity_id: entry.entity_id,
-                                cluster_id: self.cluster_id,
+                                cluster_id: new_owner,
                                 position: arcane_core::types::Vec2::new(
                                     entry.position.x,
                                     entry.position.z,
@@ -1112,20 +1132,20 @@ impl NodeCore {
                             };
                             crate::entity_keys::encode_record(&rec)
                                 .ok()
-                                .map(|doc_json| crate::entity_keys::EntityWriteOp::Claim {
-                                    entity_id: entry.entity_id,
+                                .map(|doc_json| crate::entity_keys::EntityWriteOp::Handoff {
+                                    entity_id: *id,
                                     doc_json,
                                     tick,
+                                    new_owner,
                                 })
                         })
                         .collect();
                     if !ops.is_empty() {
                         if let Err(e) = ek.publish(ops) {
-                            eprintln!("entity-keys claim error: {e}");
+                            eprintln!("entity-keys handoff error: {e}");
                         }
                     }
                 }
-                out.adopted_entities.extend(report.adopted);
                 for id in &report.lost {
                     // Purge the stale authoritative copy WITHOUT a client-facing
                     // removal (the entity lives on, owned elsewhere). Leaving it
