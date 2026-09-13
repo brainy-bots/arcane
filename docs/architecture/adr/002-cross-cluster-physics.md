@@ -49,6 +49,8 @@ Entity migration between clusters (the proxy becomes real, the real becomes a pr
 
 This ships with the **affinity clustering infrastructure epic** ([`#34`](https://github.com/brainy-bots/arcane/issues/34) — planned). Until then, entities stay on their original cluster.
 
+> **Handoff-consistency hazard (recorded).** Because cluster ticks are not synchronized with each other or with the manager/router, the ownership flip lands at an arbitrary phase relative to both clusters' tick cycles and can lose 0–2 ticks of simulation for the migrating entity. The rejected write is a **Redis simulation-state** write (buckets 1–2: pose + transient `user_data`); durable discrete outcomes (kills, pickups, loot, XP) commit via SpacetimeDB reducers (bucket 4) on a separate path the flip does not gate, so they are safe by default. The loss is therefore bounded to a tick or two of transient state on a low-coupling entity (migration only fires when the model deems the entity low-coupling) — harmless unless a game batches durable results into replicated simulation state instead of committing them event-driven. Candidate mitigation (two-phase quiesce/adopt handoff + keeping discrete outcomes on the durable path) is written up in [`../migration-handoff-consistency.md`](../migration-handoff-consistency.md); resolve it when this layer is built.
+
 ### Key decisions
 
 - **JSON encoding for physics events** — consistent with entity replication; events are `{entity_id, op_type, op_data}` tuples.

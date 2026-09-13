@@ -18,6 +18,7 @@ This folder contains interface and module responsibility specs for the `arcane` 
 
 - **[four-bucket-state-model.md](four-bucket-state-model.md)** — Where entity data lives (spine, replicated JSON, cluster-local, SpacetimeDB) and how it maps to `EntityStateEntry` and SpacetimeDB.
 - **[physics-backends-and-unreal.md](physics-backends-and-unreal.md)** — Integrating authoritative physics (Unreal Chaos first, optional Rust backends): `ClusterSimulation`, tick order, recommended server layout, checklists.
+- **[migration-handoff-consistency.md](migration-handoff-consistency.md)** — Boundary-tick hazard when an entity's ownership flips between unsynchronized clusters (can lose 0–2 ticks of Redis simulation state). Durable outcomes (kills, pickups) are safe on the SpacetimeDB path; the loss is bounded to transient pose/hot-state on a low-coupling entity. Candidate mitigation: two-phase quiesce/adopt handoff + keeping discrete outcomes on the durable path. Recorded hazard for the deferred authority-transfer work.
 - **`adr/`** — Architecture decision records (e.g. chosen Unreal integration shape, UE version). See [adr/README.md](adr/README.md).
 
 ## Interfaces
